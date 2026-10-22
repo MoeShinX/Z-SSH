@@ -553,9 +553,9 @@ impl Drop for OpenCodeConversation {
     }
 }
 
-/// 交给模型的系统提示：说明能力密钥的用途（三个智能体共用一份）。
+/// 交给模型的系统提示：通用提示（能力密钥的用途等）+ 本机 `read` 一律被拒的说明。
 fn system_prompt(capability: &str) -> String {
-    crate::ai::agent::config::system_prompt(capability)
+    crate::ai::agent::config::opencode_system_prompt(capability)
 }
 
 // ---------------------------------------------------------------------------
@@ -928,9 +928,6 @@ pub fn parse_providers(body: &Value) -> AgentModelCatalog {
                     let model_name = info["name"].as_str().unwrap_or(model_id);
                     let id = format!("{provider_id}/{model_id}");
                     let name = display_model_name(provider_name, model_name);
-                    // opencode 的免费用量模型只允许在它自己的界面里用，从 Z-SSH 调会
-                    // 报 "free tier can only be used from within OpenCode"。
-                    let unavailable = is_free_tier(provider_id, model_id);
                     // 思考等级展开成"模型/等级 + 模型名 · 等级"（和 Claude Code、codex 同一个约定），
                     // 界面据此分出右边的强度框；不带等级的那项 = 用 opencode 自己的默认
                     let variants: Vec<AgentModel> = model_variants(info)
@@ -938,13 +935,13 @@ pub fn parse_providers(body: &Value) -> AgentModelCatalog {
                         .map(|variant| AgentModel {
                             id: format!("{id}/{variant}"),
                             name: format!("{name} · {variant}"),
-                            unavailable,
+                            unavailable: false,
                         })
                         .collect();
                     models.push(AgentModel {
                         id,
                         name,
-                        unavailable,
+                        unavailable: false,
                     });
                     models.extend(variants);
                 }
@@ -1033,11 +1030,6 @@ fn display_model_name(provider_name: &str, model_name: &str) -> String {
     }
 }
 
-/// opencode 的免费用量模型（id 里带 `-free`）只能从 opencode 自己的界面用。
-pub fn is_free_tier(provider_id: &str, model_id: &str) -> bool {
-    provider_id.eq_ignore_ascii_case("opencode") && model_id.contains("-free")
-}
-
 /// `/config` 的 `model` 字段：字符串 `provider/id` 或对象 `{providerID, modelID|id}`。
 pub fn parse_default_model(value: &Value) -> Option<String> {
     if let Some(s) = value.as_str() {
@@ -1098,13 +1090,18 @@ async fn fetch_tool_gate(http: &Http) -> Option<Vec<String>> {
 
 /// 工具 id 清单 → 每回合要禁用的表：除了 zssh 的 MCP 工具（含 M3-4 的文件工具
 /// `zssh_list_dir` / `zssh_read_file` / `zssh_write_file` / `zssh_stat`）和占位的
-/// `invalid`，其余全部禁掉——本机的 `read` / `write` / `bash` 等一个不放。
+/// `invalid`，其余全部禁掉——本机的 `write` / `bash` 等一个不放。
+///
+/// 唯一的例外是 `read`：它不进禁用表。每回合的 `tools` 禁用会把工具从发给模型的列表里
+/// 删掉，而 OpenCode 的免费服务要求 `read` 在列表里（否则拒绝，实测 1.19.4）。`read` 由配置里的
+/// `permission.read` 管：除一个永不匹配的哑模式外一律 `deny`（见 `config::READ_DUMMY_PATTERN`），
+/// 任何真实路径都读不到。
 /// 清单是空的多半是接口变了，返回 `None`，别拿空表当"全部放行"。
 pub fn tool_gate_from_ids(ids: &[Value]) -> Option<Vec<String>> {
     let gate: Vec<String> = ids
         .iter()
         .filter_map(|v| v.as_str())
-        .filter(|id| !id.starts_with("zssh_") && *id != "invalid")
+        .filter(|id| !id.starts_with("zssh_") && *id != "invalid" && *id != "read")
         .map(str::to_string)
         .collect();
     if gate.is_empty() {
@@ -1377,7 +1374,11 @@ mod tests {
     async fn tool_gate_is_built_from_the_listed_ids() {
         let (url, _) = canned_http("200 OK", r#"["bash","read","zssh_exec","invalid"]"#).await;
         let gate = fetch_tool_gate_with_retry(&test_http(url)).await;
-        assert_eq!(gate, Some(vec!["bash".to_owned(), "read".to_owned()]));
+        assert_eq!(
+            gate,
+            Some(vec!["bash".to_owned()]),
+            "read 不进禁用表，交给 permission"
+        );
     }
 
     #[test]
@@ -1438,16 +1439,11 @@ mod tests {
         .map(|s| json!(s))
         .collect();
         let gate = tool_gate_from_ids(&ids).expect("有禁用表");
-        for local in [
-            "bash",
-            "read",
-            "write",
-            "edit",
-            "glob",
-            "my_mcp_server_read_file",
-        ] {
+        for local in ["bash", "write", "edit", "glob", "my_mcp_server_read_file"] {
             assert!(gate.contains(&local.to_string()), "{local} 要被禁");
         }
+        // read 要留在工具列表里（OpenCode 免费服务要求），读不读得了由 permission 的哑模式配置管。
+        assert!(!gate.contains(&"read".to_string()), "read 不进禁用表");
         assert!(
             gate.iter().all(|id| !id.starts_with("zssh_")),
             "zssh 的工具一个都不禁：{gate:?}"
@@ -1498,7 +1494,7 @@ mod tests {
             .iter()
             .find(|m| m.id == "opencode/muse-free")
             .unwrap();
-        assert!(free.unavailable, "免费模型要标不可用");
+        assert!(!free.unavailable, "免费模型不再标不可用");
         let pick = catalog
             .models
             .iter()
@@ -1555,7 +1551,7 @@ mod tests {
             .iter()
             .find(|m| m.id == "opencode/x-free/high")
             .unwrap();
-        assert!(free.unavailable);
+        assert!(!free.unavailable);
 
         let map = variant_map(&body);
         assert_eq!(map["opus/claude-sonnet-5"].len(), 5);
@@ -1618,10 +1614,29 @@ mod tests {
     }
 
     #[test]
-    fn free_tier_models_are_marked_unavailable() {
-        assert!(is_free_tier("opencode", "deepseek-v4.1-flash-free"));
-        assert!(!is_free_tier("opencode", "big-pickle"));
-        assert!(!is_free_tier("deepseek", "deepseek-flash"));
+    fn free_tier_models_are_listed_as_available() {
+        let body = json!({
+            "providers": [
+                {"id": "opencode", "name": "OpenCode", "models": {
+                    "some-model-free": {"name": "Some Model Free"},
+                    "paid-model": {"name": "Paid Model"}
+                }}
+            ]
+        });
+        let catalog = parse_providers(&body);
+        assert_eq!(catalog.models.len(), 2);
+        assert!(
+            catalog.models.iter().all(|m| !m.unavailable),
+            "免费模型不再标不可用"
+        );
+    }
+
+    #[test]
+    fn system_prompt_says_the_local_read_tool_is_always_rejected() {
+        let prompt = system_prompt("deadbeefdeadbeef");
+        assert!(prompt.contains("deadbeefdeadbeef"));
+        assert!(prompt.contains("`read` tool is listed but every call to it is always rejected"));
+        assert!(prompt.contains("`read_file`"));
     }
 
     #[test]

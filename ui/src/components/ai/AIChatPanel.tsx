@@ -118,6 +118,7 @@ import {
   friendlyToolName,
   hostOf,
   isAborted,
+  friendlyAgentError,
   isDangerous,
   isFileTool,
   matchApproval,
@@ -253,8 +254,6 @@ export default function AIChatPanel({
   const historyIdRef = useRef<string | null>(null);
   /** 当前对话用的智能体（保存到哪个智能体的历史里）。 */
   const conversationAgentRef = useRef<AgentId | null>(null);
-  /** 免费的免用量模型报错已经在面板里提示过一次。 */
-  const freeModelWarned = useRef(false);
   /** 当前智能体（面板里选过就用选的，否则用设置页的默认值）。 */
   const activeAgent: AgentId = chosenAgent ?? defaultAgent;
   /** 面板宽度（UI-1 第 2 节）：设置表里读、拖左边缘改、双击把手恢复默认。 */
@@ -380,17 +379,8 @@ export default function AIChatPanel({
       setSaveTick((n) => n + 1);
       if (isAborted(payload.message)) {
         // 用户主动停止（MessageAbortedError）：不是错误，不弹提示（AI-2e 3.1）。
-      } else if (
-        !freeModelWarned.current &&
-        /free tier can only be used from within OpenCode/i.test(payload.message)
-      ) {
-        // 免费用量模型的报错给一次明确提示（AI-2c 0.2）。
-        freeModelWarned.current = true;
-        toast.error(
-          "opencode 的免费模型只能在 opencode 自己的界面里用，请在模型下拉框里换一个模型",
-        );
       } else {
-        toast.error(payload.message);
+        toast.error(friendlyAgentError(payload.message));
       }
     }
   }, [flushText]);

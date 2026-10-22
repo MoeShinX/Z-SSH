@@ -7,6 +7,8 @@
 #
 # 前置：ZSSH_TEST_* 环境变量（缺了测试会自己跳过并打印原因）。
 # -AgentE2E 等价于设 ZSSH_AGENT_E2E=1：opencode / codex / Claude Code 各做一次"读、改一行、写回"。
+# -AgentE2E 还会跑 opencode_free_read_live：隔离目录里用真实 opencode 的免费模型，验证本机 read 工具一律被拒
+# （没装 opencode 或没有可用的免费模型时打印「跳过」）。
 # 本机 PATH 上的 opencode 低于 1.19 时（SQLite 外键 bug）那一项会跳过并提示；
 # 用环境变量 ZSSH_AGENT_OPENCODE 指向 1.19 以上的 opencode 可执行文件即可。
 #

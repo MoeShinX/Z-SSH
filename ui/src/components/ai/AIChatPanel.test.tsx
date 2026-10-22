@@ -7,6 +7,7 @@ import {
   canPinHost,
   commandOf,
   exitCodeOf,
+  friendlyAgentError,
   friendlyToolName,
   hostDotClass,
   hostDotTitle,
@@ -321,5 +322,26 @@ describe("工具卡片的输出：拆开智能体包的 JSON", () => {
       from: "uid 0 / gid 0",
       to: "uid 1000 / gid 1000",
     });
+  });
+});
+
+describe("AI 面板：opencode 免费服务报错改写", () => {
+  it("版本太旧", () => {
+    const text = friendlyAgentError("OpenCode 1.18.0 or newer is required to use the free tier");
+    expect(text).toContain("opencode 版本太旧");
+    expect(text).toContain("1.18");
+    expect(text).toContain("npm i -g opencode-ai@latest");
+  });
+
+  it("免费服务拒绝：不再说只能在 opencode 自己的界面里用", () => {
+    const text = friendlyAgentError("OpenCode's free tier can only be used from within OpenCode");
+    expect(text).toContain("OpenCode 的免费服务拒绝了这次请求");
+    expect(text).toContain("换一个非免费模型");
+    expect(text).not.toContain("自己的界面");
+  });
+
+  it("其他错误原样显示", () => {
+    expect(friendlyAgentError("boom")).toBe("boom");
+    expect(friendlyAgentError("")).toBe("");
   });
 });

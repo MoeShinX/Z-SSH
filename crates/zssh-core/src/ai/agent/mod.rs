@@ -59,7 +59,7 @@ pub struct AgentModel {
     pub id: String,
     /// 界面上展示的名字。
     pub name: String,
-    /// 已知不可用（例如 opencode 的免费用量模型只允许在它自己的界面里用）。
+    /// 已知不可用（目前没有哪个智能体会设它；保留给以后）。
     /// 界面上给这类模型加"不可用"标记；能不能真用仍以后端返回为准。
     #[serde(default)]
     pub unavailable: bool,

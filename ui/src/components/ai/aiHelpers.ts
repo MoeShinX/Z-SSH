@@ -161,6 +161,17 @@ export function isAborted(text: string): boolean {
   return /MessageAbortedError|Tool execution aborted/i.test(text);
 }
 
+/** opencode 免费服务的原始报错，换成用户看得懂、知道该怎么办的话；其他错误返回原文。 */
+export function friendlyAgentError(message: string): string {
+  if (/1.18.0 or newer is required/i.test(message)) {
+    return "opencode 版本太旧，免费模型需要 1.18 以上，请升级 opencode（npm i -g opencode-ai@latest）后重启 Z-SSH";
+  }
+  if (/free tier can only be used from within OpenCode/i.test(message)) {
+    return "OpenCode 的免费服务拒绝了这次请求，可以先换一个非免费模型；如果一直这样，请反馈";
+  }
+  return message;
+}
+
 /** 一个 @ 主机（或当前那台）在标签状态点上的状态（AI-2d 3.2）。 */
 export type HostDotState = "connected" | "connecting" | "offline";
 
