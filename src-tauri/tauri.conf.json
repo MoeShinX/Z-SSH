@@ -1,0 +1,67 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Z-SSH",
+  "version": "0.2.1",
+  "identifier": "com.zssh.app",
+  "mainBinaryName": "Z-SSH",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Z-SSH",
+        "width": 1610,
+        "height": 946,
+        "decorations": false,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'",
+      "devCsp": "default-src 'self' http://localhost:1420; script-src 'self' 'unsafe-inline' http://localhost:1420; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420 http://localhost:1420; object-src 'none'"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFDNTcyODdGRDczNjVCRUEKUldUcVd6YlhmeWhYSEVIRnM3UDVmN1ExaFVzR3pJVFZnbEhOYmhXTlNteGxoQzgzTVZQbHRNSU8K",
+      "endpoints": [
+        "https://github.com/MoeShinX/Z-SSH/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Z-SSH",
+    "copyright": "GPL-3.0-or-later",
+    "shortDescription": "Z-SSH：Windows 上的 SSH 客户端",
+    "category": "DeveloperTool",
+    "icon": [
+      "icons/zssh-z-neon/32x32.png",
+      "icons/zssh-z-neon/128x128.png",
+      "icons/zssh-z-neon/128x128@2x.png",
+      "icons/zssh-z-neon/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": {
+        "template": "windows/installer.nsi",
+        "installerIcon": "icons/zssh-z-neon/icon.ico",
+        "uninstallerIcon": "icons/zssh-z-neon/icon.ico",
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

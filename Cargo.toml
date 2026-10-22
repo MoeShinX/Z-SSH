@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = ["crates/zssh-core", "crates/zssh-mcp", "src-tauri"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2021"
+# 允许移植 Netcatty（GPL-3.0-or-later）的代码，整个项目随同一许可证发布。
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+zssh-core = { path = "crates/zssh-core" }
+
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
+# 默认后端 aws-lc-rs 在 Windows 上要 CMake + NASM，本机没有，所以固定用 ring。
+russh = { version = "0.64", default-features = false, features = [
+    "ring",
+    "rsa",
+    "flate2",
+] }
+thiserror = "2"
+# 测试用临时目录守卫（Drop 时在所有退出路径上清理）。
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# SFTP 协议（M3-1）。它自己**不把 russh 当运行时依赖**（russh 只在它的 dev-dependencies
+# 里，给它自己的测试用），只要 AsyncRead + AsyncWrite，所以直接接 russh 0.64 的
+# `Channel::into_stream()`，不会和 workspace 里的 russh 版本打架。
+russh-sftp = "3.0"
+
+# SQLite 带 bundled：本机没有系统 sqlite，编译进去更省事。
+rusqlite = { version = "0.40", features = ["bundled"] }
+# SOCKS5 代理（HTTP CONNECT 自己实现，不引 HTTP 客户端）
+tokio-socks = "0.5"
+
+# 官方 Rust MCP SDK（Apache-2.0）。特性由各成员按需打开：
+# zssh-mcp 要 server + transport-io，测试端要 client + transport-child-process。
+rmcp = { version = "3.5", default-features = false }
+# 作用范围令牌（32 字节随机数）的随机源。
+getrandom = "0.4"
+# read_terminal 去掉终端控制序列。
+strip-ansi-escapes = "0.2"
+
+# opencode 驱动（AI-2）：HTTP 客户端 + SSE 流 + 一键下载。
+# default-tls 在 Windows 上走 schannel，不需要 CMake/NASM；socks 用于走 Z-SSH 的 SOCKS5 代理。
+reqwest = { version = "0.12", default-features = false, features = [
+    "default-tls",
+    "json",
+    "stream",
+    "socks",
+] }
+# 一键下载 opencode 后解压 zip（只要 deflate，不拉 lzma/zstd 一堆多余依赖）。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# tray-icon：主窗口缩到托盘（UI-4）。图标直接用打包进程序的应用图标。
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-build = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 调 Windows 原生接口用（M1-02 压测量内存，M1-03 用 DPAPI），特性按用到的加。
+windows = "0.62"
+
+# 发布版优化：体积明显小一圈（lto + 去掉调试符号）。
+# M1-08 记录过对比：默认 17.82MB → 这一组 11.4MB 左右。
+# 开发 / 测试构建只留行号（崩溃回溯照样能定位到文件和行），第三方依赖不带调试信息：
+# 全量调试信息时 target/debug 几周能涨到 400 多 GB（2026-10-20 清过一次）。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+# Argon2id 的参数很重（解一次要上百 MiB 内存）。debug 构建里它比 release 慢十几倍，
+# 同步测试要反复加解密，所以只把这两个密码学依赖在 dev/test 下也按 release 优化。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

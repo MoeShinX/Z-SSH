@@ -1,0 +1,15 @@
+target/
+node_modules/
+ui/dist/
+src-tauri/gen/
+.env*
+
+# 安装包（target/ 之外误放时也不进 git）
+*-setup.exe
+*.msi
+
+# 候选图标、临时脚本和截图输出不进 git
+src-tauri/icons/zssh-*/
+!src-tauri/icons/zssh-z-neon/
+*.tmp
+*.bak

@@ -1,0 +1,240 @@
+# Z-SSH 的发布流程：推送 v* 标签时构建、给更新包签名，建成"草稿" Release。
+# 草稿由维护者在 GitHub 网页上确认后再发布，发布之前已安装的用户检查不到这个版本。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 里配置两个 Secret（见 docs/release.md）：
+#   TAURI_SIGNING_PRIVATE_KEY           更新签名私钥的内容（不是路径）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  私钥的密码
+# 以及一个 Variable（不是 Secret，它不是秘密）：
+#   ZSSH_ONEDRIVE_CLIENT_ID             OneDrive 登录用的 client ID，构建时编进程序
+# 这是"更新签名"，用来让已安装的程序确认更新包没被人换过；和 Windows 代码签名证书不是一回事。
+#
+# 分两个任务，签名私钥只进第二个：
+#   build：取代码、装依赖、构建（npm 脚本、cargo 构建脚本都在这里跑），**拿不到任何密钥**，
+#          只读权限；产物（安装包、免安装 zip、说明）作为 artifact 交给下一步。
+#   sign ：不取代码、不跑项目里的任何脚本；只装固定版本的 tauri-cli，给安装包签名、
+#          生成 latest.json、建草稿 Release。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建（无密钥）
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.notes.outputs.prerelease }}
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: 检查标签和版本号一致
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          ./scripts/bump-version.ps1 -Check $tag
+          if ($LASTEXITCODE -ne 0) { throw "标签 $tag 和 Cargo.toml / tauri.conf.json / package.json 里的版本号不一致" }
+          # CHANGELOG 里必须有这个版本的一节（Release 说明从这里取）
+          $version = $tag.TrimStart("v")
+          if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($version))\]" -Quiet)) {
+            throw "CHANGELOG.md 里没有 $version 这一节"
+          }
+
+      - name: 检查更新签名公钥已经换成真的
+        shell: pwsh
+        run: |
+          if (Select-String -Path src-tauri/tauri.conf.json -Pattern 'REPLACE_WITH_UPDATER_PUBLIC_KEY' -Quiet) {
+            throw "src-tauri/tauri.conf.json 里的更新公钥还是占位串，按 docs/release.md 生成密钥并替换后再发布"
+          }
+
+      # 版本由仓库根目录的 rust-toolchain.toml 固定（本机、CI、发布都用同一个）。
+      - name: 装 Rust（按 rust-toolchain.toml，MSVC）
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      # 发布不恢复 Actions 缓存（缓存可能由别的分支 / 工作流写入），依赖和工具都现装。
+      - name: 装 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      - name: 装前端依赖
+        working-directory: ui
+        run: npm ci
+
+      - name: 装 tauri-cli
+        shell: pwsh
+        run: |
+          # 用 npm 上官方预编译的 @tauri-apps/cli（和 cargo 的 tauri-cli 同一套代码、同一个版本号），
+          # 几秒装好；以前 cargo install 每个任务都要从源码编 5～8 分钟。固定到确切版本，
+          # --ignore-scripts 不跑安装脚本（预编译程序在 optionalDependencies 里，不需要脚本）。
+          # 签名任务装的是同一个版本：实测 2.11.4 签出的签名不带 version:x.y.z、2.12.3 带，
+          # 程序开了 requireSignedVersion。换版本还要同步 src-tauri/windows/installer.nsi
+          # （打包器 NSIS 模板的副本，见 docs/release.md）。
+          npm install --global --ignore-scripts "@tauri-apps/cli@2.12.3"
+          if ($LASTEXITCODE -ne 0) { throw "装 tauri-cli 失败" }
+          $version = (tauri --version)
+          if ($version -ne "tauri-cli 2.12.3") { throw "tauri-cli 版本不对：$version" }
+
+      - name: 先编译 zssh-mcp.exe（安装包要带它）
+        run: cargo build --release -p zssh-mcp
+
+      # OneDrive 登录用的 client ID（Azure 应用注册里的“应用程序(客户端) ID”）。它是公共客户端的标识，
+      # **不是秘密**，所以放在仓库的 Variables 里（Settings → Secrets and variables → Actions → Variables），
+      # 不是 Secrets，构建任务也拿得到。注册步骤见 docs/release.md。
+      # 没配置：只警告，不挡发布，这个版本的 OneDrive 登录按钮会不可用；配了但格式不对：直接失败。
+      - name: 检查 OneDrive client ID
+        shell: pwsh
+        env:
+          ZSSH_ONEDRIVE_CLIENT_ID: ${{ vars.ZSSH_ONEDRIVE_CLIENT_ID }}
+        run: |
+          $id = "$env:ZSSH_ONEDRIVE_CLIENT_ID".Trim()
+          if ($id -eq "") {
+            Write-Host "::warning title=OneDrive client ID::仓库 Variables 里没有 ZSSH_ONEDRIVE_CLIENT_ID，这个版本的 OneDrive 登录按钮会不可用（见 docs/release.md）"
+          } elseif ($id -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            throw "仓库 Variables 里的 ZSSH_ONEDRIVE_CLIENT_ID 格式不对（应该形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）"
+          } else {
+            Write-Host "已配置 OneDrive client ID，会编进程序"
+          }
+
+      # tauri.bundle.conf.json 只把 zssh-mcp.exe 放进安装目录，不生成更新签名（这里没有私钥）。
+      - name: 构建安装包
+        shell: pwsh
+        env:
+          # 编进程序（src-tauri/src/main.rs 的 option_env!）；没配置时是空串，程序按“没有内置”处理。
+          ZSSH_ONEDRIVE_CLIENT_ID: ${{ vars.ZSSH_ONEDRIVE_CLIENT_ID }}
+        run: |
+          tauri build --bundles nsis --config src-tauri/tauri.bundle.conf.json
+          if ($LASTEXITCODE -ne 0) { throw "构建失败" }
+
+      - name: 从 CHANGELOG 取这个版本的说明
+        id: notes
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $lines = Get-Content CHANGELOG.md -Encoding UTF8
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match "^## \[$([regex]::Escape($version))\]") { $start = $i + 1; break } }
+          $end = $lines.Count
+          for ($i = $start; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^## \[') { $end = $i; break } }
+          $body = ($lines[$start..($end - 1)] -join "`n").Trim()
+          [System.IO.File]::WriteAllText("$PWD/release-notes.md", $body, (New-Object System.Text.UTF8Encoding($false)))
+          # 带连字符的版本（0.1.0-beta.1 之类）和 CHANGELOG 里标了"预发布"的版本，建成 pre-release。
+          $pre = ($version -match '-') -or (($lines[$start - 1]) -match '预发布')
+          "prerelease=$($pre.ToString().ToLower())" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: 检查安装包里带了 zssh-mcp.exe，打免安装 zip，收集产物
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $setup = Get-ChildItem target/release/bundle/nsis -Filter "*_${version}_x64-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "没找到安装包" }
+          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+          if (-not $sevenZip) { $sevenZip = Get-Command "$env:ProgramFiles/7-Zip/7z.exe" -ErrorAction SilentlyContinue }
+          if ($sevenZip) {
+            $listing = & $sevenZip.Source l $setup.FullName 2>&1 | Out-String
+            if ($listing -notmatch 'zssh-mcp\.exe') { throw "安装包里没有 zssh-mcp.exe" }
+          } elseif (-not (Test-Path target/release/zssh-mcp.exe)) {
+            throw "target/release/zssh-mcp.exe 不存在"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $setup.FullName dist/
+          # 免安装版：主程序 + zssh-mcp.exe（AI 功能要求两者在同一目录）+ 许可证。
+          $stage = Join-Path $env:RUNNER_TEMP "Z-SSH"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/Z-SSH.exe, target/release/zssh-mcp.exe, LICENSE, NOTICE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/Z-SSH_${version}_x64_portable.zip" -Force
+          Copy-Item release-notes.md dist/
+          Get-ChildItem dist | ForEach-Object { "$($_.Name)  $($_.Length) 字节" }
+
+      - name: 交给签名任务
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  sign:
+    name: 签名并建草稿 Release
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: 取构建产物
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned
+          path: dist
+
+      - name: 装 Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      # 和构建任务同一个固定版本（npm 上的预编译版）；这里不取仓库代码，不跑任何项目脚本。
+      - name: 装 tauri-cli
+        shell: pwsh
+        run: |
+          npm install --global --ignore-scripts "@tauri-apps/cli@2.12.3"
+          if ($LASTEXITCODE -ne 0) { throw "装 tauri-cli 失败" }
+          $version = (tauri --version)
+          if ($version -ne "tauri-cli 2.12.3") { throw "tauri-cli 版本不对：$version" }
+
+      - name: 给安装包签名（签名里带版本号）
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $setup = Get-ChildItem dist -Filter "*_${version}_x64-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "没找到安装包" }
+          tauri signer sign --app-version $version $setup.FullName
+          if ($LASTEXITCODE -ne 0) { throw "签名失败（Secret 没配好？）" }
+          # 程序开了 requireSignedVersion：签名的 trusted comment 里必须带这个版本号。
+          $sigText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String((Get-Content "$($setup.FullName).sig" -Raw).Trim()))
+          if ($sigText -notmatch "version:$([regex]::Escape($version))(\s|$)") { throw "更新签名里没有 version:$version" }
+
+      - name: 生成 latest.json 并建草稿 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          $setup = Get-ChildItem dist -Filter "*_${version}_x64-setup.exe" | Select-Object -First 1
+          $signature = (Get-Content "$($setup.FullName).sig" -Raw).Trim()
+          $notes = [System.IO.File]::ReadAllText("$PWD/dist/release-notes.md")
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$($setup.Name)"
+          $platform = [ordered]@{ signature = $signature; url = $url }
+          $manifest = [ordered]@{
+            version = $version
+            notes = $notes
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+            platforms = [ordered]@{ "windows-x86_64" = $platform; "windows-x86_64-nsis" = $platform }
+          }
+          [System.IO.File]::WriteAllText("$PWD/dist/latest.json", ($manifest | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+          $flags = @("--draft", "--title", "Z-SSH $tag", "--notes-file", "dist/release-notes.md")
+          if ("${{ needs.build.outputs.prerelease }}" -eq "true") { $flags += "--prerelease" }
+          $assets = @($setup.FullName, "$($setup.FullName).sig", "dist/latest.json", "dist/Z-SSH_${version}_x64_portable.zip")
+          gh release create $tag @assets @flags -R "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { throw "建 Release 失败" }

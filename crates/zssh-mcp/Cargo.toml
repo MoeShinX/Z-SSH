@@ -1,0 +1,16 @@
+[package]
+name = "zssh-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Z-SSH MCP stdio server: forwards MCP tool calls to the Z-SSH tool bridge"
+
+[dependencies]
+zssh-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# server 供 3 个工具用具名宏注册，transport-io 走 stdio（agent 用它启动本程序）
+rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
+# 工具参数的结构图（rmcp 宏生成的代码按 `schemars::` 路径引用它）
+schemars = "1"

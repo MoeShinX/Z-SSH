@@ -1,0 +1,49 @@
+[package]
+name = "zssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Z-SSH desktop shell"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+zssh-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tauri-plugin-window-state = "2.5.0"
+tauri-plugin-dialog = "2.8.3"
+zeroize = "1"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2.5.4"
+# 第一次缩到托盘时弹一条系统通知（UI-4）；只在 Rust 里调，前端不开权限。
+tauri-plugin-notification = "2"
+# 更新插件用的 reqwest 0.13 默认没开 socks 特性；这里借特性统一把它打开，
+# 否则默认代理是 SOCKS5 时更新检查走不了代理。
+reqwest-socks = { package = "reqwest", version = "0.13", default-features = false, features = ["socks"] }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+# 终端获得焦点时把输入法切到英文（commands/ime.rs）
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# release 构建必须打开：不开的话应用会去连 devUrl（localhost:1420），
+# 打包出来跑起来就是"拒绝连接"。tauri-cli 构建时会自动带上，手动
+# cargo build --release 要自己加 --features custom-protocol。
+custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tauri = { workspace = true, features = ["test"] }

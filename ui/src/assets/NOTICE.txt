@@ -1,0 +1,96 @@
+Z-SSH
+Copyright (C) 2026 Z-SSH contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+--------------------------------------------------------------------------------
+Third-party code
+--------------------------------------------------------------------------------
+
+Netcatty
+  https://github.com/binaricat/Netcatty
+  Copyright (C) binaricat and Netcatty contributors
+  License: GPL-3.0-or-later
+
+  Parts of the Z-SSH user interface (base UI components, theme tokens and
+  presets, terminal themes, title bar, host vault views, settings page,
+  terminal layer, server stats bar, AI chat side panel) and the server
+  stats collection script were adapted from Netcatty. The in-terminal AI
+  command execution logic (crates/zssh-core/src/ai/pty.rs command wrapper,
+  end-marker parsing and output normalization, ported from
+  electron/bridges/ai/ptyExec.cjs and ptyExecHelpers.cjs), the remote
+  login-shell probe (crates/zssh-core/src/ai/shell_kind.rs, ported from
+  electron/bridges/ai/sessionShellKind.cjs and lib/localShellRules.json;
+  POSIX probe branch only) and the terminal display filter
+  (crates/zssh-core/src/ai/display.rs, ported from electron/preload.cjs
+  filterMcpChunk / flushMcpBufferedOutput and electron/bridges/ai/shellUtils.cjs
+  formatSyntheticEcho) were also adapted
+  from Netcatty. The codex agent driver
+  (crates/zssh-core/src/ai/agent/codex/, JSON-RPC handshake and shared
+  process lifecycle, approval decision mapping and event translation,
+  adapted from electron/bridges/aiBridge/codexAppServer/connection.cjs and
+  runtime.cjs and electron/bridges/aiBridge/sdk/codexDriver.cjs) was also
+  adapted from Netcatty. The Claude Code agent driver
+  (crates/zssh-core/src/ai/agent/claude/, stream-json session handling and
+  event translation, session resume after the process is closed, adapted
+  from electron/bridges/aiBridge/sdk/claudeDriver.cjs) was also
+  adapted from Netcatty. The SFTP/transfer engine
+  (crates/zssh-core/src/sftp/: staging `.part` files, resume with a
+  verification read on both sides, pause/resume, conflict handling and the
+  list of local-vs-remote edge cases) references
+  electron/bridges/sftpBridge.cjs and transferBridge.cjs for the problem
+  space and boundary cases; it is an independent Rust implementation, not a
+  code port. The SFTP dual-pane user interface
+  (ui/src/components/sftp/: the file pane with breadcrumb, filter, sorting
+  and virtual list, the tab view with the transfer queue and context menu,
+  and the conflict / permissions / name / delete dialogs, plus the sorting,
+  filtering and selection logic in ui/src/state/sftpPane.ts and the data
+  shapes in ui/src/api/sftp.ts) was adapted from Netcatty
+  components/sftp/ (SftpPaneFileList, SftpPaneToolbar, SftpBreadcrumb,
+  SftpPaneView, SftpTransferQueue, SftpTransferItem, SftpConflictDialog,
+  SftpPermissionsDialog, sftpSorting); the layout, the option semantics and
+  the dialogs were followed, while the code was rewritten against the Z-SSH
+  data model and Tauri commands. The SFTP panel docked next to the terminal
+  (ui/src/components/sftp/SftpDockPanel.tsx, adapted from
+  components/SftpSidePanel.tsx) and the "follow the terminal's directory"
+  probe (crates/zssh-core/src/ssh/cwd.rs: the POSIX sh script that finds the
+  user's PTY shell as a sibling process of the exec channel, follows the
+  foreground shell chain and reads /proc/<pid>/cwd, ported and simplified
+  from electron/bridges/sshBridge/sessionOps.cjs getSessionPwd) were also
+  adapted from Netcatty. The configuration-sync settings page
+  (ui/src/components/settings/sync/: connection form, master password
+  setup, sync status, conflict list and local backups, plus the status
+  bar in ui/src/components/sync/) follows the layout and wording of
+  components/cloud-sync/ (CloudSyncControls, CloudSyncDashboardTabs,
+  CloudSyncDialogs, CloudSyncLocalBackupsPanel); the sync engine, the
+  encryption and the WebDAV / S3 storages are independent Rust
+  implementations. Adapted files are marked with an "Adapted
+  from Netcatty" comment at the top. The Z-SSH
+  backend (SSH, flow control, vault storage, authentication, proxy and
+  jump-host dialing, connection pool, AI tool bridge, opencode / codex /
+  claude agent drivers) is an independent Rust implementation.
+  The host operating-system logos and brand colours (ui/src/assets/os/,
+  ui/src/components/vault/OsIcon.tsx) and the os-release name matching in
+  crates/zssh-core/src/ssh/os_probe.rs were adapted from Netcatty
+  public/distro/, components/DistroAvatar.tsx and domain/host.ts. The
+  logos are trademarks of their respective owners.
+
+CodeMirror 6 (built-in text editor, ui/src/components/editor/)
+  https://codemirror.net/
+  Copyright (C) Marijn Haverbeke and others
+  License: MIT (all 34 packages: @codemirror/*, @lezer/*, @marijn/find-cluster-break,
+  crelt, style-mod, w3c-keyname)
+
+  Used unmodified as npm dependencies. MIT is compatible with distribution
+  under GPL-3.0-or-later; the packages' own license texts are kept in
+  node_modules/<package>/LICENSE and in ui/package-lock.json.
+
+Other third-party dependencies are listed with their licenses in Cargo.lock
+and ui/package-lock.json.

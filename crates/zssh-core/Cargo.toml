@@ -1,0 +1,78 @@
+[package]
+name = "zssh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 这一层是纯 Rust，不能依赖 Tauri。
+# process：AI-2 的 opencode 驱动要起子进程并杀进程树。
+tokio = { workspace = true, features = ["process"] }
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+rusqlite = { workspace = true }
+tokio-socks = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# known_hosts 里哈希主机名的 HMAC-SHA1；版本和 russh 用的一致，不重复编译
+hmac = "0.13"
+sha1 = "0.11"
+base64 = "0.21"
+# 工具桥 read_terminal 要把终端输出里的 ANSI 转义序列去掉
+strip-ansi-escapes = { workspace = true }
+# 工具桥 scope 令牌（32 字节随机数）
+getrandom = { workspace = true }
+# write_file 的确认卡片要显示和现有文件的差异（按行 diff）
+similar = "2"
+# 同步用的全局记录标识（UUID v4）
+uuid = { version = "1", features = ["v4"] }
+# opencode 驱动（AI-2）：HTTP 调用、读 SSE 流，一键下载解压。
+reqwest = { workspace = true }
+zip = { workspace = true }
+# S-1 同步包：主密码 → Argon2id → XChaCha20-Poly1305。
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
+# 生成 SSH 密钥用的随机数（和 russh 用的是同一个版本）
+rand = "0.10"
+# 同步包的 key_check（HMAC-SHA256）和测试里的 SHA-256。
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI（CryptProtectData / CryptUnprotectData）
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    # MoveFileExW：本地覆盖用的原子替换
+    "Win32_Storage_FileSystem",
+    # 智能体子进程树绑进 Job Object（Z-SSH 崩溃时由系统结束整棵树，K06）；
+    # CreateJobObjectW 的参数类型在 Win32_Security，IO_COUNTERS / OpenProcess 在 Threading
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # 读 Internet 选项里的系统代理（软件网络"跟随系统代理"）
+    "Win32_System_Registry",
+    # GetLocalTime：会话日志的文件名用本地时间
+    "Win32_System_SystemInformation",
+    # ShellExecuteW：用系统默认浏览器打开授权网址（OneDrive 登录）
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# 压测示例要读进程的工作集峰值，和任务管理器一个口径。
+windows = { workspace = true, features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# 日志检查：收集 tracing 输出，断言里面没有密码/私钥/同步包明文。
+tracing-subscriber = { workspace = true }
+# 工具桥端到端实测（tests/ai_bridge_live.rs）：MCP 客户端 + 起 zssh-mcp 子进程。
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+# 端到端实测要拿 tokio::process 起子进程。
+tokio = { workspace = true, features = ["process"] }# 测试临时目录守卫：任何退出路径（含 panic）都会清理。
+tempfile = { workspace = true }

@@ -1,0 +1,28 @@
+/* 等宽字体 JetBrains Mono 打进产物（CSP 只允许本地字体，不从网上加载）；界面用系统字体
+   （见 styles/theme.css 的 --font-sans）。只引 woff2：应用只跑在 WebView2（Chromium）上。
+   font-display: block —— 字体就在本地，几十毫秒就到；用 swap 的话启动时会先闪一下别的字体再换。 */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff2") format("woff2");
+}
+
+@import "tailwindcss";
+/* 设计基础：主题令牌和全局样式，来自 Netcatty 的 index.css */
+@import "./styles/theme.css";

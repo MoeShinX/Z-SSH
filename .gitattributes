@@ -1,0 +1,3 @@
+# 更新测试用的签名文件按字节比对，不能被换行转换改动（Windows 上 autocrlf 会把 payload.bin 变成 CRLF，验签就失败）。
+src-tauri/tests/fixtures/updater/* -text
+*.db binary

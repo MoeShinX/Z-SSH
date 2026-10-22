@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口和文件窗口（files）的最小权限集合：core:default + 自绘标题栏要用的窗口控制（最小化/最大化/关闭/拖动），不启用 fs、shell 等插件；dialog 插件只开 allow-open（下载到…的选择文件夹、选离线备份文件）和 allow-save（导出离线备份）。",
+  "windows": ["main", "files"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "process:allow-restart"
+  ]
+}

@@ -1,0 +1,99 @@
+# Z-SSH 的 CI：在 windows-latest 上跑和本地一样的五条门禁。
+#
+# 不需要任何密钥：依赖测试服务器（`ZSSH_TEST_*`）和真实智能体（`ZSSH_AGENT_E2E`）
+# 的用例在没设这些环境变量时会**跳过并打印原因**（见 AGENTS.md 的"可移植性"一节），
+# 所以默认跑到的都是纯本地能过的用例。
+#
+# 五条门禁和 AGENTS.md 里"每次提交前必须全部通过"一致：
+#   1. cargo fmt --all -- --check
+#   2. cargo clippy --workspace --all-targets -- -D warnings
+#   3. cargo test --workspace
+#   4. cd ui && npm run build      （必须含 tsc -b）
+#   5. cd ui && npm test
+#
+# 为什么是 windows-latest：产品只面向 Windows 10/11 x64（含 Windows 专有的
+# DPAPI、WebView2、`cmd /c` 包装脚本解析、`%APPDATA%` 这类路径），Linux 上编译
+# 都过不去，跑也没有意义。
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的提交进来时，取消上一轮还没跑完的（省时间）。
+# 只读：CI 只取代码、跑门禁，不需要写仓库，也不需要任何密钥。
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Rust 侧的编译产物缓存键用得到（workspace 里两个包 + examples）。
+  RUST_BACKTRACE: "1"
+
+jobs:
+  gates:
+    name: 五条门禁（windows-latest）
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # 版本由仓库根目录的 rust-toolchain.toml 固定（本机、CI、发布都用同一个，runner 升级也不会冒出新的 clippy 错误）。
+      # 无参数的 rustup toolchain install 就是按那个文件安装，版本号只写在一处。
+      - name: 装 Rust（按 rust-toolchain.toml，MSVC）
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo clippy --version
+
+      # Swatinem/rust-cache：只缓存第三方依赖的编译产物和 cargo 的下载目录，不缓存本项目自己的
+      # crate 和增量编译文件（它会顺手设 CARGO_INCREMENTAL=0）。以前直接缓存整个 target，
+      # 一份 10 GB、恢复要 8 分钟，而且键里带 Cargo.lock 的哈希，每次发版改版本号都会存一份
+      # 新的，把仓库 10 GB 的缓存额度挤满。只在 main 上保存，别的分支只读。
+      - name: 缓存 cargo 的编译产物
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: 装 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: 装前端依赖
+        working-directory: ui
+        run: npm ci
+
+      # ---------- 门禁 1：格式 ----------
+      - name: "门禁 1/5 cargo fmt --check"
+        run: cargo fmt --all -- --check
+
+      # ---------- 门禁 2：clippy ----------
+      - name: "门禁 2/5 cargo clippy -D warnings"
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # ---------- 门禁 3：Rust 测试 ----------
+      # 依赖测试服务器 / 真实智能体的用例会自己跳过（打印"跳过 …"），不算失败。
+      - name: "门禁 3/5 cargo test --workspace"
+        run: cargo test --workspace
+
+      # ---------- 门禁 4：前端构建（tsc -b + vite build）----------
+      - name: "门禁 4/5 npm run build"
+        working-directory: ui
+        run: npm run build
+
+      # ---------- 门禁 5：前端测试 ----------
+      - name: "门禁 5/5 npm test"
+        working-directory: ui
+        run: npm test
