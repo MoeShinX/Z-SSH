@@ -53,12 +53,14 @@ import {
   aiHostPicker,
   onAgentEvent,
   onApprovalRequest,
+  onExecTarget,
   type AgentEventPayload,
   type AgentId,
   type AgentInstall,
   type AgentLoginStatus,
   type AgentModelCatalog,
   type ApprovalRequest,
+  type ExecTargetReport,
   type HistoryRecord,
   type HistorySummary,
   type HostPickerEntry,
@@ -77,12 +79,9 @@ import {
   hostDotClass,
   hostDotTitle,
   hostStateOf,
-  sessionIdOf,
-  targetIdOf,
 } from "./aiHelpers";
 import {
   buildScopeTargets,
-  describeCallTarget,
   pinHost,
   pinIsCurrent,
   pinKey,
@@ -95,6 +94,13 @@ import {
 } from "./scopeTargets";
 import type { TargetRef } from "../../state/aiTarget";
 import {
+  execTargetOf,
+  execTargetOfApproval,
+  findCallForReport,
+  trackCall,
+  type TrackedCall,
+} from "./execTargets";
+import {
   CONTEXT_LOST_NOTICE,
   formatHistoryTime,
   fromHistoryMessages,
@@ -102,8 +108,8 @@ import {
   historyHostLabel,
   newHistoryId,
   toHistoryMessages,
-  type CallTarget,
   type ChatItem,
+  type ExecTarget,
   type ToolCall,
 } from "./chatHistory";
 import {
@@ -164,13 +170,15 @@ export interface PendingApproval {
   filePath?: string;
   /** `write_file` 的差异和细节。 */
   file?: ApprovalRequest["file"];
+  /** 执行层解析出的实际执行位置（和工具开始的回报同一份）。 */
+  exec?: ExecTarget | null;
 }
 
 export type { PinnedHost };
 
 /** AI 在终端里执行命令的开始 / 结束（App 据此在后台标签上显示活动提示）。 */
 export type AiActivityEvent =
-  | { kind: "start"; callId: string; targetId: string }
+  | { kind: "start"; callId: string; targetId: string; sessionId: string | null }
   | { kind: "end"; callId: string }
   | { kind: "reset" };
 
@@ -189,6 +197,8 @@ interface AIChatPanelProps {
     hostId: number | null;
     hostLabel: string;
     username: string;
+    /** 键盘焦点所在的 pane（绑定会话优先取它）。 */
+    focused?: boolean;
   }[];
   /** @ 标签的状态点：主机 id → 真实连接状态（AI-2d 3.2）。 */
   hostStates: Record<number, HostConnectionState>;
@@ -298,28 +308,36 @@ export default function AIChatPanel({
   // 放在渲染阶段同步完成：目标列表只看到"一步到位"的结果，不会先把旧的移出再加回来
   // （后端把"目标被移出"当作在途请求失效的信号）。
   const currentSession: ScopeSession | null = sessions[0] ?? null;
+  // 每台主机最近一次获得焦点的会话：这台主机不是当前、或当前标签里没有焦点在它身上时，
+  // 工具调用绑定到它（AI-SCOPE-2 第 1 节）。在渲染阶段更新，保证下面算目标列表时是最新的。
+  const recentFocusRef = useRef(new Map<number, string>());
+  for (const s of sessions) {
+    if (s.focused && s.hostId !== null) recentFocusRef.current.set(s.hostId, s.sessionId);
+  }
   const [previousSession, setPreviousSession] = useState<ScopeSession | null>(currentSession);
   const conversationStarted = sessionKey !== null && hasUserMessage(items);
   if ((currentSession?.sessionId ?? null) !== (previousSession?.sessionId ?? null)) {
     setPreviousSession(currentSession);
     if (conversationStarted) {
-      setPinned((prev) => retainPrevious(prev, previousSession, openSessionIds));
+      setPinned((prev) =>
+        retainPrevious(prev, previousSession, openSessionIds, currentSession),
+      );
     }
   }
   // 自动保留的会话关了就跟着消失。
   useEffect(() => {
-    setPinned((prev) => pruneRetained(prev, openSessionIds));
+    setPinned((prev) => pruneRetained(prev, openSessionIds, recentFocusRef.current));
   }, [openSessionIds]);
   const pinnedRef = useRef(pinned);
   pinnedRef.current = pinned;
-  /** 同一台主机只出现一次的目标列表（同步给后端，也是目标标签和卡片的依据）。 */
+  /** 一台主机一个逻辑目标的目标列表（同步给后端，也是目标标签和卡片的依据）。 */
   const scopeTargets = useMemo(
-    () => buildScopeTargets(sessions, pinned, openSessionIds),
+    () => buildScopeTargets(sessions, pinned, openSessionIds, recentFocusRef.current),
     [sessions, pinned, openSessionIds],
   );
   /** 对话里出现过的目标：卡片据此标主机名、跳到终端（会话关了也留着）。 */
   const knownTargetsRef = useRef(new Map<string, KnownTarget>());
-  registerTargets(knownTargetsRef.current, sessions, pinned);
+  registerTargets(knownTargetsRef.current, scopeTargets);
   const targetStateRef = useRef({ currentId: null as string | null, count: 0 });
   targetStateRef.current = {
     currentId: scopeTargets.find((t) => t.current)?.target_id ?? null,
@@ -327,6 +345,17 @@ export default function AIChatPanel({
   };
   const activityRef = useRef(onAiActivity);
   activityRef.current = onAiActivity;
+  /**
+   * 带目标的工具调用（把执行层回报的实际执行位置对到卡片上）和比卡片先到的回报。
+   * 回报和智能体的 `tool_start` 走两条通道，谁先到不保证（AI-SCOPE-2 第 2 节）。
+   */
+  const trackedCallsRef = useRef<TrackedCall[]>([]);
+  const pendingReportsRef = useRef<ExecTargetReport[]>([]);
+  /** 回报 → 卡片上的执行位置：对话里有不止一个目标、或者当时没有"当前"目标时要标出主机名。 */
+  const execOfReport = useCallback((report: ExecTargetReport): ExecTarget => {
+    const state = targetStateRef.current;
+    return execTargetOf(report, state.count > 1 || state.currentId === null);
+  }, []);
 
   const keyRef = useRef<string | null>(null);
   const scopeIdRef = useRef<string | null>(null);
@@ -373,23 +402,38 @@ export default function AIChatPanel({
     // 思考过程现在不显示：也不打断文字的合并
     if (payload.kind === "reasoning_delta") return;
     flushText();
-    // 这次调用作用在哪个目标上（卡片标主机名 / 查看终端），以及后台标签的活动提示。
-    let callTarget: CallTarget | null = null;
+    // 带目标的调用先登记，等执行层回报实际执行位置；回报先到的这里立刻认领。
+    let tracked: TrackedCall | null = null;
+    let earlyExec: ExecTarget | undefined;
     if (payload.kind === "tool_start") {
-      const state = targetStateRef.current;
-      callTarget = describeCallTarget(
-        payload.tool,
-        payload.input,
-        knownTargetsRef.current,
-        state.currentId,
-        state.count,
-      );
-      if (isRunCommand(payload.tool)) {
-        const id = targetIdOf(payload.input) ?? sessionIdOf(payload.input) ?? state.currentId;
-        if (id) activityRef.current?.({ kind: "start", callId: payload.call_id, targetId: id });
+      tracked = trackCall(payload.call_id, payload.tool, payload.input);
+      if (tracked) {
+        const calls = trackedCallsRef.current;
+        calls.push(tracked);
+        if (calls.length > 200) calls.splice(0, calls.length - 200);
+        const early = pendingReportsRef.current.findIndex(
+          (report) => findCallForReport([tracked as TrackedCall], report) !== undefined,
+        );
+        if (early >= 0) {
+          const [report] = pendingReportsRef.current.splice(early, 1);
+          tracked.claimed = true;
+          earlyExec = execOfReport(report);
+          if (tracked.tool === "run_command") {
+            activityRef.current?.({
+              kind: "start",
+              callId: payload.call_id,
+              targetId: report.target_id,
+              sessionId: report.session_id,
+            });
+          }
+        }
       }
-    } else if (payload.kind === "tool_end" && isRunCommand(payload.tool)) {
-      activityRef.current?.({ kind: "end", callId: payload.call_id });
+    } else if (payload.kind === "tool_end") {
+      const call = trackedCallsRef.current.find((c) => c.callId === payload.call_id);
+      if (call) call.ended = true;
+      if (isRunCommand(payload.tool)) {
+        activityRef.current?.({ kind: "end", callId: payload.call_id });
+      }
     }
     setItems((prev) => {
       switch (payload.kind) {
@@ -407,7 +451,8 @@ export default function AIChatPanel({
                 input: payload.input,
                 output: "",
                 status: "running",
-                ...(callTarget ? { target: callTarget } : {}),
+                ...(tracked ? { tracked: true } : {}),
+                ...(earlyExec ? { exec: earlyExec } : {}),
               },
             },
           ];
@@ -460,7 +505,55 @@ export default function AIChatPanel({
         toast.error(friendlyAgentError(payload.message));
       }
     }
-  }, [flushText]);
+  }, [flushText, execOfReport]);
+
+  // 执行层回报的实际执行位置：对到工具卡片上（卡片的主机名、「查看终端」、标签活动点都用它）。
+  // 对不上卡片的先存着，卡片出现时认领。
+  const handleExecReport = useCallback(
+    (report: ExecTargetReport) => {
+      if (report.scope !== scopeIdRef.current) return;
+      const call = findCallForReport(trackedCallsRef.current, report);
+      if (!call) {
+        const pending = pendingReportsRef.current;
+        pending.push(report);
+        if (pending.length > 50) pending.splice(0, pending.length - 50);
+        return;
+      }
+      call.claimed = true;
+      const exec = execOfReport(report);
+      setItems((prev) =>
+        prev.map((item) =>
+          item.kind === "tool" && item.call.callId === call.callId
+            ? { kind: "tool", call: { ...item.call, exec } }
+            : item,
+        ),
+      );
+      // 已经返回的调用（回报晚到）不再点亮活动点。
+      if (call.tool === "run_command" && !call.ended) {
+        activityRef.current?.({
+          kind: "start",
+          callId: call.callId,
+          targetId: report.target_id,
+          sessionId: report.session_id,
+        });
+      }
+    },
+    [execOfReport],
+  );
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void onExecTarget(handleExecReport)
+      .then((stop) => {
+        if (cancelled) stop();
+        else unlisten = stop;
+      })
+      .catch((error: unknown) => console.warn("订阅执行位置回报失败", error));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [handleExecReport]);
 
   // 发现两个智能体（一次）；codex 还要查一下登录状态（AI-3 第 5 节）。
   useEffect(() => {
@@ -531,6 +624,7 @@ export default function AIChatPanel({
           tool: request.tool ?? "run_command",
           filePath: request.file?.path,
           file: request.file,
+          exec: execTargetOfApproval(request),
         },
       ]);
     }).then((stop) => {
@@ -585,6 +679,8 @@ export default function AIChatPanel({
     conversationAgentRef.current = target;
     // 上一个对话切走时自动保留的会话不带进新对话；用户自己 @ 的照旧保留。
     knownTargetsRef.current.clear();
+    trackedCallsRef.current = [];
+    pendingReportsRef.current = [];
     setPinned((prev) => (prev.some((p) => p.retained) ? prev.filter((p) => !p.retained) : prev));
     setContextLost(false);
     setApprovals([]);
@@ -665,6 +761,8 @@ export default function AIChatPanel({
     keyRef.current = null;
     scopeIdRef.current = null;
     scopeTargetsRef.current = [];
+    trackedCallsRef.current = [];
+    pendingReportsRef.current = [];
     setSessionKey(null);
     setApprovals([]);
     setAiRunningInTerminal(false);
@@ -1633,10 +1731,14 @@ export function ToolCard({
   const [diffExpanded, setDiffExpanded] = useState(false);
   const host = hostOf(call.input, hosts);
   const exitCode = call.status === "done" ? exitCodeOf(call.output) : null;
-  // 执行所在的主机：目标多于一个时必须显示（只有一个时省略，避免啰嗦）。
-  const target = call.target;
-  const targetLabel = target && (showTarget || target.multi) ? target.label : null;
+  // 执行所在的主机：用执行层回报的实际执行位置（审批事件带的是同一份）。目标多于一个、或者
+  // 当时没有"当前"目标时必须显示主机名（只有一个当前目标时省略，避免啰嗦）。
+  const exec = call.exec ?? approval?.exec ?? undefined;
+  const targetLabel = exec && (showTarget || exec.multi) ? exec.label : null;
   const hostName = targetLabel ?? host;
+  // 调用结束了、执行层却一直没回报：说明目标没能解析出来（比如对话里没有可用目标），
+  // 不能静默省略，写明"未确定"。
+  const targetUnknown = !exec && call.tracked === true && call.status !== "running";
   return (
     <div
       className={cn(
@@ -1655,13 +1757,20 @@ export function ToolCard({
               {hostName}
             </span>
           )}
-          {target && onViewTarget && (
+          {targetUnknown && (
+            <span data-section="call-target-unknown" className="text-[11px] text-amber-600">
+              执行目标未确定
+            </span>
+          )}
+          {exec && onViewTarget && (
             <button
               type="button"
               data-action="view-terminal"
               className="text-[11px] text-muted-foreground underline decoration-dotted hover:text-foreground"
               title="切到这台主机的终端标签（还没连上、正在连也可以，能看到连接过程）"
-              onClick={() => onViewTarget({ sessionId: target.sessionId, hostId: target.hostId })}
+              onClick={() =>
+                onViewTarget({ targetId: exec.targetId, sessionId: exec.sessionId })
+              }
             >
               查看终端
             </button>

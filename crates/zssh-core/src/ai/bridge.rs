@@ -108,6 +108,10 @@ pub enum ApprovalDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub scope: String,
+    /// 实际执行的目标（逻辑目标 ID）和执行用的会话（还没有连上的会话为 `None`）：
+    /// 审批卡片据此显示执行位置，和执行层的解析结果一致（AI-SCOPE-2 第 2 节）。
+    pub target_id: String,
+    pub session_id: Option<String>,
     pub host_label: String,
     /// `run_command` 是命令全文；`write_file` 是 `write_file <路径>`（卡片上用 `file` 里的细节）。
     pub command: String,
@@ -125,6 +129,35 @@ pub struct FileApproval {
     pub is_new: bool,
     pub new_bytes: usize,
     pub diff: FileDiff,
+}
+
+/// 执行层解析出的实际执行位置（AI-SCOPE-2 第 2 节）：每次工具调用解析完目标、真正开始之前
+/// 交给宿主，宿主转给界面。界面只认这份回报，不再自己猜"这次会落在哪台主机 / 哪个终端"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecTargetReport {
+    /// 对话的工具桥 scope id（界面据此认出是不是自己这个对话的调用）。
+    pub scope: String,
+    /// 工具名（不带前缀）：`run_command`、`read_terminal`、`list_dir`、`read_file`、
+    /// `write_file`、`stat`。
+    pub tool: String,
+    /// 界面把这份回报对到工具卡片上用的键：`run_command` 是命令原文，文件工具是调用时给的
+    /// 路径原文，`read_terminal` 为空。
+    pub key: String,
+    /// 实际执行的逻辑目标 ID（`host-<id>`，快速连接是会话 ID）。
+    pub target_id: String,
+    /// 执行用的会话；这台主机现在没有可用的会话（会自动连接）时为 `None`。
+    pub session_id: Option<String>,
+    pub host_label: String,
+}
+
+/// 一次工具调用解析出来的目标：逻辑目标、请求票据、执行用的会话、交给宿主的 ID。
+pub(crate) struct ResolvedTarget {
+    pub(crate) summary: TargetSummary,
+    /// 在解析会话**之前**记下的请求票据（停止、目标移出 / 移出再加回都会使它失效）。
+    pub(crate) ticket: RequestTicket,
+    pub(crate) session_id: Option<String>,
+    /// 交给宿主执行方法用的 ID：有会话就是会话 ID，否则是逻辑目标 ID（宿主自己连）。
+    pub(crate) exec_id: String,
 }
 
 /// 审批通道：`src-tauri` 走事件，测试走桩。工具桥负责超时和 scope 销毁的取消。
@@ -176,6 +209,30 @@ pub enum ExecPlacement {
 
 /// 会话执行：在会话所在的连接上开 exec 通道 / 读环形缓冲 / 能否在终端里跑。
 pub trait BridgeHost: Send + Sync {
+    /// 一个逻辑目标这次该用哪个会话执行（AI-SCOPE-2 第 1 节）。
+    ///
+    /// `bound` 是界面绑给这个目标的会话（这台主机焦点所在 / 最近获得焦点的终端）：它还在
+    /// （连着或正在连）就优先用它；没有或已经关了，再按现有规则找（目标本身就是会话 ID 就用
+    /// 它；`host-<id>` 找这台主机已经连上的会话）。都没有返回 `None`——执行时由宿主自动连接。
+    ///
+    /// 默认实现信任界面的绑定，目标本身不是 `host-<id>` 时把它当会话 ID（测试替身用）。
+    fn execution_session<'a>(
+        &'a self,
+        target_id: &'a str,
+        bound: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<String>> {
+        let session = bound.map(str::to_owned).or_else(|| {
+            (!target_id.starts_with(crate::ai::protocol::HOST_TARGET_PREFIX))
+                .then(|| target_id.to_owned())
+        });
+        Box::pin(async move { session })
+    }
+
+    /// 执行层解析出目标之后、真正开始之前回报给界面（AI-SCOPE-2 第 2 节）。默认空操作。
+    fn report_target(&self, report: ExecTargetReport) {
+        let _ = report;
+    }
+
     fn exec<'a>(
         &'a self,
         session_id: &'a str,
@@ -669,14 +726,21 @@ impl ScopeHandle {
         current: bool,
         pinned: bool,
     ) {
-        self.scope.add_target(TargetSummary {
+        self.add_target_summary(TargetSummary {
             id: id.into(),
             host_label: host_label.into(),
             username: username.into(),
             status: status.into(),
             current,
             pinned,
+            session_id: None,
         });
+    }
+
+    /// 同 [`ScopeHandle::add_target`]，但能带上界面绑定的会话（`session_id`）。同一个 ID 再
+    /// 加会更新（绑定随焦点变化时不算"移出再加回"，在途请求不受影响）。
+    pub fn add_target_summary(&self, summary: TargetSummary) {
+        self.scope.add_target(summary);
     }
 
     /// 目标断开 / 被移除后从作用范围里摘掉。
@@ -979,9 +1043,18 @@ impl Bridge {
             METHOD_READ_TERMINAL => {
                 let params: ReadTerminalParams = serde_json::from_value(request.params.clone())
                     .map_err(|err| format!("参数不正确：{err}"))?;
-                let target_id = resolve_target(&scope, params.target_id.as_deref())?;
+                let resolved = self
+                    .resolve_exec_target(&scope, params.target_id.as_deref(), "read_terminal", "")
+                    .await?;
                 let max_lines = clamp_max_lines(params.max_lines);
-                let lines = self.host.read_terminal(&target_id, max_lines).await?;
+                let lines = self
+                    .host
+                    .read_terminal(&resolved.exec_id, max_lines)
+                    .await?;
+                // 读的过程中（可能在等自动连接）停止了 / 目标被移出了：不把内容交回去。
+                if let Some(reason) = scope.ticket_refusal(&resolved.ticket) {
+                    return Err(reason.to_string());
+                }
                 Ok(serde_json::json!({ "lines": lines, "max_lines": max_lines }))
             }
             METHOD_RUN_COMMAND => self.run_command(&scope, request.params.clone()).await,
@@ -1028,11 +1101,21 @@ impl Bridge {
         // 命令是当键盘输入打进终端的：控制字符会变成按键（Ctrl+U 删掉包装脚本的前缀、
         // 回车提前提交……），单引号挡不住。审批和两条执行通道之前就拒绝（R-8 第 1 节）。
         crate::ai::command_text::reject_forbidden_control_chars(&params.command)?;
-        let target_id = resolve_target(scope, params.target_id.as_deref())?;
-        let summary = scope
-            .summary(&target_id)
-            .ok_or_else(|| SCOPE_TARGET_ERROR.to_string())?;
-        let ticket = scope.ticket(&target_id);
+        let ResolvedTarget {
+            summary,
+            ticket,
+            session_id,
+            exec_id,
+        } = self
+            .resolve_exec_target(
+                scope,
+                params.target_id.as_deref(),
+                "run_command",
+                &params.command,
+            )
+            .await?;
+        // 票据、审计、闸都按逻辑目标记；交给宿主执行的是 exec_id（有绑定会话就是它）。
+        let target_id = summary.id.clone();
         let verdict = assess(&params.command);
 
         // 手动模式每条命令都要批；自动模式全部直接执行，危险判断只用于标记和审计。
@@ -1042,6 +1125,8 @@ impl Bridge {
                 &ticket,
                 ApprovalRequest {
                     scope: scope.id.clone(),
+                    target_id: target_id.clone(),
+                    session_id: session_id.clone(),
                     host_label: summary.host_label.clone(),
                     command: params.command.clone(),
                     danger: verdict.level,
@@ -1079,7 +1164,7 @@ impl Bridge {
                 Some(crate::ai::command_text::TAB_FALLBACK_REASON.to_string()),
             )
         } else {
-            match self.host.exec_placement(&target_id).await {
+            match self.host.exec_placement(&exec_id).await {
                 ExecPlacement::Terminal => (ExecLocation::Terminal, None),
                 ExecPlacement::Background { reason } => (ExecLocation::Background, Some(reason)),
             }
@@ -1089,7 +1174,7 @@ impl Bridge {
             // exec_placement 可能刚探测完远端 shell（第一次要等一会儿）：这期间点了停止 / 移出了
             // 目标，就不再写命令，把抢到的终端还回去（R-9 F11、F12）。
             if let Err(reason) = gate.check() {
-                self.host.release_terminal(&target_id).await;
+                self.host.release_terminal(&exec_id).await;
                 // 审计按"没有执行"记：批准过，但在执行前作废了。
                 self.record_audit(
                     scope,
@@ -1111,7 +1196,7 @@ impl Bridge {
                 crate::ai::pty::build_wrapped_command(&params.command, &marker),
             );
             let request = TerminalExecRequest {
-                target_id: target_id.clone(),
+                target_id: exec_id.clone(),
                 scope_id: scope.id.clone(),
                 command: params.command.clone(),
                 payload,
@@ -1185,7 +1270,7 @@ impl Bridge {
                             scope,
                             &gate,
                             &summary,
-                            &target_id,
+                            &exec_id,
                             &params.command,
                             &verdict,
                             decision,
@@ -1201,7 +1286,7 @@ impl Bridge {
             scope,
             &gate,
             &summary,
-            &target_id,
+            &exec_id,
             &params.command,
             &verdict,
             decision,
@@ -1410,6 +1495,51 @@ impl Bridge {
             bytes: None,
             backup_path: None,
         });
+    }
+}
+
+impl Bridge {
+    /// 解析一次工具调用的执行位置：目标（不填用"当前"）、执行用的会话（界面绑定的优先）。
+    ///
+    /// 解析完立刻回报给宿主（AI-SCOPE-2 第 2 节）——在审批、自动连接这些可能等很久的步骤
+    /// 之前，界面马上就能在卡片上显示"这次会落在哪台主机"。
+    pub(crate) async fn resolve_exec_target(
+        &self,
+        scope: &Arc<Scope>,
+        target_id: Option<&str>,
+        tool: &str,
+        key: &str,
+    ) -> Result<ResolvedTarget, String> {
+        let target_id = resolve_target(scope, target_id)?;
+        let summary = scope
+            .summary(&target_id)
+            .ok_or_else(|| SCOPE_TARGET_ERROR.to_string())?;
+        // 票据必须在任何 await 之前记下：找会话 / 等连接期间用户点了停止，或者把目标移出又
+        // 加回来，这条请求都要作废；先解析再记票据会把这些取消状态漏掉。
+        let ticket = scope.ticket(&target_id);
+        let session_id = self
+            .host
+            .execution_session(&target_id, summary.session_id.as_deref())
+            .await;
+        // 解析期间已经失效：不回报、不执行。
+        if let Some(reason) = scope.ticket_refusal(&ticket) {
+            return Err(reason.to_string());
+        }
+        self.host.report_target(ExecTargetReport {
+            scope: scope.id.clone(),
+            tool: tool.to_owned(),
+            key: key.to_owned(),
+            target_id: target_id.clone(),
+            session_id: session_id.clone(),
+            host_label: summary.host_label.clone(),
+        });
+        let exec_id = session_id.clone().unwrap_or(target_id);
+        Ok(ResolvedTarget {
+            summary,
+            ticket,
+            session_id,
+            exec_id,
+        })
     }
 }
 
@@ -3006,6 +3136,8 @@ root password: hunter2" }),
     fn approval(scope: &Scope) -> ApprovalRequest {
         ApprovalRequest {
             scope: scope.id.clone(),
+            target_id: "s1".into(),
+            session_id: Some("s1".into()),
             host_label: "web-1".into(),
             command: "ls".into(),
             danger: DangerLevel::Safe,
@@ -3637,5 +3769,399 @@ root password: hunter2" }),
             .await
             .expect("服务端要很快断开");
         assert!(matches!(read, Ok(0) | Err(_)), "连接应已关闭：{read:?}");
+    }
+
+    // ---- AI-SCOPE-2：一台主机一个逻辑目标、绑定会话、回报实际执行位置 ----
+
+    /// 能区分"绑定的会话"和"这台主机别的会话"的替身宿主：记录每次执行落在哪个会话、
+    /// 收到的执行位置回报；`alive` 里没有的会话算已经关了。
+    struct BindingHost {
+        alive: Mutex<std::collections::HashSet<String>>,
+        /// 目标 ID → 这台主机已经连上的会话（没有绑定时的后备）。
+        host_sessions: Mutex<HashMap<String, String>>,
+        exec_sessions: Mutex<Vec<String>>,
+        read_sessions: Mutex<Vec<String>>,
+        reports: Mutex<Vec<ExecTargetReport>>,
+        /// 为真时 `execution_session` 进入后停住，等 `release` 才返回（模拟找会话 / 等连接）。
+        block: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl BindingHost {
+        fn new(alive: &[&str], host_sessions: &[(&str, &str)]) -> Arc<BindingHost> {
+            Arc::new(BindingHost {
+                alive: Mutex::new(alive.iter().map(|s| (*s).to_owned()).collect()),
+                host_sessions: Mutex::new(
+                    host_sessions
+                        .iter()
+                        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                        .collect(),
+                ),
+                exec_sessions: Mutex::new(Vec::new()),
+                read_sessions: Mutex::new(Vec::new()),
+                reports: Mutex::new(Vec::new()),
+                block: AtomicBool::new(false),
+                entered: Notify::new(),
+                release: Notify::new(),
+            })
+        }
+
+        fn close(&self, session: &str) {
+            self.alive.lock().unwrap().remove(session);
+        }
+
+        fn reports(&self) -> Vec<ExecTargetReport> {
+            self.reports.lock().unwrap().clone()
+        }
+    }
+
+    impl BridgeHost for BindingHost {
+        fn execution_session<'a>(
+            &'a self,
+            target_id: &'a str,
+            bound: Option<&'a str>,
+        ) -> BoxFuture<'a, Option<String>> {
+            let alive = self.alive.lock().unwrap();
+            let session = bound
+                .filter(|id| alive.contains(*id))
+                .map(str::to_owned)
+                .or_else(|| alive.contains(target_id).then(|| target_id.to_owned()))
+                .or_else(|| self.host_sessions.lock().unwrap().get(target_id).cloned());
+            drop(alive);
+            Box::pin(async move {
+                if self.block.load(Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                session
+            })
+        }
+
+        fn report_target(&self, report: ExecTargetReport) {
+            self.reports.lock().unwrap().push(report);
+        }
+
+        fn exec<'a>(
+            &'a self,
+            session_id: &'a str,
+            _command: &'a str,
+            _wait: Duration,
+            _max_stream_bytes: usize,
+        ) -> BoxFuture<'a, Result<ExecCapture, String>> {
+            self.exec_sessions
+                .lock()
+                .unwrap()
+                .push(session_id.to_owned());
+            Box::pin(async { Ok(exec_ok()) })
+        }
+
+        fn read_terminal<'a>(
+            &'a self,
+            session_id: &'a str,
+            _max_lines: usize,
+        ) -> BoxFuture<'a, Result<Vec<String>, String>> {
+            self.read_sessions
+                .lock()
+                .unwrap()
+                .push(session_id.to_owned());
+            Box::pin(async { Ok(vec!["line".to_owned()]) })
+        }
+    }
+
+    fn binding_bridge(
+        host: Arc<BindingHost>,
+        mode: ExecMode,
+        approver: Arc<MockApprover>,
+    ) -> Arc<Bridge> {
+        Arc::new(Bridge::new(
+            host,
+            Arc::new(MockAudit::default()),
+            approver,
+            Arc::new(FixedMode(mode)),
+        ))
+    }
+
+    fn host_target(id: &str, label: &str, current: bool, session: Option<&str>) -> TargetSummary {
+        TargetSummary {
+            id: id.to_owned(),
+            host_label: label.to_owned(),
+            username: "root".to_owned(),
+            status: if session.is_some() {
+                "connected"
+            } else {
+                "pinned"
+            }
+            .to_owned(),
+            current,
+            pinned: false,
+            session_id: session.map(str::to_owned),
+        }
+    }
+
+    async fn serve(bridge: &Arc<Bridge>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("绑定端口");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(Arc::clone(bridge).serve(listener));
+        port
+    }
+
+    #[tokio::test]
+    async fn run_command_executes_on_the_bound_session_and_falls_back_after_it_closes() {
+        // 这台主机开了两个终端：sess-1 是别的，sess-2 是界面绑定的（焦点所在）。
+        let host = BindingHost::new(&["sess-1", "sess-2"], &[("host-7", "sess-1")]);
+        let bridge = binding_bridge(
+            host.clone(),
+            ExecMode::Auto,
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+        );
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+
+        let response = client
+            .request(1, METHOD_RUN_COMMAND, json!({ "command": "ls" }))
+            .await;
+        result_of(&response);
+        assert_eq!(
+            *host.exec_sessions.lock().unwrap(),
+            vec!["sess-2".to_owned()],
+            "有绑定会话就落在它上面，不用这台主机别的会话"
+        );
+        let reports = host.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].tool, "run_command");
+        assert_eq!(reports[0].key, "ls");
+        assert_eq!(reports[0].target_id, "host-7");
+        assert_eq!(reports[0].session_id.as_deref(), Some("sess-2"));
+        assert_eq!(reports[0].host_label, "web-1");
+
+        // 绑定的会话关了（界面还没来得及同步）：回退到这台主机别的已连会话。
+        host.close("sess-2");
+        let response = client
+            .request(2, METHOD_RUN_COMMAND, json!({ "command": "ls" }))
+            .await;
+        result_of(&response);
+        assert_eq!(host.exec_sessions.lock().unwrap()[1], "sess-1");
+        assert_eq!(host.reports()[1].session_id.as_deref(), Some("sess-1"));
+
+        // 一个会话都没有：交给宿主按逻辑目标自己连（回报里会话为空）。
+        host.close("sess-1");
+        host.host_sessions.lock().unwrap().clear();
+        let response = client
+            .request(3, METHOD_RUN_COMMAND, json!({ "command": "ls" }))
+            .await;
+        result_of(&response);
+        assert_eq!(host.exec_sessions.lock().unwrap()[2], "host-7");
+        assert_eq!(host.reports()[2].session_id, None);
+        assert_eq!(host.reports()[2].target_id, "host-7");
+    }
+
+    #[tokio::test]
+    async fn the_binding_can_move_without_removing_the_target() {
+        // 焦点换到这台主机的另一个终端：界面再同步一次同一个目标（绑定变了），在途请求的
+        // 票据不受影响（不算移出再加回），新请求落在新绑定的会话上。
+        let host = BindingHost::new(&["sess-1", "sess-2"], &[]);
+        let bridge = binding_bridge(
+            host.clone(),
+            ExecMode::Auto,
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+        );
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-1")));
+        let ticket = scope.scope.ticket("host-7");
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+        assert_eq!(scope.scope.ticket_refusal(&ticket), None);
+
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+        let response = client
+            .request(1, METHOD_READ_TERMINAL, json!({ "target_id": "host-7" }))
+            .await;
+        result_of(&response);
+        assert_eq!(
+            *host.read_sessions.lock().unwrap(),
+            vec!["sess-2".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_current_target_the_chosen_one_runs_and_is_reported() {
+        // 切到空白标签：两个目标都不是"当前"，模型省略 target_id —— 选哪个的规则不变
+        // （列表第一项），但选中的是谁要回报出去，且回报的会话就是实际执行的会话。
+        let host = BindingHost::new(&["sess-a", "sess-b"], &[]);
+        let bridge = binding_bridge(
+            host.clone(),
+            ExecMode::Auto,
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+        );
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-2", "db-1", false, Some("sess-b")));
+        scope.add_target_summary(host_target("host-1", "web-1", false, Some("sess-a")));
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+        let response = client
+            .request(1, METHOD_RUN_COMMAND, json!({ "command": "uptime" }))
+            .await;
+        result_of(&response);
+        let reports = host.reports();
+        assert_eq!(reports.len(), 1);
+        let (label, session) = match reports[0].target_id.as_str() {
+            "host-1" => ("web-1", "sess-a"),
+            "host-2" => ("db-1", "sess-b"),
+            other => panic!("不认识的目标：{other}"),
+        };
+        assert_eq!(reports[0].host_label, label);
+        assert_eq!(reports[0].session_id.as_deref(), Some(session));
+        assert_eq!(
+            *host.exec_sessions.lock().unwrap(),
+            vec![session.to_owned()],
+            "回报的会话就是实际执行的会话"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_carries_the_resolved_target_and_session() {
+        let host = BindingHost::new(&["sess-2"], &[]);
+        let approver = Arc::new(MockApprover::new(ApproverBehavior::Allow));
+        let bridge = binding_bridge(host.clone(), ExecMode::Manual, approver.clone());
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", false, Some("sess-2")));
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+        let response = client
+            .request(
+                1,
+                METHOD_RUN_COMMAND,
+                json!({ "target_id": "host-7", "command": "ls" }),
+            )
+            .await;
+        result_of(&response);
+        let request = approver.last().expect("手动模式要审批");
+        assert_eq!(request.target_id, "host-7");
+        assert_eq!(request.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(host.reports()[0].session_id.as_deref(), Some("sess-2"));
+    }
+
+    #[tokio::test]
+    async fn the_bound_session_is_not_shown_to_the_model() {
+        let host = BindingHost::new(&["sess-2"], &[]);
+        let bridge = binding_bridge(
+            host,
+            ExecMode::Manual,
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+        );
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+        let response = client.request(1, METHOD_LIST_TARGETS, json!({})).await;
+        let text = result_of(&response).to_string();
+        assert!(text.contains("host-7"));
+        assert!(!text.contains("sess-2"), "绑定的会话 ID 不给模型看：{text}");
+    }
+
+    // ---- 解析会话期间的取消（停止 / 目标移出再加回）----
+
+    /// 发一条请求，停在宿主 `execution_session` 里时对作用范围做 `disturb`，再放行；返回响应。
+    async fn request_disturbed_while_resolving(
+        method: &'static str,
+        params: Value,
+        disturb: impl FnOnce(&ScopeHandle, &Arc<Bridge>),
+    ) -> (
+        Result<Value, String>,
+        Arc<BindingHost>,
+        Vec<ExecTargetReport>,
+    ) {
+        let host = BindingHost::new(&["sess-2"], &[]);
+        host.block.store(true, Ordering::SeqCst);
+        let bridge = binding_bridge(
+            host.clone(),
+            ExecMode::Auto,
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+        );
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+        let request = RequestEnvelope {
+            id: 1,
+            method: method.to_owned(),
+            capability: scope.capability().to_owned(),
+            params,
+        };
+        let task = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.dispatch(&request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), host.entered.notified())
+            .await
+            .expect("请求应该走到解析会话");
+        disturb(&scope, &bridge);
+        host.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("请求应该结束")
+            .expect("任务不该 panic");
+        let reports = host.reports();
+        (result, host, reports)
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_the_session_is_being_resolved_prevents_execution() {
+        for (method, params) in [
+            (METHOD_RUN_COMMAND, json!({ "command": "touch /tmp/x" })),
+            (METHOD_READ_TERMINAL, json!({})),
+        ] {
+            let (result, host, reports) =
+                request_disturbed_while_resolving(method, params, |scope, bridge| {
+                    bridge.stop_scope(scope.scope_id());
+                })
+                .await;
+            let message = result.expect_err("停止之后不能执行");
+            assert!(message.contains("停止"), "{method}：{message}");
+            assert!(host.exec_sessions.lock().unwrap().is_empty(), "{method}");
+            assert!(host.read_sessions.lock().unwrap().is_empty(), "{method}");
+            assert!(reports.is_empty(), "已经作废的请求不再回报：{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_and_re_adding_the_target_while_resolving_still_invalidates_the_request() {
+        for (method, params) in [
+            (METHOD_RUN_COMMAND, json!({ "command": "touch /tmp/x" })),
+            (METHOD_READ_TERMINAL, json!({})),
+        ] {
+            let (result, host, _) =
+                request_disturbed_while_resolving(method, params, |scope, _| {
+                    scope.remove_target("host-7");
+                    scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+                })
+                .await;
+            let message = result.expect_err("移出再加回之后旧请求仍然无效");
+            assert!(message.contains("移出"), "{method}：{message}");
+            assert!(host.exec_sessions.lock().unwrap().is_empty(), "{method}");
+            assert!(host.read_sessions.lock().unwrap().is_empty(), "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_disturbance_the_same_request_executes_once() {
+        let (result, host, reports) = request_disturbed_while_resolving(
+            METHOD_RUN_COMMAND,
+            json!({ "command": "ls" }),
+            |_, _| {},
+        )
+        .await;
+        result.expect("没有干扰就正常执行");
+        assert_eq!(
+            *host.exec_sessions.lock().unwrap(),
+            vec!["sess-2".to_owned()]
+        );
+        assert_eq!(reports.len(), 1);
     }
 }

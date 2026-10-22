@@ -31,6 +31,7 @@ use zssh_core::ai::agent::opencode::{
 use zssh_core::ai::agent::{AgentConversation, AgentEvent, AgentModelCatalog};
 use zssh_core::ai::bridge::{Bridge, ScopeHandle};
 use zssh_core::ai::history::{self, HistoryDraft, HistoryRecord, HistoryStore, HistorySummary};
+use zssh_core::ai::protocol::TargetSummary;
 
 use crate::state::AppState;
 
@@ -770,7 +771,8 @@ pub async fn ai_agent_catalog(
 /// 目标进出 scope 的同步（AI-2c）：当前焦点终端 + @ 进来的主机。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScopeTargetChange {
-    /// 目标 ID：已连上的会话是会话 ID；未连上的 @ 主机是 `host-<host_id>`。
+    /// 目标 ID：主机库里的主机一律是 `host-<host_id>`（开了几个终端都不变）；快速连接这类
+    /// 没有主机记录的会话是会话 ID。
     pub target_id: String,
     pub host_label: String,
     pub username: String,
@@ -781,6 +783,10 @@ pub struct ScopeTargetChange {
     /// 用户 @ 进来的主机。
     #[serde(default)]
     pub pinned: bool,
+    /// 这个目标绑定的会话（这台主机焦点所在 / 最近获得焦点的终端）。执行时优先用它；
+    /// 没有（@ 了没打开的主机）或已经关了，再找这台主机别的已连会话 / 自动连接。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// 同步一个对话的目标列表：`added` 加进来，`removed` 摘掉。同一个 ID 再同步会更新。
@@ -799,14 +805,15 @@ pub async fn ai_agent_scope_sync(
         conversation.scope.clone()
     };
     for change in added {
-        scope.add_target(
-            change.target_id,
-            change.host_label,
-            change.username,
-            change.status,
-            change.current,
-            change.pinned,
-        );
+        scope.add_target_summary(TargetSummary {
+            id: change.target_id,
+            host_label: change.host_label,
+            username: change.username,
+            status: change.status,
+            current: change.current,
+            pinned: change.pinned,
+            session_id: change.session_id.filter(|id| !id.is_empty()),
+        });
     }
     for target_id in removed {
         scope.remove_target(&target_id);
@@ -1077,6 +1084,30 @@ pub async fn shutdown_all(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_target_change_carries_the_bound_session_and_stays_compatible_without_it() {
+        let with: ScopeTargetChange = serde_json::from_value(serde_json::json!({
+            "target_id": "host-7",
+            "host_label": "web-1",
+            "username": "root",
+            "status": "connected",
+            "current": true,
+            "session_id": "sess-2",
+        }))
+        .unwrap();
+        assert_eq!(with.session_id.as_deref(), Some("sess-2"));
+        assert!(with.current && !with.pinned);
+        let without: ScopeTargetChange = serde_json::from_value(serde_json::json!({
+            "target_id": "host-7",
+            "host_label": "web-1",
+            "username": "root",
+            "status": "pinned",
+            "session_id": null,
+        }))
+        .unwrap();
+        assert_eq!(without.session_id, None);
+    }
 
     #[test]
     fn download_progress_serializes() {

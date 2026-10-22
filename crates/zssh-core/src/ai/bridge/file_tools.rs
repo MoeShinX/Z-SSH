@@ -13,8 +13,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::{
-    now_millis, random_hex, resolve_target, ApprovalRequest, AuditEntry, Bridge, ExecDecision,
-    ExecGate, FileApproval, RequestTicket, Scope, SCOPE_TARGET_ERROR,
+    now_millis, random_hex, ApprovalRequest, AuditEntry, Bridge, ExecDecision, ExecGate,
+    FileApproval, RequestTicket, Scope,
 };
 use crate::ai::files::{
     execute_write_checked, prepare_write, tool_list_dir, tool_read_file, tool_stat, RemoteFs,
@@ -24,6 +24,14 @@ use crate::ai::protocol::{
     METHOD_WRITE_FILE,
 };
 use crate::ai::safety::DangerLevel;
+
+/// 文件工具的目标：目标摘要、文件系统、请求票据、执行用的会话。
+type FileTarget = (
+    crate::ai::protocol::TargetSummary,
+    Arc<dyn RemoteFs>,
+    RequestTicket,
+    Option<String>,
+);
 
 /// 一次文件工具调用要写进审计的内容（不含文件内容）。
 struct FileAudit {
@@ -48,8 +56,9 @@ impl Bridge {
         match method {
             METHOD_LIST_DIR => {
                 let params: PathParams = parse(params)?;
-                let (summary, fs, ticket) =
-                    self.file_target(scope, params.target_id.as_deref()).await?;
+                let (summary, fs, ticket, _) = self
+                    .file_target(scope, params.target_id.as_deref(), "list_dir", &params.path)
+                    .await?;
                 let started = std::time::Instant::now();
                 self.ensure_still_valid(
                     scope,
@@ -86,8 +95,9 @@ impl Bridge {
             }
             METHOD_STAT => {
                 let params: PathParams = parse(params)?;
-                let (summary, fs, ticket) =
-                    self.file_target(scope, params.target_id.as_deref()).await?;
+                let (summary, fs, ticket, _) = self
+                    .file_target(scope, params.target_id.as_deref(), "stat", &params.path)
+                    .await?;
                 let started = std::time::Instant::now();
                 self.ensure_still_valid(
                     scope,
@@ -121,8 +131,14 @@ impl Bridge {
             }
             METHOD_READ_FILE => {
                 let params: ReadFileParams = parse(params)?;
-                let (summary, fs, ticket) =
-                    self.file_target(scope, params.target_id.as_deref()).await?;
+                let (summary, fs, ticket, _) = self
+                    .file_target(
+                        scope,
+                        params.target_id.as_deref(),
+                        "read_file",
+                        &params.path,
+                    )
+                    .await?;
                 let started = std::time::Instant::now();
                 self.ensure_still_valid(
                     scope,
@@ -165,26 +181,22 @@ impl Bridge {
     }
 
     /// 解析目标并拿到它的文件系统（开 SFTP 通道）。目标不在目标列表里直接拒绝。
+    ///
+    /// 解析出的实际执行位置在开通道之前就回报给界面（`tool` / `key` 用来对到卡片上，AI-SCOPE-2）；
+    /// 通道开在执行用的会话上（界面绑定的优先），第四项是这个会话 ID。
     async fn file_target(
         &self,
         scope: &Arc<Scope>,
         target_id: Option<&str>,
-    ) -> Result<
-        (
-            crate::ai::protocol::TargetSummary,
-            Arc<dyn RemoteFs>,
-            RequestTicket,
-        ),
-        String,
-    > {
-        let target_id = resolve_target(scope, target_id)?;
-        let summary = scope
-            .summary(&target_id)
-            .ok_or_else(|| SCOPE_TARGET_ERROR.to_string())?;
-        // 在解析出目标的这一刻记下状态（连接可能要等好一会儿）。
-        let ticket = scope.ticket(&target_id);
-        let fs = self.host.remote_fs(&target_id).await?;
-        Ok((summary, fs, ticket))
+        tool: &str,
+        key: &str,
+    ) -> Result<FileTarget, String> {
+        let resolved = self
+            .resolve_exec_target(scope, target_id, tool, key)
+            .await?;
+        // 票据是解析会话之前记下的（连接可能要等好一会儿）。
+        let fs = self.host.remote_fs(&resolved.exec_id).await?;
+        Ok((resolved.summary, fs, resolved.ticket, resolved.session_id))
     }
 
     /// 只读工具的有效性核对：目标被移出对话（哪怕又被加回来）、用户点了停止、作用范围销毁，
@@ -244,7 +256,14 @@ impl Bridge {
         params: WriteFileParams,
     ) -> Result<Value, String> {
         // 之后目标被移出 / 用户点了停止，批准了也不能再写（R-9 F11、F12）。
-        let (summary, fs, ticket) = self.file_target(scope, params.target_id.as_deref()).await?;
+        let (summary, fs, ticket, session_id) = self
+            .file_target(
+                scope,
+                params.target_id.as_deref(),
+                "write_file",
+                &params.path,
+            )
+            .await?;
         let started = std::time::Instant::now();
         // 准备：读现有内容、算差异和危险标记。这一步不改服务器上的任何东西。
         let plan = prepare_write(
@@ -267,6 +286,8 @@ impl Bridge {
                 &ticket,
                 ApprovalRequest {
                     scope: scope.id.clone(),
+                    target_id: summary.id.clone(),
+                    session_id: session_id.clone(),
                     host_label: summary.host_label.clone(),
                     command: format!("write_file {}", plan.target),
                     danger,

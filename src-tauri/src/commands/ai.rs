@@ -13,7 +13,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::oneshot;
 use zssh_core::ai::bridge::{
     ApprovalDecision, ApprovalRequest, Approver, AuditEntry, AuditLog, BridgeHost, ExecGate,
-    ExecMode, ExecModeProvider, ExecPlacement, TerminalExecCapture, TerminalExecRequest,
+    ExecMode, ExecModeProvider, ExecPlacement, ExecTargetReport, TerminalExecCapture,
+    TerminalExecRequest,
 };
 use zssh_core::ai::files::{FileDiff, RemoteFs, SftpRemoteFs};
 use zssh_core::ai::protocol::parse_host_target_id;
@@ -28,6 +29,36 @@ use crate::state::AppState;
 pub const AI_APPROVAL_REQUEST: &str = "ai_approval_request";
 /// 事件名：AI 需要一个还没打开的 @ 主机自动连接（界面为它新开一个标签）。
 pub const AI_TARGET_CONNECT: &str = "ai_target_connect";
+/// 事件名：执行层解析出了一次工具调用的实际执行位置（AI-SCOPE-2 第 2 节）。
+pub const AI_EXEC_TARGET: &str = "ai_exec_target";
+
+/// `ai_exec_target` 的负载：这次工具调用实际落在哪个目标、哪个会话、哪台主机。
+///
+/// 界面的工具卡片、「查看终端」、标签上的活动点都只认这份回报，不自己猜。
+#[derive(Debug, Clone, Serialize)]
+pub struct AiExecTargetPayload {
+    pub scope: String,
+    /// 工具名（不带前缀）。
+    pub tool: String,
+    /// 界面对到卡片上用的键：命令原文 / 路径原文 / 空。
+    pub key: String,
+    pub target_id: String,
+    pub session_id: Option<String>,
+    pub host_label: String,
+}
+
+impl From<ExecTargetReport> for AiExecTargetPayload {
+    fn from(report: ExecTargetReport) -> Self {
+        AiExecTargetPayload {
+            scope: report.scope,
+            tool: report.tool,
+            key: report.key,
+            target_id: report.target_id,
+            session_id: report.session_id,
+            host_label: report.host_label,
+        }
+    }
+}
 
 /// `ai_approval_request` 的负载（给 AI-2 的界面用）。
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +69,9 @@ pub struct AiApprovalPayload {
     pub command: String,
     pub danger: String,
     pub reasons: Vec<String>,
+    /// 实际执行的目标和会话（和 `ai_exec_target` 同一份解析结果）。
+    pub target_id: String,
+    pub session_id: Option<String>,
     /// 工具名：`run_command` 或 `write_file`。
     pub tool: String,
     /// `write_file` 的细节：写哪个文件、和现有文件的差异（新建文件就是全文）。
@@ -67,6 +101,8 @@ impl AiApprovalPayload {
             command: zssh_core::ai::command_text::escape_invisible_chars(&request.command),
             danger: request.danger.as_str().to_string(),
             reasons: request.reasons,
+            target_id: request.target_id,
+            session_id: request.session_id,
             tool: if request.file.is_some() {
                 "write_file".to_string()
             } else {
@@ -267,6 +303,11 @@ impl AppBridgeHost {
         if state.exec_connection(target_id).await.is_some() {
             return Ok(target_id.to_string());
         }
+        // 界面绑定的会话还在连接中（用户自己开的标签，指纹 / 认证 / 开 shell 要时间）：等它连好，
+        // 不要再为同一台主机另开一个标签。
+        if state.has_session(target_id).await {
+            return wait_until_open(&state, target_id, wait).await;
+        }
         let Some(host_id) = parse_host_target_id(target_id) else {
             return Err(format!("目标不存在或者还没连上：{target_id}"));
         };
@@ -293,16 +334,25 @@ impl AppBridgeHost {
         };
         // 界面回报的是刚 `session_open` 出来的会话 ID：它还在连接中（指纹 / 认证 /
         // 开 shell 都要时间）。等它真正可以执行（或者超时）。
-        let deadline = Instant::now() + wait;
-        loop {
-            if state.exec_connection(&session_id).await.is_some() {
-                return Ok(session_id);
-            }
-            if Instant::now() >= deadline {
-                return Err("自动连接的会话没能连上".to_string());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until_open(&state, &session_id, wait).await
+    }
+}
+
+/// 等一个连接中的会话变成可以执行；会话从表里消失（连接失败 / 用户关了）或超时就报错。
+async fn wait_until_open(
+    state: &AppState,
+    session_id: &str,
+    wait: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if state.exec_connection(session_id).await.is_some() {
+            return Ok(session_id.to_string());
         }
+        if !state.has_session(session_id).await || Instant::now() >= deadline {
+            return Err("自动连接的会话没能连上".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -331,6 +381,36 @@ impl AppBridgeHost {
 }
 
 impl BridgeHost for AppBridgeHost {
+    fn execution_session<'a>(
+        &'a self,
+        target_id: &'a str,
+        bound: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<String>> {
+        let app = self.app.clone();
+        Box::pin(async move {
+            let state = app.state::<AppState>();
+            // 界面绑定的会话（焦点所在 / 最近获得焦点的）优先，它还在（连着或正在连）就用它；
+            // 不再用 `session_for_host` 那种"遍历表取第一个"的选法去覆盖界面的选择。
+            if let Some(bound) = bound {
+                if state.has_session(bound).await {
+                    return Some(bound.to_owned());
+                }
+            }
+            if state.has_session(target_id).await {
+                return Some(target_id.to_owned());
+            }
+            let host_id = parse_host_target_id(target_id)?;
+            state.session_for_host(host_id).await
+        })
+    }
+
+    fn report_target(&self, report: ExecTargetReport) {
+        // 界面还没起来（或者窗口没了）就没人看卡片，发不出去无所谓。
+        let _ = self
+            .app
+            .emit(AI_EXEC_TARGET, AiExecTargetPayload::from(report));
+    }
+
     fn exec<'a>(
         &'a self,
         target_id: &'a str,
@@ -874,10 +954,14 @@ mod tests {
             command: "rm -rf /".to_owned(),
             danger: "dangerous".to_owned(),
             reasons: vec!["递归删除".to_owned()],
+            target_id: "host-7".to_owned(),
+            session_id: Some("sess-2".to_owned()),
             tool: "run_command".to_owned(),
             file: None,
         };
         let value = serde_json::to_value(&payload).expect("序列化");
+        assert_eq!(value["target_id"], "host-7");
+        assert_eq!(value["session_id"], "sess-2");
         assert_eq!(value["req_id"], 7);
         assert_eq!(value["scope"], "abc123");
         assert_eq!(value["host_label"], "web-1");
@@ -888,11 +972,32 @@ mod tests {
     }
 
     #[test]
+    fn exec_target_payload_serializes_for_the_frontend() {
+        let payload = AiExecTargetPayload::from(ExecTargetReport {
+            scope: "abc123".to_owned(),
+            tool: "run_command".to_owned(),
+            key: "ls".to_owned(),
+            target_id: "host-7".to_owned(),
+            session_id: None,
+            host_label: "web-1".to_owned(),
+        });
+        let value = serde_json::to_value(&payload).expect("序列化");
+        assert_eq!(value["scope"], "abc123");
+        assert_eq!(value["tool"], "run_command");
+        assert_eq!(value["key"], "ls");
+        assert_eq!(value["target_id"], "host-7");
+        assert!(value["session_id"].is_null(), "没有可用会话时为 null");
+        assert_eq!(value["host_label"], "web-1");
+    }
+
+    #[test]
     fn approval_payload_escapes_invisible_control_characters_in_the_command() {
         // 第二道防线（R-8 第 1 节）：万一有不可见字符走到审批，卡片上要显示成可见的
         // 转义形式，而不是让用户看到一个和实际执行内容不一致的命令。
         let request = ApprovalRequest {
             scope: "abc123".to_owned(),
+            target_id: "host-7".to_owned(),
+            session_id: None,
             host_label: "web-1".to_owned(),
             command: "ls\x15rm -rf ~\u{202e}".to_owned(),
             danger: zssh_core::ai::safety::DangerLevel::Dangerous,
@@ -935,6 +1040,8 @@ c
             command: "write_file /etc/hosts".to_owned(),
             danger: "dangerous".to_owned(),
             reasons: vec!["写入系统路径：系统配置目录 /etc".to_owned()],
+            target_id: "host-7".to_owned(),
+            session_id: None,
             tool: "write_file".to_owned(),
             file: Some(AiApprovalFile {
                 path: "/etc/hosts".to_owned(),

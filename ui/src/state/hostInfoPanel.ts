@@ -13,11 +13,21 @@
 
 import { useSyncExternalStore } from "react";
 
+import { doubleClickMs } from "./doubleClickTime";
+
 /**
- * 收起的延迟，取 Windows 默认的双击间隔（500ms，设置里「鼠标」的双击速度默认档）：
+ * 在系统双击间隔之外多留的一点余量：双击的第二下刚好卡在间隔边缘到达时，定时器不至于抢在
+ * 它前面把面板收了。
+ */
+export const COLLAPSE_MARGIN_MS = 50;
+
+/**
+ * 收起的延迟 = 系统的双击间隔 + 余量。Windows 的双击间隔用户可以调（默认 500ms，最大 5000ms），
  * 双击的两下间隔不会超过它，所以第二下一定赶在收起之前到来；又不会让人觉得面板没反应。
  */
-export const COLLAPSE_DELAY_MS = 500;
+export function collapseDelayMs(): number {
+  return doubleClickMs() + COLLAPSE_MARGIN_MS;
+}
 
 let current: number | null = null;
 let pending: ReturnType<typeof setTimeout> | undefined;
@@ -47,7 +57,7 @@ export function clickHostInfo(hostId: number, clickCount = 1) {
     pending = setTimeout(() => {
       pending = undefined;
       set(null);
-    }, COLLAPSE_DELAY_MS);
+    }, collapseDelayMs());
   } else {
     set(hostId);
   }

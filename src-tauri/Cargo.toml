@@ -32,11 +32,12 @@ url = "2"
 [target.'cfg(windows)'.dependencies]
 # 右键菜单过滤（native_menu.rs）要写 WebView2 的类型；版本和 Tauri 自己用的是同一份（Cargo.lock 里的 0.39.1）。
 webview2-com = "0.39"
-# 终端获得焦点时把输入法切到英文（commands/ime.rs）
+# 终端获得焦点时把输入法切到英文（commands/ime.rs）；读系统双击时间（commands/system.rs）
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

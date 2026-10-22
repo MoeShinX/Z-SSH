@@ -85,7 +85,8 @@ import {
   setHostTreeRightReserved,
 } from "./state/panelWidths";
 import AIChatPanel, { type AiActivityEvent } from "./components/ai/AIChatPanel";
-import { aiTabBadges, locateTarget, tabForTargetId, type TargetRef } from "./state/aiTarget";
+import { loadDoubleClickTime } from "./state/doubleClickTime";
+import { aiTabBadges, locateTarget, tabForTarget, type TargetRef } from "./state/aiTarget";
 import { aiTabFor } from "./state/aiTab";
 import DockRow from "./components/terminal/DockRow";
 import TerminalLayer from "./components/terminal/TerminalLayer";
@@ -1792,10 +1793,14 @@ export default function App() {
   const aiSessions = useMemo(() => {
     if (!aiTab) return [];
     return paneIds(aiTab.tree)
-      .map((paneId) => ws.panes[paneId])
-      .filter((pane): pane is PaneSession => Boolean(pane?.sessionId))
-      .map((pane) => ({
+      .map((paneId) => ({ paneId, pane: ws.panes[paneId] }))
+      .filter((entry): entry is { paneId: string; pane: PaneSession } =>
+        Boolean(entry.pane?.sessionId),
+      )
+      .map(({ paneId, pane }) => ({
         sessionId: pane.sessionId as string,
+        // 键盘焦点所在的窗格：AI 的逻辑目标（一台主机一个）绑定到它的会话。
+        focused: paneId === aiTab.focus,
         hostId: pane.origin.kind === "host" ? pane.origin.hostId : null,
         hostLabel:
           pane.origin.kind === "host"
@@ -2330,22 +2335,26 @@ export default function App() {
   }, [ws.panes]);
 
   // 后台标签的 AI 活动提示（AI-SCOPE-1 第 4 节）：AI 正在某个没在看的标签里执行命令时
-  // 显示活动点；跑完还没看过显示「有新输出」点；切过去就清掉。
-  const [aiRunning, setAiRunning] = useState<Record<string, string>>({});
-  const aiRunningRef = useRef<Record<string, string>>({});
+  // 显示活动点；跑完还没看过显示「有新输出」点；切过去就清掉。位置用执行层回报的实际执行会话
+  // （AI-SCOPE-2），不自己猜。
+  const [aiRunning, setAiRunning] = useState<Record<string, TargetRef>>({});
+  const aiRunningRef = useRef<Record<string, TargetRef>>({});
   const [aiUnseen, setAiUnseen] = useState<string[]>([]);
   const handleAiActivity = useCallback((event: AiActivityEvent) => {
     if (event.kind === "start") {
-      aiRunningRef.current = { ...aiRunningRef.current, [event.callId]: event.targetId };
+      aiRunningRef.current = {
+        ...aiRunningRef.current,
+        [event.callId]: { targetId: event.targetId, sessionId: event.sessionId },
+      };
       setAiRunning(aiRunningRef.current);
     } else if (event.kind === "end") {
-      const targetId = aiRunningRef.current[event.callId];
-      if (targetId === undefined) return;
+      const running = aiRunningRef.current[event.callId];
+      if (running === undefined) return;
       const { [event.callId]: _done, ...rest } = aiRunningRef.current;
       aiRunningRef.current = rest;
       setAiRunning(rest);
       const current = wsRef.current;
-      const tabId = tabForTargetId(current.tabs, current.panes, targetId);
+      const tabId = tabForTarget(current.tabs, current.panes, running);
       if (tabId) setAiUnseen((prev) => (prev.includes(tabId) ? prev : [...prev, tabId]));
     } else if (Object.keys(aiRunningRef.current).length > 0) {
       aiRunningRef.current = {};
@@ -2364,11 +2373,16 @@ export default function App() {
     [ws.tabs, ws.panes, aiRunning, aiUnseen, watchedTabId],
   );
 
-  // 工具卡片上的「查看终端」：切到那个目标所在的标签和窗格（还没连上也可以，能看到连接过程）。
+  // 工具卡片上的「查看终端」：切到执行层回报的那个会话所在的标签和窗格（回报时还没有会话的，
+  // 切到正在连的那个标签，能看到连接过程）。
   const viewAiTarget = useCallback((target: TargetRef) => {
     const found = locateTarget(wsRef.current.tabs, wsRef.current.panes, target);
     if (!found) {
-      toast.info("这台主机现在没有打开的终端标签");
+      toast.info(
+        target.sessionId
+          ? "执行的那个终端已经关闭了"
+          : "这台主机现在没有打开的终端标签",
+      );
       return;
     }
     setWs((current) => ({
@@ -2391,6 +2405,11 @@ export default function App() {
 
   // 主机列表的系统图标：读一次已经探测过的，之后跟着后端事件更新
   useEffect(() => startHostOs(), []);
+
+  // 系统的双击时间（主机树属性面板的收起延迟要跟着它走）：启动时读一次。
+  useEffect(() => {
+    void loadDoubleClickTime();
+  }, []);
 
   // 服务器状态（M1-10）：后端按订阅 ID 推，这里把最新值记到 pane 上，并推动
   // 状态栏重画。推送本身不进 React 状态（量大的时候会拖慢输入）。
@@ -2890,7 +2909,6 @@ export default function App() {
             // 主机树在终端界面也常驻（展开时）：和主机页是同一个组件、同一个开关
             <div className="absolute inset-y-0 left-0 z-10 flex" data-section="terminal-host-tree">
               <HostTreeAside
-                query=""
                 selectedGroup={treeGroup}
                 onSelectGroup={setTreeGroup}
                 selectedHostId={treeHostId}

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Group, Host } from "../api/vault";
 import {
-  autoExpandedFor,
+  filteredHostOrder,
   compareNames,
   groupKey,
   hostMatches,
@@ -15,6 +15,7 @@ import {
   sortByRecent,
   toggleExpanded,
   totalUnder,
+  treeFilterFor,
   UNGROUPED_KEY,
 } from "./hostTree";
 
@@ -52,16 +53,63 @@ describe("主机树", () => {
     expect(toggleExpanded(new Set(), groupKey(5)).has("g5")).toBe(true);
   });
 
-  it("分组下面直接挂的主机按名字排，搜索时只留匹配的", () => {
-    expect(hostsUnder(hosts, 2, "").map((h) => h.name)).toEqual(["CA1 PVE", "DE1 PVE"]);
-    expect(hostsUnder(hosts, 2, "de1").map((h) => h.name)).toEqual(["DE1 PVE"]);
-    expect(hostsUnder(hosts, null, "").map((h) => h.name)).toEqual(["loose"]);
+  it("分组下面直接挂的主机按名字排，搜索时只留过滤结果里的", () => {
+    expect(hostsUnder(hosts, 2, null).map((h) => h.name)).toEqual(["CA1 PVE", "DE1 PVE"]);
+    expect(hostsUnder(hosts, 2, treeFilterFor(groups, hosts, "de1")).map((h) => h.name)).toEqual(["DE1 PVE"]);
+    expect(hostsUnder(hosts, null, null).map((h) => h.name)).toEqual(["loose"]);
   });
 
-  it("搜索时自动展开有匹配主机的分组和它的上级", () => {
-    expect([...autoExpandedFor(groups, hosts, "生产")].sort()).toEqual(["g2", "g3"]);
-    expect([...autoExpandedFor(groups, hosts, "loose")]).toEqual([UNGROUPED_KEY]);
-    expect(autoExpandedFor(groups, hosts, "").size).toBe(0);
+  it("没在搜索（空白词）时没有过滤结果", () => {
+    expect(treeFilterFor(groups, hosts, "")).toBeNull();
+    expect(treeFilterFor(groups, hosts, "   ")).toBeNull();
+  });
+
+  it("主机匹配：显示它和它的各级上级分组，计数是过滤后的数量", () => {
+    const filter = treeFilterFor(groups, hosts, "生产")!;
+    expect([...filter.hostIds]).toEqual([3]);
+    expect([...filter.groupIds].sort()).toEqual([2, 3]);
+    expect(filter.ungrouped).toBe(false);
+    expect(filter.counts.get(3)).toBe(1);
+    expect(filter.counts.get(2)).toBe(1);
+    expect(filter.total).toBe(1);
+    const loose = treeFilterFor(groups, hosts, "LOOSE")!;
+    expect(loose.ungrouped).toBe(true);
+    expect([...loose.groupIds]).toEqual([]);
+  });
+
+  it("名称、地址、用户名、标签都能搜，不分大小写", () => {
+    const ids = (text: string) => [...treeFilterFor(groups, hosts, text)!.hostIds].sort();
+    expect(ids("ca1")).toEqual([1]);
+    expect(ids("EXAMPLE.internal")).toEqual([1, 2, 3, 4]);
+    expect(ids("ROOT")).toEqual([1, 2, 3, 4]);
+    expect(ids("生产")).toEqual([3]);
+    expect(ids("不存在")).toEqual([]);
+  });
+
+  it("分组名匹配：显示整个子树的全部主机，其他分组不显示", () => {
+    const filter = treeFilterFor(groups, hosts, "wap-pve")!;
+    expect([...filter.hostIds].sort()).toEqual([1, 2, 3]);
+    expect([...filter.groupIds].sort()).toEqual([2, 3]);
+    expect(filter.counts.get(2)).toBe(3);
+    expect(filter.counts.get(3)).toBe(1);
+    // 另一个分组 wap 的名字也含 "wap"，但它下面没有主机
+    expect([...treeFilterFor(groups, hosts, "wap")!.groupIds].sort()).toEqual([1, 2, 3]);
+  });
+
+  it("「未分组」这个名字也能搜到，连带全部未分组主机", () => {
+    const filter = treeFilterFor(groups, hosts, "未分")!;
+    expect(filter.ungrouped).toBe(true);
+    expect([...filter.hostIds]).toEqual([4]);
+  });
+
+  it("搜索结果的主机顺序和树里从上到下一致：先分组（子分组在前、主机在后）、最后未分组", () => {
+    const filter = treeFilterFor(groups, hosts, "e")!;
+    expect(filteredHostOrder(groups, hosts, filter).map((h) => h.name)).toEqual([
+      "HK2 PVE",
+      "CA1 PVE",
+      "DE1 PVE",
+      "loose",
+    ]);
   });
 
   it("分组的数字包括子分组里的主机", () => {

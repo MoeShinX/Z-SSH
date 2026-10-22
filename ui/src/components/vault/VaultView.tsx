@@ -26,8 +26,9 @@ import {
   Search,
   Server,
   Trash2,
+  X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "../../lib/utils";
 import OsIcon from "./OsIcon";
@@ -35,7 +36,7 @@ import type { Group, Host } from "../../api/vault";
 import { useVault } from "../../stores/vault";
 import { useSettings } from "../../stores/settings";
 import {
-  autoExpandedFor,
+  filteredHostOrder,
   groupKey,
   hostsUnder,
   parseExpanded,
@@ -44,7 +45,9 @@ import {
   sortByRecent,
   toggleExpanded,
   totalUnder,
+  treeFilterFor,
   UNGROUPED_KEY,
+  type TreeFilter,
 } from "../../state/hostTree";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -203,7 +206,6 @@ export default function VaultView({
     <div data-section="vault" className="flex h-full min-h-0">
       {/* 左侧主机树（可收起成一列图标）；终端界面也用同一个组件 */}
       <HostTreeAside
-        query={query}
         selectedGroup={selectedGroup}
         onSelectGroup={setSelectedGroup}
         selectedHostId={selectedHostId}
@@ -335,7 +337,6 @@ export default function VaultView({
  * 主机页缩成一列图标（`collapsedStyle="icons"`），终端界面直接不占地方（`"hidden"`）。
  */
 export function HostTreeAside({
-  query,
   selectedGroup,
   onSelectGroup,
   selectedHostId,
@@ -347,7 +348,6 @@ export function HostTreeAside({
   collapsedStyle,
   infoPanel = false,
 }: {
-  query: string;
   selectedGroup: number | null | "all";
   onSelectGroup: (group: number | null | "all") => void;
   selectedHostId: number | null;
@@ -383,17 +383,39 @@ export function HostTreeAside({
         },
       }
     : hostActions;
-  // 树的展开状态（本机布局，记在设置里）；搜索时有匹配的分组自动展开
+  // 树自己的搜索框（UI-7）：只在这个树实例里记着（不持久化）。主机页和终端界面各有一个
+  // 实例、各管各的词：搜索是「找到并连上」的一次性动作，连完切到终端界面时树应该是完整的，
+  // 不该带着上一次的过滤；也避免和主机页右侧那个大搜索框互相影响。
+  const [search, setSearch] = useState("");
+  const [activeId, setActiveId] = useState<number | null>(null);
+  const asideRef = useRef<HTMLElement>(null);
+  const filter = useMemo(() => treeFilterFor(groups, hosts, search), [groups, hosts, search]);
+  const order = useMemo(
+    () => (filter ? filteredHostOrder(groups, hosts, filter) : []),
+    [groups, hosts, filter],
+  );
+  // 高亮的那台必须还在结果里（主机被删、搜索词变了都算没有）
+  const activeHostId = order.some((host) => host.id === activeId) ? activeId : null;
+  useEffect(() => {
+    if (activeHostId === null) return;
+    asideRef.current
+      ?.querySelector<HTMLElement>('[data-search-active="true"]')
+      ?.scrollIntoView?.({ block: "nearest" });
+  }, [activeHostId]);
+  // 树的展开状态（本机布局，记在设置里）。搜索时显示出来的分组一律自动展开，
+  // 用户自己的展开状态原样不动，清空搜索后恢复。
   const expandedRaw = useSettings((state) => state["layout.vault_expanded"]);
   const updateSetting = useSettings((state) => state.update);
   const expanded = useMemo(() => parseExpanded(expandedRaw), [expandedRaw]);
-  const autoExpanded = useMemo(
-    () => autoExpandedFor(groups, hosts, query),
-    [groups, hosts, query],
-  );
-  const isExpanded = (key: string) => expanded.has(key) || autoExpanded.has(key);
-  const toggle = (key: string) =>
+  const isExpanded = (key: string) => {
+    if (filter === null) return expanded.has(key);
+    return key === UNGROUPED_KEY ? filter.ungrouped : filter.groupIds.has(Number(key.slice(1)));
+  };
+  const toggle = (key: string) => {
+    // 搜索时展开状态是自动的，点箭头不去改用户存着的展开状态
+    if (filter !== null) return;
     void updateSetting("layout.vault_expanded", serializeExpanded(toggleExpanded(expanded, key)));
+  };
   // 收起（本机布局）：主机页和终端界面共用这一个开关
   const collapsed = useSettings((state) => state["layout.vault_sidebar_collapsed"]);
   const setCollapsed = (value: boolean) => void updateSetting("layout.vault_sidebar_collapsed", value);
@@ -421,6 +443,7 @@ export function HostTreeAside({
         )
       ) : (
       <aside
+        ref={asideRef}
         data-section="vault-sidebar"
         className="relative flex shrink-0 flex-col border-r border-border/60 bg-background"
         style={{ width }}
@@ -433,7 +456,7 @@ export function HostTreeAside({
           onCommit={onCommit}
           onReset={onReset}
         />
-        <div className="flex items-center gap-1 p-3">
+        <div className="flex items-center gap-1 p-3 pb-2">
           <Button
             variant="outline"
             className="h-[30px] flex-1 text-[13px] font-normal"
@@ -445,16 +468,44 @@ export function HostTreeAside({
             <PanelLeftClose size={15} />
           </Button>
         </div>
+        <TreeSearchBox
+          value={search}
+          onChange={(value) => {
+            setSearch(value);
+            setActiveId(null);
+          }}
+          onMove={(delta) => {
+            if (order.length === 0) return;
+            const index = order.findIndex((host) => host.id === activeHostId);
+            const next =
+              index < 0
+                ? delta > 0
+                  ? 0
+                  : order.length - 1
+                : Math.min(order.length - 1, Math.max(0, index + delta));
+            setActiveId(order[next].id);
+          }}
+          onConnect={() => {
+            const target = order.find((host) => host.id === activeHostId) ?? order[0];
+            if (target) treeActions.connect(target);
+          }}
+        />
         <ScrollArea className="min-h-0 flex-1">
           <div className="px-2 pb-2">
+            {filter !== null && filter.total === 0 && filter.groupIds.size === 0 && !filter.ungrouped ? (
+              <div data-section="tree-search-empty" className="px-2 py-6 text-center text-[13px] text-muted-foreground">
+                没有匹配的主机
+              </div>
+            ) : (
+              <>
             <GroupRow
               label="全部主机"
-              count={hosts.length}
+              count={filter ? filter.total : hosts.length}
               active={selectedGroup === "all"}
               onClick={() => onSelectGroup("all")}
             />
             {groups
-              .filter((group) => group.parent_id === null)
+              .filter((group) => group.parent_id === null && (filter === null || filter.groupIds.has(group.id)))
               .map((group) => (
                 <GroupBranch
                   key={group.id}
@@ -464,7 +515,8 @@ export function HostTreeAside({
                   last={false}
                   groups={groups}
                   hosts={hosts}
-                  query={query}
+                  filter={filter}
+                  activeHostId={activeHostId}
                   selected={selectedGroup}
                   selectedHostId={selectedHostId}
                   isExpanded={isExpanded}
@@ -476,9 +528,10 @@ export function HostTreeAside({
                   hostActions={treeActions}
                 />
               ))}
+            {(filter === null || filter.ungrouped) && (
             <GroupRow
-              label="未分组"
-              count={hosts.filter((host) => host.group_id === null).length}
+              label={filter ? <Highlight text="未分组" term={filter.text} /> : "未分组"}
+              count={hostsUnder(hosts, null, filter).length}
               active={selectedGroup === null}
               onClick={() => onSelectGroup(null)}
               dropGroup={null}
@@ -495,8 +548,10 @@ export function HostTreeAside({
               expanded={isExpanded(UNGROUPED_KEY)}
               onToggle={() => toggle(UNGROUPED_KEY)}
             />
-            {isExpanded(UNGROUPED_KEY) &&
-              hostsUnder(hosts, null, query).map((host, index, list) => (
+            )}
+            {(filter === null || filter.ungrouped) &&
+              isExpanded(UNGROUPED_KEY) &&
+              hostsUnder(hosts, null, filter).map((host, index, list) => (
                 <HostLeaf
                   key={host.id}
                   host={host}
@@ -504,8 +559,12 @@ export function HostTreeAside({
                   guide={{ trail: [], last: index === list.length - 1, kind: "host" }}
                   selected={selectedHostId === host.id}
                   actions={treeActions}
+                  term={filter?.text}
+                  searchActive={activeHostId === host.id}
                 />
               ))}
+              </>
+            )}
           </div>
         </ScrollArea>
         <div className="flex shrink-0 items-center gap-1 border-t border-border/60 p-2">
@@ -546,7 +605,7 @@ function GroupRow({
   dropGroup,
   guide,
 }: {
-  label: string;
+  label: React.ReactNode;
   count: number;
   active: boolean;
   onClick: () => void;
@@ -627,7 +686,8 @@ function GroupBranch({
   last,
   groups,
   hosts,
-  query,
+  filter,
+  activeHostId,
   selected,
   selectedHostId,
   isExpanded,
@@ -646,7 +706,10 @@ function GroupBranch({
   last: boolean;
   groups: Group[];
   hosts: Host[];
-  query: string;
+  /** 搜索框的过滤结果；没在搜索是 null。 */
+  filter: TreeFilter | null;
+  /** 搜索结果里键盘高亮的那台。 */
+  activeHostId: number | null;
   selected: number | null | "all";
   selectedHostId: number | null;
   isExpanded: (key: string) => boolean;
@@ -657,19 +720,21 @@ function GroupBranch({
   onDeleteGroup: (group: Group) => void;
   hostActions: HostActions;
 }) {
-  const children = groups.filter((item) => item.parent_id === group.id);
+  const children = groups.filter(
+    (item) => item.parent_id === group.id && (filter === null || filter.groupIds.has(item.id)),
+  );
   const key = groupKey(group.id);
   const open = isExpanded(key);
   // 子项的显示顺序是先子分组后主机；最后一个子项画成 └
-  const shownHosts = open ? hostsUnder(hosts, group.id, query) : [];
+  const shownHosts = open ? hostsUnder(hosts, group.id, filter) : [];
   // 子项们的祖先竖线：本组后面还有兄弟，竖线就得穿过它的子孙行（顶层没有竖线）
   const childTrail = depth === 0 ? [] : [...trail, !last];
   return (
     <>
       <GroupRow
-        label={group.name}
+        label={filter ? <Highlight text={group.name} term={filter.text} /> : group.name}
         guide={depth === 0 ? undefined : { trail, last, kind: "group" }}
-        count={totalUnder(groups, hosts, group.id)}
+        count={filter ? (filter.counts.get(group.id) ?? 0) : totalUnder(groups, hosts, group.id)}
         active={selected === group.id}
         onClick={() => onSelect(group.id)}
         dropGroup={group.id}
@@ -704,7 +769,8 @@ function GroupBranch({
             last={shownHosts.length === 0 && index === children.length - 1}
             groups={groups}
             hosts={hosts}
-            query={query}
+            filter={filter}
+            activeHostId={activeHostId}
             selected={selected}
             selectedHostId={selectedHostId}
             isExpanded={isExpanded}
@@ -725,6 +791,8 @@ function GroupBranch({
             guide={{ trail: childTrail, last: index === shownHosts.length - 1, kind: "host" }}
             selected={selectedHostId === host.id}
             actions={hostActions}
+            term={filter?.text}
+            searchActive={activeHostId === host.id}
           />
         ))}
     </>
@@ -744,6 +812,98 @@ export interface HostActions {
   forwards?: (host: Host) => void;
 }
 
+/** 把文字里匹配搜索词（已转小写）的部分用 <mark> 标出来，不区分大小写。 */
+function Highlight({ text, term }: { text: string; term: string }) {
+  if (term === "") return <>{text}</>;
+  const lower = text.toLowerCase();
+  // 个别字符转小写后长度会变，位置对不上就不高亮，宁可不标也别标错
+  if (lower.length !== text.length) return <>{text}</>;
+  const parts: React.ReactNode[] = [];
+  let from = 0;
+  for (let at = lower.indexOf(term); at >= 0; at = lower.indexOf(term, from)) {
+    if (at > from) parts.push(text.slice(from, at));
+    parts.push(
+      <mark key={at} className="rounded-sm bg-primary/25 text-inherit">
+        {text.slice(at, at + term.length)}
+      </mark>,
+    );
+    from = at + term.length;
+  }
+  parts.push(text.slice(from));
+  return <>{parts}</>;
+}
+
+/** 名字没匹配、是靠地址 / 用户名 / 标签匹配到的：返回匹配的那一项，让用户看得出为什么在结果里。 */
+function matchHint(host: Host, term: string): string | null {
+  if (host.name.toLowerCase().includes(term)) return null;
+  if (host.host.toLowerCase().includes(term)) return host.host;
+  if (host.username.toLowerCase().includes(term)) return host.username;
+  return host.tags.find((tag) => tag.toLowerCase().includes(term)) ?? null;
+}
+
+/**
+ * 主机树顶部的搜索框（像 Xshell 会话管理器）。输入法：普通输入框，按 IME-3 属于英文区，
+ * 不需要特别处理。
+ */
+function TreeSearchBox({
+  value,
+  onChange,
+  onMove,
+  onConnect,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onMove: (delta: 1 | -1) => void;
+  onConnect: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <div className="relative shrink-0 px-3 pb-2">
+      <Search className="pointer-events-none absolute left-5 top-[calc(50%-4px)] h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        ref={inputRef}
+        data-section="tree-search"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing) return;
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            onMove(event.key === "ArrowDown" ? 1 : -1);
+          } else if (event.key === "Enter") {
+            event.preventDefault();
+            onConnect();
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            if (value !== "") onChange("");
+            else inputRef.current?.blur();
+          }
+        }}
+        className="h-7 pl-7 pr-7 text-[13px] font-normal"
+        placeholder="搜索主机"
+        aria-label="搜索主机树"
+        spellCheck={false}
+        autoComplete="off"
+      />
+      {value !== "" && (
+        <button
+          type="button"
+          title="清空搜索"
+          aria-label="清空搜索"
+          onClick={() => {
+            onChange("");
+            inputRef.current?.focus();
+          }}
+          className="absolute right-4 top-[calc(50%-4px)] flex h-5 w-5 -translate-y-1/2 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+        >
+          <X size={13} />
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** 树里的一台主机：单击看详情，双击连接，右键菜单和卡片一样。 */
 function HostLeaf({
   host,
@@ -751,6 +911,8 @@ function HostLeaf({
   guide,
   selected,
   actions,
+  term,
+  searchActive = false,
 }: {
   host: Host;
   depth: number;
@@ -758,12 +920,18 @@ function HostLeaf({
   guide: TreeGuide;
   selected: boolean;
   actions: HostActions;
+  /** 树搜索框里的词（小写）；用来高亮，没在搜索不传。 */
+  term?: string;
+  /** 搜索结果里键盘高亮的行。 */
+  searchActive?: boolean;
 }) {
+  const hint = term ? matchHint(host, term) : null;
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <button
           data-section="tree-host"
+          data-search-active={searchActive ? "true" : undefined}
           data-drop-group={host.group_id ?? "none"}
           onPointerDown={(event) => startHostDrag(host, event)}
           onClick={(event) => !dragJustEnded() && actions.select(host, event.detail)}
@@ -774,10 +942,16 @@ function HostLeaf({
           className={cn(
             "flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[13px] transition-colors",
             selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
+            searchActive && "bg-accent/70 ring-1 ring-inset ring-primary/60",
           )}
         >
           <OsIcon hostId={host.id} size="tree" />
-          <span className="truncate">{host.name}</span>
+          <span className="truncate">{term ? <Highlight text={host.name} term={term} /> : host.name}</span>
+          {hint && (
+            <span data-section="tree-match-hint" className="ml-auto max-w-[45%] shrink-0 truncate text-[11px] text-muted-foreground">
+              <Highlight text={hint} term={term ?? ""} />
+            </span>
+          )}
         </button>
       </ContextMenuTrigger>
       <HostMenu

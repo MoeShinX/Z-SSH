@@ -9,9 +9,10 @@
 //! mousedown / mouseup / click 都带它，Chromium 也是这样），>= 2 才是双击；同时要求
 //! 前一下点的是同一个链接实例（网址和缓冲区范围都相同），屏幕上两处相同网址各点一下不算。
 //! 判定通过后清掉记录，连点三下不会开两个页面。
-
-/** 两下点击算双击的最长间隔（毫秒），取 Windows 默认的双击时间；是计数之外的第二道保险。 */
-export const LINK_DOUBLE_CLICK_MS = 500;
+//!
+//! **不再另设固定的时间窗口**：浏览器给出 `detail >= 2`，本身就代表操作系统按用户设置的
+//! 双击时间认定这是一次双击（Windows 的双击时间可以调到 5 秒，写死 500ms 会把调慢了的
+//! 用户的双击拒掉）。
 
 /** 按下到抬起之间移动超过这个距离（像素）就是拖选，不算点击链接。 */
 export const LINK_CLICK_MOVE_PX = 4;
@@ -84,26 +85,19 @@ export interface LinkDoubleClickGate {
   reset: () => void;
 }
 
-export function createLinkDoubleClickGate(
-  now: () => number = () => Date.now(),
-  windowMs: number = LINK_DOUBLE_CLICK_MS,
-): LinkDoubleClickGate {
-  let candidate: { uri: string; range: LinkRange; at: number } | null = null;
+export function createLinkDoubleClickGate(): LinkDoubleClickGate {
+  let candidate: { uri: string; range: LinkRange } | null = null;
   return {
     isDoubleClick(click) {
-      const at = now();
       if (click.detail >= 2) {
         // 第二下及以后：只有前面记着同一个链接实例的第一下才算；不管结果如何都清掉候选
         const first = candidate;
         candidate = null;
         return (
-          first !== null &&
-          first.uri === click.uri &&
-          sameLinkRange(first.range, click.range) &&
-          at - first.at <= windowMs
+          first !== null && first.uri === click.uri && sameLinkRange(first.range, click.range)
         );
       }
-      candidate = { uri: click.uri, range: click.range, at };
+      candidate = { uri: click.uri, range: click.range };
       return false;
     },
     reset() {

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::super::{
     ApprovalDecision, ApprovalRequest, Approver, AuditEntry, AuditLog, Bridge, BridgeHost,
-    ExecDecision, ExecMode, ExecModeProvider,
+    ExecDecision, ExecMode, ExecModeProvider, ExecTargetReport,
 };
 use crate::ai::files::testfs::MemFs;
 use crate::ai::files::RemoteFs;
@@ -30,6 +30,9 @@ impl ExecModeProvider for Mode {
 struct FsHost {
     fs: Arc<MemFs>,
     opened: AtomicUsize,
+    /// 每次开文件系统用的 ID（绑定了会话就是会话 ID）和收到的执行位置回报。
+    opened_for: Mutex<Vec<String>>,
+    reports: Mutex<Vec<ExecTargetReport>>,
 }
 
 impl BridgeHost for FsHost {
@@ -51,11 +54,16 @@ impl BridgeHost for FsHost {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn report_target(&self, report: ExecTargetReport) {
+        self.reports.lock().unwrap().push(report);
+    }
+
     fn remote_fs<'a>(
         &'a self,
-        _target_id: &'a str,
+        target_id: &'a str,
     ) -> BoxFuture<'a, Result<Arc<dyn RemoteFs>, String>> {
         self.opened.fetch_add(1, Ordering::SeqCst);
+        self.opened_for.lock().unwrap().push(target_id.to_owned());
         let fs: Arc<dyn RemoteFs> = self.fs.clone();
         Box::pin(async move { Ok(fs) })
     }
@@ -110,6 +118,8 @@ fn rig(mode: ExecMode, answer: Answer) -> Rig {
     let host = Arc::new(FsHost {
         fs: fs.clone(),
         opened: AtomicUsize::new(0),
+        opened_for: Mutex::new(Vec::new()),
+        reports: Mutex::new(Vec::new()),
     });
     let approvals = Arc::new(Approvals {
         answer,
@@ -753,4 +763,68 @@ async fn read_tools_do_not_return_content_when_the_target_is_removed_mid_read() 
         );
         assert!(!response.to_string().contains("audit-witness"));
     }
+}
+
+#[tokio::test]
+async fn file_tools_open_the_bound_session_and_report_where_they_run() {
+    // 逻辑目标 host-7 绑定了会话 sess-9：文件通道开在绑定的会话上，开通道之前就把
+    // 实际执行位置回报给界面；写文件的确认请求带同一份位置。
+    let rig = rig(ExecMode::Manual, Answer::Allow);
+    rig.fs.put("/home/u/a.txt", b"hello\n", 0o644);
+    let handle = rig.bridge.create_scope();
+    handle.add_target_summary(crate::ai::protocol::TargetSummary {
+        id: "host-7".to_owned(),
+        host_label: "web-1".to_owned(),
+        username: "root".to_owned(),
+        status: "connected".to_owned(),
+        current: true,
+        pinned: false,
+        session_id: Some("sess-9".to_owned()),
+    });
+    let cap = handle.capability().to_owned();
+
+    call(&rig, &cap, METHOD_LIST_DIR, json!({ "path": "~" }))
+        .await
+        .unwrap();
+    call(&rig, &cap, METHOD_STAT, json!({ "path": "a.txt" }))
+        .await
+        .unwrap();
+    call(&rig, &cap, METHOD_READ_FILE, json!({ "path": "a.txt" }))
+        .await
+        .unwrap();
+    call(
+        &rig,
+        &cap,
+        METHOD_WRITE_FILE,
+        json!({ "path": "b.txt", "content": "x" }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *rig.host.opened_for.lock().unwrap(),
+        vec!["sess-9"; 4],
+        "四个文件工具都开在绑定的会话上"
+    );
+    let reports = rig.host.reports.lock().unwrap().clone();
+    let seen: Vec<(&str, &str)> = reports
+        .iter()
+        .map(|r| (r.tool.as_str(), r.key.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("list_dir", "~"),
+            ("stat", "a.txt"),
+            ("read_file", "a.txt"),
+            ("write_file", "b.txt"),
+        ]
+    );
+    assert!(reports.iter().all(|r| r.target_id == "host-7"
+        && r.session_id.as_deref() == Some("sess-9")
+        && r.host_label == "web-1"));
+    let approvals = rig.approvals.requests.lock().unwrap().clone();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].target_id, "host-7");
+    assert_eq!(approvals[0].session_id.as_deref(), Some("sess-9"));
 }

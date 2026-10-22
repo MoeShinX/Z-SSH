@@ -35,7 +35,6 @@ const noop = () => {};
 
 function asideProps() {
   return {
-    query: "",
     selectedGroup: "all" as const,
     onSelectGroup: noop,
     selectedHostId: null,

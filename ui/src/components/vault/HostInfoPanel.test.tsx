@@ -21,7 +21,13 @@ vi.mock("../../api/settings", () => ({
 }));
 
 import type { Host, Proxy } from "../../api/vault";
-import { COLLAPSE_DELAY_MS, resetHostInfoForTests, useHostInfoId } from "../../state/hostInfoPanel";
+import { setDoubleClickMsForTests } from "../../state/doubleClickTime";
+import {
+  COLLAPSE_MARGIN_MS,
+  collapseDelayMs,
+  resetHostInfoForTests,
+  useHostInfoId,
+} from "../../state/hostInfoPanel";
 import { UNGROUPED_KEY } from "../../state/hostTree";
 import { useSettings } from "../../stores/settings";
 import { useVault } from "../../stores/vault";
@@ -71,7 +77,6 @@ function setup(infoPanel: boolean) {
   const noop = () => {};
   render(
     <HostTreeAside
-      query=""
       selectedGroup="all"
       onSelectGroup={noop}
       selectedHostId={null}
@@ -103,6 +108,7 @@ const advance = (ms: number) => act(() => void vi.advanceTimersByTime(ms));
 beforeEach(() => {
   vi.useFakeTimers();
   resetHostInfoForTests();
+  setDoubleClickMsForTests(null);
   useVault.setState({
     groups: [],
     hosts: [
@@ -146,7 +152,7 @@ describe("终端界面主机树的属性面板", () => {
     expect(actions.select).toHaveBeenCalledTimes(1);
 
     fireEvent.click(leaf("web-1"));
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
     expect(panel()).toBeNull();
   });
 
@@ -154,7 +160,7 @@ describe("终端界面主机树的属性面板", () => {
     setup(true);
     fireEvent.click(leaf("web-1"));
     fireEvent.click(leaf("db-2"));
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
 
     expect(panel()).not.toBeNull();
     expect(panel()?.textContent).toContain("db-2");
@@ -171,7 +177,7 @@ describe("终端界面主机树的属性面板", () => {
     fireEvent.click(el);
     fireEvent.click(el);
     fireEvent.doubleClick(el);
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
     expect(actions.connect).toHaveBeenCalledTimes(1);
     expect(panel()).not.toBeNull();
 
@@ -180,7 +186,7 @@ describe("终端界面主机树的属性面板", () => {
     expect(panel()).not.toBeNull();
     fireEvent.click(el);
     fireEvent.doubleClick(el);
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
     expect(actions.connect).toHaveBeenCalledTimes(2);
     expect(panel()).not.toBeNull();
   });
@@ -200,7 +206,7 @@ describe("终端界面主机树的属性面板", () => {
     advance(gap);
     fireEvent.click(el, { detail: 2 });
     fireEvent.doubleClick(el, { detail: 2 });
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
 
     expect(seen.every((id) => id === 1)).toBe(true);
     expect(panel()).not.toBeNull();
@@ -212,10 +218,10 @@ describe("终端界面主机树的属性面板", () => {
     const el = leaf("web-1");
     fireEvent.click(el, { detail: 1 });
     fireEvent.click(el, { detail: 2 });
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
     expect(panel()).not.toBeNull();
     fireEvent.click(el, { detail: 3 });
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
     expect(panel()).not.toBeNull();
   });
 
@@ -225,8 +231,53 @@ describe("终端界面主机树的属性面板", () => {
     fireEvent.click(el, { detail: 1 });
     expect(panel()).not.toBeNull();
     fireEvent.click(el, { detail: 1 });
-    advance(COLLAPSE_DELAY_MS + 10);
+    advance(collapseDelayMs() + 10);
     expect(panel()).toBeNull();
+  });
+
+  it("收起延迟 = 系统双击时间 + 余量：默认 500ms 档", () => {
+    setup(true);
+    const el = leaf("web-1");
+    fireEvent.click(el, { detail: 1 });
+    fireEvent.click(el, { detail: 1 });
+    advance(500 + COLLAPSE_MARGIN_MS - 10);
+    expect(panel()).not.toBeNull();
+    advance(20);
+    expect(panel()).toBeNull();
+  });
+
+  it("系统双击时间调到 650ms：收起延迟跟着变长", () => {
+    setDoubleClickMsForTests(650);
+    expect(collapseDelayMs()).toBe(650 + COLLAPSE_MARGIN_MS);
+    setup(true);
+    const el = leaf("web-1");
+    fireEvent.click(el, { detail: 1 });
+    fireEvent.click(el, { detail: 1 });
+    advance(500 + COLLAPSE_MARGIN_MS + 10);
+    expect(panel()).not.toBeNull();
+    advance(650 - 500);
+    expect(panel()).toBeNull();
+  });
+
+  it("系统双击时间 650ms、两下相隔 600ms 的慢双击：面板全程没有收起过，连接只执行一次", () => {
+    setDoubleClickMsForTests(650);
+    const seen: (number | null)[] = [];
+    render(<HostInfoProbe seen={seen} />);
+    const actions = setup(true);
+    const el = leaf("web-1");
+    fireEvent.click(el, { detail: 1 });
+    expect(panel()).not.toBeNull();
+    seen.length = 0;
+
+    fireEvent.click(el, { detail: 1 });
+    advance(600);
+    fireEvent.click(el, { detail: 2 });
+    fireEvent.doubleClick(el, { detail: 2 });
+    advance(collapseDelayMs() + 10);
+
+    expect(seen.every((id) => id === 1)).toBe(true);
+    expect(panel()).not.toBeNull();
+    expect(actions.connect).toHaveBeenCalledTimes(1);
   });
 
   it("有跳板机 / 指定代理时多出对应的行，显示名字", () => {

@@ -13,6 +13,7 @@ pub mod sftp_paste;
 pub mod sftp_size;
 pub mod stats;
 pub mod sync;
+pub mod system;
 pub mod tray;
 pub mod update;
 pub mod vault;

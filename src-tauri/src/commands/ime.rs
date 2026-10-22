@@ -136,16 +136,34 @@ impl SharedIme {
             }
             return false;
         }
-        if !self.owners.remove(window) || !self.owners.is_empty() {
+        let was_owner = self.owners.remove(window);
+        if !self.owners.is_empty() {
+            return false;
+        }
+        // 没人在英文区却还留着记录：是窗口销毁时恢复没成功留下的（见 `window_destroyed`），
+        // 任何窗口的离开都顺手补一次；这种补发不算这个窗口欠的
+        if !was_owner && self.state.saved.is_none() {
             return false;
         }
         if self.state.apply(false, ime) {
-            // 恢复没成功：留着记录，等这个窗口下一次补发离开
-            self.owners.insert(window.to_owned());
-            true
+            // 恢复没成功：留着记录，等下一次补发离开
+            if was_owner {
+                self.owners.insert(window.to_owned());
+            }
+            was_owner
         } else {
             false
         }
+    }
+
+    /// 窗口销毁：前端来不及发离开，从这里直接把它从英文区名单里去掉。
+    /// 它是最后一个在英文区的就恢复；恢复没成功时记录保留（`owners` 已空），
+    /// 由之后任意窗口的下一次离开补上。没登记过的窗口什么都不做。
+    fn window_destroyed(&mut self, window: &str, ime: &mut impl ImeControl) {
+        if !self.owners.remove(window) || !self.owners.is_empty() {
+            return;
+        }
+        self.state.apply(false, ime);
     }
 }
 
@@ -165,6 +183,14 @@ pub async fn ime_terminal_focus(window: tauri::Window, focused: bool) -> Result<
         let _ = (window, focused);
         Ok(false)
     }
+}
+
+/// 窗口被销毁（主窗口、文件窗口）：把它从英文区名单里移除，必要时恢复输入法。
+pub fn window_destroyed(label: &str) {
+    #[cfg(windows)]
+    imp::window_destroyed(label);
+    #[cfg(not(windows))]
+    let _ = label;
 }
 
 #[cfg(windows)]
@@ -196,6 +222,15 @@ mod imp {
         state
             .get_or_insert_with(SharedIme::default)
             .apply(window, focused, &mut Win32Ime)
+    }
+
+    pub fn window_destroyed(window: &str) {
+        let mut state = STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(shared) = state.as_mut() {
+            shared.window_destroyed(window, &mut Win32Ime);
+        }
     }
 
     struct Win32Ime;
@@ -616,5 +651,81 @@ mod tests {
         ime.reachable = true;
         assert!(!shared.apply("main", false, &mut ime));
         assert!(ime.writes.is_empty());
+    }
+
+    #[test]
+    fn destroying_the_only_english_window_restores_for_the_ai_box() {
+        // 文件窗口在英文区时被关掉；主窗口之前的离开已被它挡住（返回 false、没恢复）
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("main", true, &mut ime);
+        shared.apply("files", true, &mut ime);
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, ENGLISH);
+        shared.window_destroyed("files", &mut ime);
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(shared.state.saved, None);
+        assert!(shared.owners.is_empty());
+    }
+
+    #[test]
+    fn destroying_one_of_two_english_windows_keeps_english() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("main", true, &mut ime);
+        shared.apply("files", true, &mut ime);
+        shared.window_destroyed("files", &mut ime);
+        assert_eq!(ime.mode, ENGLISH);
+        assert!(shared.state.saved.is_some());
+        // 剩下的主窗口离开才恢复
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+    }
+
+    #[test]
+    fn destroying_an_unregistered_window_has_no_effect() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.window_destroyed("files", &mut ime);
+        assert!(ime.writes.is_empty());
+        shared.apply("main", true, &mut ime);
+        let writes = ime.writes.len();
+        shared.window_destroyed("files", &mut ime);
+        assert_eq!(ime.writes.len(), writes);
+        assert_eq!(ime.mode, ENGLISH);
+        assert!(shared.owners.contains("main"));
+    }
+
+    #[test]
+    fn failed_restore_on_destroy_is_retried_by_the_next_leave_of_any_window() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("main", true, &mut ime);
+        shared.apply("files", true, &mut ime);
+        shared.apply("main", false, &mut ime);
+        // 销毁时前台不是本进程：恢复不了，记录保留
+        ime.reachable = false;
+        shared.window_destroyed("files", &mut ime);
+        assert!(shared.state.saved.is_some());
+        assert!(shared.owners.is_empty());
+        // 主窗口回到前台后再发一次离开（它本身不欠恢复，返回 false）：补上
+        ime.reachable = true;
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(shared.state.saved, None);
+    }
+
+    #[test]
+    fn enter_after_a_failed_destroy_restore_keeps_the_original_mode() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("files", true, &mut ime);
+        ime.reachable = false;
+        shared.window_destroyed("files", &mut ime);
+        ime.reachable = true;
+        assert!(shared.apply("main", true, &mut ime));
+        assert_eq!(shared.state.saved, Some(CHINESE));
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
     }
 }

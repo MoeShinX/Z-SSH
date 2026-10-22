@@ -333,6 +333,11 @@ impl AppState {
             })
     }
 
+    /// 会话表里有没有这个会话（连着的或者还在连接中的都算）。AI 判断界面绑定的会话还在不在用。
+    pub async fn has_session(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
+    }
+
     /// AI-2c：向一个会话的终端写入字节（发 Ctrl+C 之类）。
     pub async fn write_raw(&self, session_id: &str, data: Vec<u8>) -> bool {
         // 先放全局锁再等队列空位（C16）。
@@ -533,6 +538,19 @@ mod tests {
         .expect("全局会话表不能被一个满队列卡住");
         raw.abort();
         timed_out.abort();
+    }
+
+    #[tokio::test]
+    async fn has_session_counts_connecting_and_open_sessions() {
+        // AI 判断界面绑定的会话还在不在：连接中的也算在（要等它，不能另开一个）。
+        let (state, _known_hosts_dir) = test_state();
+        assert!(!state.has_session("sess-1").await);
+        state
+            .insert_connecting("sess-1".to_owned(), Arc::new(CancelSignal::default()))
+            .await;
+        assert!(state.has_session("sess-1").await);
+        assert!(state.remove("sess-1").await.is_some());
+        assert!(!state.has_session("sess-1").await);
     }
 
     #[tokio::test]

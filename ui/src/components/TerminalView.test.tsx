@@ -447,14 +447,26 @@ describe("终端里的链接", () => {
     expect(fake.opened).toEqual([URI]);
   });
 
-  it("隔了很久的两次点击不算双击", () => {
+  it("两下相隔超过 500ms 但点击计数是 2（系统双击时间被调慢）：照样打开", () => {
     render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
     hover();
 
-    const now = vi.spyOn(Date, "now").mockReturnValueOnce(1000).mockReturnValueOnce(3000);
+    const now = vi.spyOn(Date, "now").mockReturnValueOnce(1000).mockReturnValueOnce(1600);
     activate(URI, { detail: 1 });
+    vi.advanceTimersByTime(600);
     activate(URI, { detail: 2 });
     now.mockRestore();
+
+    expect(fake.opened).toEqual([URI]);
+  });
+
+  it("点击计数没到 2（系统认定不是双击）：隔多近都不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    activate(URI, { detail: 1 });
+    vi.advanceTimersByTime(5);
+    activate(URI, { detail: 1 });
 
     expect(fake.opened).toEqual([]);
   });

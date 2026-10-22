@@ -16,18 +16,24 @@ export interface ToolCall {
   location?: "terminal" | "background";
   /** 降级到后台的原因。 */
   fallbackReason?: string;
-  /** 作用的目标（开始调用时记下，只在界面里用，不存历史；回看历史的卡片没有）。 */
-  target?: CallTarget;
+  /**
+   * 执行层回报的实际执行位置（AI-SCOPE-2：以后端的解析结果为准，前端不猜）。只在界面里用，
+   * 不存历史；回看历史的卡片没有。
+   */
+  exec?: ExecTarget;
+  /** 实时的、带目标的调用（回报没到、或者一直没有回报时界面要说明"执行目标未确定"）。 */
+  tracked?: boolean;
 }
 
-/** 一次工具调用作用在哪个目标上。 */
-export interface CallTarget {
-  /** 目标 ID（工具输入里的，省略时是当时的"当前"）：会话 ID 或 `host-<id>`。 */
-  id: string;
-  label: string;
-  hostId: number | null;
+/** 一次工具调用实际执行在哪个目标上（执行层解析并回报的）。 */
+export interface ExecTarget {
+  /** 逻辑目标 ID：`host-<id>`，快速连接是会话 ID。 */
+  targetId: string;
+  /** 执行用的会话；这台主机当时没有可用会话（自动连接）时为 null。 */
   sessionId: string | null;
-  /** 调用当时对话里有不止一个目标（卡片上要标明主机名）。 */
+  /** 主机显示名。 */
+  label: string;
+  /** 卡片上要标明主机名：对话里有不止一个目标，或者当时没有"当前"目标。 */
   multi: boolean;
 }
 

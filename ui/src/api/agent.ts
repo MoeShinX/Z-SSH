@@ -90,6 +90,8 @@ export interface ScopeTargetChange {
   status: string;
   current?: boolean;
   pinned?: boolean;
+  /** 这个目标绑定的会话（这台主机焦点所在 / 最近获得焦点的终端）；没有为 null。 */
+  session_id?: string | null;
 }
 
 /** @ 主机选择弹窗里的一项（主机库里的一台主机，不含地址）。 */
@@ -324,6 +326,9 @@ export interface ApprovalRequest {
   command: string;
   danger: string;
   reasons: string[];
+  /** 实际执行的目标和会话（和 `ai_exec_target` 同一份解析结果；会话为 null = 还没连上）。 */
+  target_id: string;
+  session_id: string | null;
   /** `run_command` 或 `write_file`（M3-4）。 */
   tool: string;
   /** `write_file` 的细节：写哪个文件、和现有文件的差异。 */
@@ -339,6 +344,29 @@ export interface ApprovalRequest {
       is_new: boolean;
     };
   } | null;
+}
+
+/**
+ * 执行层解析出的一次工具调用的实际执行位置（`ai_exec_target`，AI-SCOPE-2）：每次调用解析完
+ * 目标、真正开始之前发一次。卡片上的主机名、「查看终端」、标签上的活动点都用它。
+ */
+export interface ExecTargetReport {
+  scope: string;
+  /** 不带前缀的工具名：`run_command`、`read_terminal`、`list_dir`、`read_file`、`write_file`、`stat`。 */
+  tool: string;
+  /** 对到卡片上用的键：命令原文 / 调用时给的路径原文 / 空（`read_terminal`）。 */
+  key: string;
+  /** 逻辑目标 ID（`host-<id>`，快速连接是会话 ID）。 */
+  target_id: string;
+  /** 实际执行用的会话；这台主机现在没有可用会话（会自动连接）时为 null。 */
+  session_id: string | null;
+  host_label: string;
+}
+
+export function onExecTarget(
+  handler: (report: ExecTargetReport) => void,
+): Promise<UnlistenFn> {
+  return listen<ExecTargetReport>("ai_exec_target", (event) => handler(event.payload));
 }
 
 /** 回答一条确认请求（"执行 / 拒绝"按钮调它）。 */

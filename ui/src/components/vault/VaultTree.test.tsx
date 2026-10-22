@@ -94,7 +94,8 @@ describe("主机树", () => {
 
   it("搜索时有匹配主机的分组自动展开", async () => {
     render(<VaultView {...props()} />);
-    const search = screen.getByPlaceholderText(/搜索主机/);
+    // 树自己的搜索框（UI-7）；右侧大搜索框不再驱动树
+    const search = screen.getByLabelText("搜索主机树");
     await act(async () => fireEvent.change(search, { target: { value: "de1" } }));
     expect(treeHosts()).toEqual(["DE1 PVE"]);
   });

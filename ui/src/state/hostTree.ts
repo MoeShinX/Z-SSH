@@ -94,35 +94,96 @@ export function sortByRecent(hosts: Host[], recent: number[]): Host[] {
   });
 }
 
-/** 某个分组（null = 未分组）下面直接挂的主机，按名字排。 */
-export function hostsUnder(hosts: Host[], groupId: number | null, text: string): Host[] {
+/** 主机树搜索时「未分组」那一行的名字（名字本身也能被搜到）。 */
+export const UNGROUPED_LABEL = "未分组";
+
+/**
+ * 主机树搜索框的过滤结果（UI-7）。没在搜索时是 `null`。
+ * - 主机显示：自己匹配（名称 / 地址 / 用户名 / 标签），或所在分组（含上级分组）的名字匹配；
+ * - 分组显示：名字匹配（连同整个子树）、或子树里有显示的主机；显示的分组一律自动展开，
+ *   不碰用户自己的展开状态，清空搜索就恢复原样。
+ */
+export interface TreeFilter {
+  /** 去掉首尾空白并转小写的搜索词，用来高亮。 */
+  text: string;
+  hostIds: Set<number>;
+  groupIds: Set<number>;
+  /** 「未分组」行要不要显示（有显示的未分组主机，或它的名字匹配）。 */
+  ungrouped: boolean;
+  /** 每个显示的分组（含子分组）里显示的主机数。 */
+  counts: Map<number, number>;
+  /** 显示的主机总数。 */
+  total: number;
+}
+
+export function treeFilterFor(groups: Group[], hosts: Host[], rawText: string): TreeFilter | null {
+  const text = rawText.trim().toLowerCase();
+  if (text === "") return null;
+  const parentOf = new Map(groups.map((group) => [group.id, group.parent_id]));
+  const nameOf = new Map(groups.map((group) => [group.id, group.name.toLowerCase()]));
+  // 从这个分组一路往上（含自己），防环：最多走分组个数那么多步
+  const chain = (groupId: number | null): number[] => {
+    const ids: number[] = [];
+    let current = groupId;
+    for (let step = 0; current !== null && step <= groups.length; step += 1) {
+      ids.push(current);
+      current = parentOf.get(current) ?? null;
+    }
+    return ids;
+  };
+  const nameHit = (groupId: number): boolean => chain(groupId).some((id) => nameOf.get(id)?.includes(text));
+  const ungroupedNameHit = UNGROUPED_LABEL.includes(text);
+
+  const hostIds = new Set<number>();
+  const groupIds = new Set<number>();
+  const counts = new Map<number, number>();
+  let ungrouped = ungroupedNameHit;
+  for (const group of groups) {
+    if (nameHit(group.id)) groupIds.add(group.id);
+  }
+  for (const host of hosts) {
+    const visible =
+      hostMatches(host, text) ||
+      (host.group_id === null ? ungroupedNameHit : nameHit(host.group_id));
+    if (!visible) continue;
+    hostIds.add(host.id);
+    if (host.group_id === null) {
+      ungrouped = true;
+      continue;
+    }
+    for (const id of chain(host.group_id)) {
+      groupIds.add(id);
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+  }
+  return { text, hostIds, groupIds, ungrouped, counts, total: hostIds.size };
+}
+
+/** 某个分组（null = 未分组）下面直接挂的主机，按名字排；搜索时只留过滤结果里的。 */
+export function hostsUnder(hosts: Host[], groupId: number | null, filter: TreeFilter | null): Host[] {
   return hosts
-    .filter((host) => host.group_id === groupId && hostMatches(host, text))
+    .filter((host) => host.group_id === groupId && (filter === null || filter.hostIds.has(host.id)))
     .sort((a, b) => compareNames(a.name, b.name));
 }
 
 /**
- * 搜索时要自动展开的分组：里面（含子分组）有匹配的主机。没在搜索就是空集合
- * （按用户自己展开的来）。
+ * 搜索结果里的主机，按树里从上到下的显示顺序排（先分组及其子分组、再其中的主机，
+ * 最后是未分组），↑ ↓ 就是在这个顺序里移动。
  */
-export function autoExpandedFor(groups: Group[], hosts: Host[], text: string): Set<string> {
-  const result = new Set<string>();
-  if (text.trim() === "") return result;
-  const parentOf = new Map(groups.map((group) => [group.id, group.parent_id]));
-  for (const host of hosts) {
-    if (!hostMatches(host, text)) continue;
-    if (host.group_id === null) {
-      result.add(UNGROUPED_KEY);
-      continue;
+export function filteredHostOrder(groups: Group[], hosts: Host[], filter: TreeFilter): Host[] {
+  const order: Host[] = [];
+  const seen = new Set<number>();
+  const walk = (parentId: number | null) => {
+    for (const group of groups) {
+      if (group.parent_id !== parentId || seen.has(group.id) || !filter.groupIds.has(group.id)) continue;
+      seen.add(group.id);
+      walk(group.id);
+      order.push(...hostsUnder(hosts, group.id, filter));
     }
-    // 一路往上把祖先分组都展开（防环：最多走分组个数那么多步）
-    let current: number | null = host.group_id;
-    for (let step = 0; current !== null && step <= groups.length; step += 1) {
-      result.add(groupKey(current));
-      current = parentOf.get(current) ?? null;
-    }
-  }
-  return result;
+  };
+  walk(null);
+  order.push(...hostsUnder(hosts, null, filter));
+  return order;
 }
 
 /** 分组（含子分组）里一共有多少台主机。 */

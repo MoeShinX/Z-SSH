@@ -427,6 +427,7 @@ fn main() {
             commands::auth::hostkey_forget,
             commands::auth::hostkey_saved,
             commands::ime::ime_terminal_focus,
+            commands::system::system_double_click_time,
             commands::settings::settings_get,
             commands::settings::settings_set,
             commands::settings::default_proxy_get,
@@ -503,6 +504,8 @@ fn main() {
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::Destroyed => {
                 file_window::on_window_destroyed(window.app_handle(), window.label());
+                // 前端来不及发"离开"：直接把这个窗口从输入法英文区名单里移除
+                commands::ime::window_destroyed(window.label());
             }
             tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
                 schedule_window_state_save(window.app_handle());

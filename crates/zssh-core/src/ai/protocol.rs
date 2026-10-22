@@ -150,9 +150,9 @@ pub struct WriteFileParams {
 
 /// 给智能体看的目标摘要（一个对话的目标列表里的一项）。**不含地址和凭据。**
 ///
-/// 目标 ID 有两种：
-/// - 已经连上的会话：就是会话 ID（`sess-N`）；
-/// - 用户 @ 进来、还没连上的主机：`host-<host_id>`（AI 第一次用它时自动连接）。
+/// 目标 ID 有两种（AI-SCOPE-2：一台主机一个逻辑目标）：
+/// - 主机库里的主机：`host-<host_id>`，不管它现在开了几个终端、有没有连上，ID 都不变；
+/// - 快速连接这类没有主机记录的会话：会话 ID（`sess-N`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetSummary {
     pub id: String,
@@ -165,6 +165,10 @@ pub struct TargetSummary {
     /// 是不是用户 @ 进来的（非当前）。
     #[serde(default)]
     pub pinned: bool,
+    /// 界面绑定给这个目标的会话（这台主机焦点所在 / 最近获得焦点的终端）。执行时优先用它，
+    /// 没有或已经关了再找这台主机别的已连会话 / 自动连接。不给模型看（模型只认目标 ID）。
+    #[serde(default, skip_serializing)]
+    pub session_id: Option<String>,
 }
 
 /// @ 进来、还没连上的主机的目标 ID 前缀。

@@ -1,16 +1,24 @@
-//! AI 目标 ↔ 终端标签 / pane 的对应（AI-SCOPE-1）：「查看终端」跳转和后台标签的活动提示共用。
+//! AI 执行位置 ↔ 终端标签 / pane 的对应（AI-SCOPE-1、AI-SCOPE-2）：「查看终端」跳转和后台
+//! 标签的活动提示共用。
+//!
+//! 输入是执行层回报的实际执行位置（目标 ID + 执行用的会话），这里**不再猜**"这台主机的哪个
+//! 会话"：有会话就只认那个会话；回报时还没有会话（这台主机没有可用会话，后端在自动连接）
+//! 才按目标找新开的那个标签。
 import { parseHostTargetId } from "../components/ai/aiHelpers";
 import type { PaneSession, Tab } from "./sessions";
 import { paneIds } from "./splitTree";
 
+/** 执行层回报的执行位置：逻辑目标 ID + 执行用的会话（还没有会话为 null）。 */
 export interface TargetRef {
+  targetId: string;
   sessionId: string | null;
-  hostId: number | null;
 }
 
 /**
- * 目标对应哪个 pane：先按会话 ID；没有（或会话已关）再按主机，已连上的优先，
- * 正在连的也算（跳过去能看连接过程）。找不到返回 null。
+ * 执行位置对应哪个 pane：
+ * - 有会话 ID：就是持有这个会话的 pane，会话已经关了返回 null（不去猜这台主机的别的会话）；
+ * - 没有（回报时这台主机还没有可用会话，后端自动连接）：这台主机正在连的 pane 优先，其次已连上的，
+ *   同级取最新打开的。快速连接这类没有主机记录的目标没有会话就找不到。
  */
 export function paneForTarget(
   panes: Record<string, PaneSession>,
@@ -20,15 +28,18 @@ export function paneForTarget(
     for (const [paneId, pane] of Object.entries(panes)) {
       if (pane.sessionId === ref.sessionId) return paneId;
     }
+    return null;
   }
-  if (ref.hostId === null) return null;
-  let fallback: string | null = null;
+  const hostId = parseHostTargetId(ref.targetId);
+  if (hostId === null) return null;
+  let connecting: string | null = null;
+  let connected: string | null = null;
   for (const [paneId, pane] of Object.entries(panes)) {
-    if (pane.origin.kind !== "host" || pane.origin.hostId !== ref.hostId) continue;
-    if (pane.phase === "connected" && pane.sessionId) return paneId;
-    if (pane.phase !== "disconnected" && fallback === null) fallback = paneId;
+    if (pane.origin.kind !== "host" || pane.origin.hostId !== hostId) continue;
+    if (pane.phase === "connecting" || pane.phase === "authenticating") connecting = paneId;
+    else if (pane.phase === "connected") connected = paneId;
   }
-  return fallback;
+  return connecting ?? connected;
 }
 
 /** pane 所在的终端标签（SFTP / 编辑器标签没有 pane）。 */
@@ -50,19 +61,13 @@ export function locateTarget(
   return tab ? { tabId: tab.id, paneId } : null;
 }
 
-/** 目标 ID（会话 ID 或 `host-<id>`）所在的标签。 */
-export function tabForTargetId(
+/** 执行位置所在的标签。 */
+export function tabForTarget(
   tabs: Tab[],
   panes: Record<string, PaneSession>,
-  targetId: string,
+  ref: TargetRef,
 ): string | null {
-  const hostId = parseHostTargetId(targetId);
-  const located = locateTarget(
-    tabs,
-    panes,
-    hostId !== null ? { sessionId: null, hostId } : { sessionId: targetId, hostId: null },
-  );
-  return located?.tabId ?? null;
+  return locateTarget(tabs, panes, ref)?.tabId ?? null;
 }
 
 export type TabAiBadge = "running" | "unseen";
@@ -74,7 +79,7 @@ export type TabAiBadge = "running" | "unseen";
 export function aiTabBadges(
   tabs: Tab[],
   panes: Record<string, PaneSession>,
-  runningTargets: string[],
+  runningTargets: TargetRef[],
   unseenTabs: string[],
   watchedTabId: string | null,
 ): Record<string, TabAiBadge> {
@@ -82,8 +87,8 @@ export function aiTabBadges(
   for (const tabId of unseenTabs) {
     if (tabId !== watchedTabId && tabs.some((tab) => tab.id === tabId)) badges[tabId] = "unseen";
   }
-  for (const targetId of runningTargets) {
-    const tabId = tabForTargetId(tabs, panes, targetId);
+  for (const ref of runningTargets) {
+    const tabId = tabForTarget(tabs, panes, ref);
     if (tabId && tabId !== watchedTabId) badges[tabId] = "running";
   }
   return badges;
