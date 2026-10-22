@@ -205,27 +205,37 @@ impl CloseOnDrop {
             .ok_or_else(|| ZsshError::Shell("通道写半边已被取走".into()))
     }
 
-    /// 正常的失败路径：直接等着把通道关掉（有超时），不依赖 Drop。
+    /// 正常的失败路径：把通道关掉（有超时），等它关完再返回。
+    ///
+    /// 关闭放在独立的任务里跑、这里只等任务：等的过程中外层被取消（用户关掉窗格），
+    /// 丢掉的只是等待，关闭任务照样跑完。直接在这里 await `close()` 的话，写半边已经从
+    /// 守卫里取走，取消时它随这个 future 一起被丢掉，关闭可能发不出去，Drop 也兜不住。
     async fn close_now(mut self) {
-        if let Some(write_half) = self.write_half.take() {
+        if let Some(task) = self.write_half.take().and_then(spawn_close) {
+            let _ = task.await;
+        }
+    }
+}
+
+/// 在后台任务里关通道（带超时）。没有 tokio 运行时（运行时已经在关闭）时发不出去，
+/// 返回 `None`；连接此时也基本在随之关闭。
+fn spawn_close(write_half: ChannelWriteHalf<Msg>) -> Option<tokio::task::JoinHandle<()>> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => Some(runtime.spawn(async move {
             let _ = timeout(CLOSE_TIMEOUT, write_half.close()).await;
+        })),
+        Err(_) => {
+            tracing::debug!("没有 tokio 运行时，未能发送通道关闭");
+            None
         }
     }
 }
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
-        let Some(write_half) = self.write_half.take() else {
-            return;
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    let _ = timeout(CLOSE_TIMEOUT, write_half.close()).await;
-                });
-            }
-            // 没有运行时（运行时已经在关闭）：发不出异步消息，连接此时也基本在随之关闭。
-            Err(_) => tracing::debug!("开终端被取消时没有 tokio 运行时，未能发送通道关闭"),
+        if let Some(write_half) = self.write_half.take() {
+            // 不等：Drop 里不能 await，关闭任务自己跑完。
+            let _ = spawn_close(write_half);
         }
     }
 }

@@ -403,7 +403,7 @@ async fn cancelled_channel_is_closed_and_the_connection_stays_usable() {
     let mut shell = open(second, Duration::from_secs(5))
         .await
         .expect("第二个通道正常打开");
-    let out = collect_output(&mut shell, 8).await;
+    let out = collect_output(&mut shell, 7).await;
     assert_eq!(
         out,
         b"second
