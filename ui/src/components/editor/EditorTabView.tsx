@@ -62,6 +62,7 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
   const themeCompartment = useRef(new Compartment());
   const fontCompartment = useRef(new Compartment());
   const lockCompartment = useRef(new Compartment());
+  const historyCompartment = useRef(new Compartment());
   const [wrap, setWrap] = useState(false);
   const [cursor, setCursor] = useState({ line: 1, column: 1, selected: 0 });
   /** 本地文件保存冲突：弹对话框（重新载入 / 覆盖 / 另存为 / 取消）。 */
@@ -120,7 +121,7 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
         highlightActiveLineGutter(),
         highlightActiveLine(),
         drawSelection(),
-        history(),
+        historyCompartment.current.of(history()),
         indentOnInput(),
         bracketMatching(),
         highlightSelectionMatches(),
@@ -177,10 +178,14 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
     if (!view || !current || revision === lastRevision.current) return;
     lastRevision.current = revision;
     // 版本和未保存标记已经在 store 里随结果一起定好了，这里只换文本，不再单独改它们。
+    // 撤销历史一并清掉：换文本时先卸下 history，下一次再装回一个新的——否则 Ctrl+Z
+    // 能撤回到载入前的文本（被丢掉的修改），还会被当成普通修改标成未保存。
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: current.initialText },
       annotations: programmaticReplace.of(true),
+      effects: historyCompartment.current.reconfigure([]),
     });
+    view.dispatch({ effects: historyCompartment.current.reconfigure(history()) });
   }, [editId, revision]);
 
   // 重新载入期间编辑器只读（光标、选择、复制仍可用），载入完成或失败后恢复。

@@ -26,8 +26,18 @@ export const SFTP_SPLIT_DEFAULT = 0.5;
 /** 上下分隔线能拖到的范围：每一栏至少留这么多份额。 */
 export const SFTP_SPLIT_MIN = 0.15;
 
-/** 三种可调宽的面板。 */
-export type PanelKind = "ai" | "aside" | "sftp";
+/**
+ * 主机树侧栏（UI-5）：默认 224px（原来写死的 w-56）。
+ * 下限 180：顶栏左侧那一块（logo、侧栏开关、「主机」标签）要放得下，主机名也不至于太挤；
+ * 上限 min(480, 窗口宽的 40%)：再宽就是浪费终端的地方，同样要给终端留 TERMINAL_MIN。
+ */
+export const HOST_TREE_DEFAULT = 224;
+export const HOST_TREE_MIN = 180;
+export const HOST_TREE_MAX = 480;
+export const HOST_TREE_MAX_RATIO = 0.4;
+
+/** 四种可调宽的面板。 */
+export type PanelKind = "ai" | "aside" | "sftp" | "hostTree";
 
 /** 某种面板的宽度上下限（跟随窗口宽度）。 */
 export interface PanelBounds {
@@ -52,10 +62,13 @@ export function panelBounds(
       ? AI_PANEL_MAX_RATIO
       : kind === "sftp"
         ? SFTP_PANEL_MAX_RATIO
-        : ASIDE_PANEL_MAX_RATIO;
+        : kind === "hostTree"
+          ? HOST_TREE_MAX_RATIO
+          : ASIDE_PANEL_MAX_RATIO;
   const available = Math.max(0, Math.floor(windowWidth - TERMINAL_MIN - Math.max(0, reserved)));
-  const min = Math.min(PANEL_MIN, available);
-  const max = Math.max(min, Math.floor(Math.min(windowWidth * ratio, available)));
+  const min = Math.min(kind === "hostTree" ? HOST_TREE_MIN : PANEL_MIN, available);
+  const hardMax = kind === "hostTree" ? HOST_TREE_MAX : Number.POSITIVE_INFINITY;
+  const max = Math.max(min, Math.floor(Math.min(windowWidth * ratio, available, hardMax)));
   return { min, max };
 }
 
@@ -80,6 +93,38 @@ export function sanitizeStoredWidth(raw: unknown, fallback: number): number {
   if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
   if (raw <= 0 || raw > 20000) return fallback;
   return Math.round(raw);
+}
+
+// ---------------------------------------------------------------------------
+// 拖动中的宽度：同一个面板可能有几处在读（主机树的宽度同时决定侧栏、顶栏左侧块和
+// 终端区域的左边距），所以拖动期间的临时宽度放在模块级，大家订阅同一份。
+// ---------------------------------------------------------------------------
+
+const dragWidths = new Map<string, number>();
+const dragWidthListeners = new Set<() => void>();
+
+/** 某个设置键现在被拖到多宽了；没在拖是 null。 */
+export function getPanelDragWidth(key: string): number | null {
+  return dragWidths.get(key) ?? null;
+}
+
+/** 设置 / 清除（null）拖动中的宽度，并通知订阅者。 */
+export function setPanelDragWidth(key: string, width: number | null): void {
+  if (width === null) {
+    if (!dragWidths.delete(key)) return;
+  } else {
+    if (dragWidths.get(key) === width) return;
+    dragWidths.set(key, width);
+  }
+  for (const listener of dragWidthListeners) listener();
+}
+
+/** 订阅拖动中宽度的变化（给 useSyncExternalStore 用）。 */
+export function subscribePanelDragWidth(listener: () => void): () => void {
+  dragWidthListeners.add(listener);
+  return () => {
+    dragWidthListeners.delete(listener);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +158,7 @@ export function onPanelDragChange(listener: (dragging: boolean) => void): () => 
 export function resetPanelDraggingForTests(): void {
   dragging = false;
   listeners.clear();
+  dragWidths.clear();
 }
 
 /** 拖动期间加在 `<body>` 上的类：禁掉文字选中（UI-1 第 2 节）。 */

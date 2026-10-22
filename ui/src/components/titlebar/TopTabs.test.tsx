@@ -24,7 +24,11 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
-const themeMock = vi.hoisted(() => ({ terminalMode: "dark" as "light" | "dark" }));
+const themeMock = vi.hoisted(() => ({
+  terminalMode: "dark" as "light" | "dark",
+  /** 测试里临时覆盖的设置值（主机树宽度、是否收起）。 */
+  overrides: {} as Record<string, unknown>,
+}));
 
 // 主题入口用的是 settings store 和 radix dropdown，这里不关心
 vi.mock("../../stores/settings", () => ({
@@ -36,13 +40,17 @@ vi.mock("../../stores/settings", () => ({
       terminal_theme: "skin",
       quick_commands_bar: false,
       update: () => {},
+      ...themeMock.overrides,
     }),
   useResolvedMode: () => "dark",
   useTerminalMode: () => themeMock.terminalMode,
   useTerminalITheme: () => ({ background: "#1F1F1F", foreground: "#CCCCCC" }),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  themeMock.overrides = {};
+});
 
 beforeEach(() => {
   globalThis.ResizeObserver = class {
@@ -90,7 +98,7 @@ describe("标题栏拖动区（M1-09）", () => {
       expect(button.getAttribute("data-tauri-drag-region")).toBe("false");
     }
     // "主机"标签也不能拖
-    const hostTab = container.querySelector('[data-section="top-tabs"] > div');
+    const hostTab = container.querySelector('[data-section="top-tabs-left"] > div');
     expect(hostTab?.getAttribute("data-tauri-drag-region")).toBe("false");
   });
 });
@@ -185,5 +193,73 @@ describe("当前终端标签和终端的衔接", () => {
     expect(tab?.dataset.blend).toBeUndefined();
     expect(tab?.style.backgroundColor).toBe("");
     themeMock.terminalMode = "dark";
+  });
+});
+
+describe("顶栏左侧块和主机树对齐（UI-5）", () => {
+  function renderWithView(view: "vault" | "terminal" | "settings") {
+    return render(
+      <TopTabs
+        tabs={[]}
+        activeTabId=""
+        panes={{}}
+        view={view}
+        onShowVault={() => {}}
+        onOpenSettings={() => {}}
+        onSelectTab={() => {}}
+        onCloseTab={() => {}}
+        onNewTab={() => {}}
+        aiOpen={false}
+        onToggleAI={() => {}}
+        sftpOpen={false}
+        onToggleSftp={() => {}}
+      />,
+    );
+  }
+  const left = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('[data-section="top-tabs-left"]');
+
+  it("主机树展开：左侧块宽度等于主机树宽度（主机页、终端界面都一样），默认 224", () => {
+    for (const view of ["vault", "terminal"] as const) {
+      const { container, unmount } = renderWithView(view);
+      expect(left(container)?.dataset.aligned).toBe("true");
+      expect(left(container)?.style.width).toBe("224px");
+      unmount();
+    }
+  });
+
+  it("宽度变化时左侧块跟着变；存的是脏数据回退 224", () => {
+    themeMock.overrides = { "layout.host_tree_width": 300 };
+    const first = renderWithView("terminal");
+    expect(left(first.container)?.style.width).toBe("300px");
+    first.unmount();
+
+    themeMock.overrides = { "layout.host_tree_width": "wide" };
+    const second = renderWithView("terminal");
+    expect(left(second.container)?.style.width).toBe("224px");
+  });
+
+  it("主机树收起：不设固定宽度，标签紧挨着排", () => {
+    themeMock.overrides = { "layout.vault_sidebar_collapsed": true, "layout.host_tree_width": 300 };
+    const { container } = renderWithView("terminal");
+    expect(left(container)?.dataset.aligned).toBe("false");
+    expect(left(container)?.style.width).toBe("");
+  });
+
+  it("设置页没有主机树：不设固定宽度", () => {
+    const { container } = renderWithView("settings");
+    expect(left(container)?.dataset.aligned).toBe("false");
+    expect(left(container)?.style.width).toBe("");
+  });
+
+  it("logo、开关、「主机」标签都在左侧块里，顶栏仍是拖动区", () => {
+    const { container } = renderWithView("vault");
+    const block = left(container);
+    expect(block?.querySelector("img")).not.toBeNull();
+    expect(block?.querySelector('[data-action="toggle-host-sidebar"]')).not.toBeNull();
+    expect(block?.textContent).toContain("主机");
+    expect(
+      container.querySelector('[data-section="top-tabs"]')?.getAttribute("data-tauri-drag-region"),
+    ).toBe("deep");
   });
 });

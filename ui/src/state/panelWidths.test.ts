@@ -5,6 +5,9 @@ import { describe, expect, it } from "vitest";
 import {
   AI_PANEL_DEFAULT,
   ASIDE_PANEL_DEFAULT,
+  HOST_TREE_DEFAULT,
+  HOST_TREE_MAX,
+  HOST_TREE_MIN,
   PANEL_MIN,
   TERMINAL_MIN,
   clampPanelWidth,
@@ -41,6 +44,28 @@ describe("面板宽度：上下限", () => {
     // NaN / Infinity 回退到最小宽度。
     expect(clampPanelWidth("ai", Number.NaN, 1400)).toBe(PANEL_MIN);
     expect(clampPanelWidth("aside", Number.POSITIVE_INFINITY, 1400)).toBe(PANEL_MIN);
+  });
+});
+
+describe("面板宽度：主机树（UI-5）", () => {
+  it("常规窗口：180 ~ min(480, 窗口宽 40%)", () => {
+    expect(panelBounds("hostTree", 1000)).toEqual({ min: HOST_TREE_MIN, max: 400 });
+    // 大窗口：40% 超过 480，被 480 封顶。
+    expect(panelBounds("hostTree", 1920)).toEqual({ min: HOST_TREE_MIN, max: HOST_TREE_MAX });
+  });
+
+  it("窗口缩小：上限跟着收窄，给终端留 360px，区间永远合法", () => {
+    expect(panelBounds("hostTree", 700).max).toBe(280); // 40%
+    const tiny = panelBounds("hostTree", 500); // 500-360=140 < 180
+    expect(tiny.min).toBe(140);
+    expect(tiny.max).toBe(140);
+  });
+
+  it("夹取：默认 224 在常规窗口里原样保留，过大 / 过小被夹住", () => {
+    expect(clampPanelWidth("hostTree", HOST_TREE_DEFAULT, 1400)).toBe(224);
+    expect(clampPanelWidth("hostTree", 50, 1400)).toBe(HOST_TREE_MIN);
+    expect(clampPanelWidth("hostTree", 9000, 1400)).toBe(HOST_TREE_MAX);
+    expect(clampPanelWidth("hostTree", 450, 800)).toBe(320); // 800 的 40%
   });
 });
 

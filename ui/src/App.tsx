@@ -69,7 +69,7 @@ import {
   unsavedPrompt,
   type UnsavedFile,
 } from "./state/editorModel";
-import { useWindowWidth } from "./components/ui/resize-handle";
+import { useHostTreeWidth, useWindowWidth } from "./components/ui/resize-handle";
 import { computeDockLayout } from "./state/dockLayout";
 import { canDockOnto, carryPaths, OTHER_HOST_NOTICE } from "./state/dock";
 import { useTerminalCwd } from "./state/followCwd";
@@ -208,9 +208,6 @@ interface ConfirmState {
   destructive: boolean;
   onConfirm: () => void;
 }
-
-/** 主机树侧栏的宽度（和 HostTreeAside 的 w-56 一致）。 */
-const HOST_TREE_WIDTH = 224;
 
 /**
  * 服务器概览面板的定位框：底部让出快捷命令栏和状态栏。命令栏高度可拖，所以偏移跟着它的
@@ -363,6 +360,8 @@ export default function App() {
   >("none");
   /** 终端界面左边的主机树：展开状态和主机页共用一个设置；选中项只是高亮。 */
   const hostTreeCollapsed = useSettings((state) => state["layout.vault_sidebar_collapsed"]);
+  // 主机树宽度（可拖，和主机页、顶栏左侧块共用一个值）：终端区域的左边距跟着它走
+  const { width: hostTreeWidth } = useHostTreeWidth();
   const [treeHostId, setTreeHostId] = useState<number | null>(null);
   const [treeGroup, setTreeGroup] = useState<number | null | "all">("all");
   /** 端口转发面板只看哪台主机（null = 全部）。 */
@@ -2824,7 +2823,7 @@ export default function App() {
           )}
           <div
             className={cn("absolute inset-y-0 right-0 flex flex-col", view !== "terminal" && "hidden")}
-            style={{ left: view === "terminal" && !hostTreeCollapsed ? HOST_TREE_WIDTH : 0 }}
+            style={{ left: view === "terminal" && !hostTreeCollapsed ? hostTreeWidth : 0 }}
           >
             {ws.tabs.length === 0 ? (
               <div className="flex h-full items-center justify-center text-sm text-muted-foreground">

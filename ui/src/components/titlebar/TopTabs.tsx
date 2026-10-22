@@ -50,6 +50,7 @@ import {
   ContextMenuTrigger,
 } from "../ui/context-menu";
 import { isOutsideWindow } from "../../state/fileWindowTabs";
+import { useHostTreeWidth } from "../ui/resize-handle";
 import logoUrl from "../../assets/logo.png";
 
 interface TopTabsProps {
@@ -120,6 +121,13 @@ export default function TopTabs({
   onSftpDragHover,
   editorDirty,
 }: TopTabsProps) {
+  // 主机树展开时（主机页、终端界面都有），左侧块（logo、开关、「主机」标签）的宽度等于
+  // 主机树的宽度，终端标签从主机树右边缘开始排，和下面终端区域的左边缘对齐。
+  // 拖主机树宽度时 width 实时跟着变（拖动值是共享的）；收起、设置页保持原来紧挨着排。
+  const hostTreeCollapsed = useSettings((state) => state["layout.vault_sidebar_collapsed"]);
+  const { width: hostTreeWidth } = useHostTreeWidth();
+  const alignToHostTree = !hostTreeCollapsed && (view === "vault" || view === "terminal");
+
   // SFTP 标签的拖动：用指针事件自己做（Tauri 默认开着 dragDropEnabled，Windows 上
   // WebView 里的 HTML5 拖放不可用），松手时看指针下面是哪个标签。
   const [drag, setDrag] = useState<{
@@ -206,26 +214,35 @@ export default function TopTabs({
       <div
         data-section="top-tabs"
         data-tauri-drag-region="deep"
-        className="relative z-20 flex h-9 w-full shrink-0 items-end gap-1 bg-background pl-3 select-none"
+        className="relative z-20 flex h-9 w-full shrink-0 items-end gap-1 bg-background select-none"
         style={{ color: "hsl(var(--foreground))" }}
       >
-        <img
-          src={logoUrl}
-          alt="Z-SSH"
-          draggable={false}
-          data-tauri-drag-region
-          className="mb-2 h-[18px] w-[18px] shrink-0"
-        />
-        {/* 主机树侧栏开关（主机页和终端界面共用一个开关） */}
-        <SidebarToggle />
-        {/* 固定最左：主机页 */}
-        <TabShape
-          active={view === "vault"}
-          onClick={onShowVault}
-          className="rounded-md"
-          label="主机"
-          icon={<LayoutGrid size={14} />}
-        />
+        {/* 左侧块：logo、主机树开关、「主机」标签。主机树展开时宽度 = 主机树宽度
+            （-mr-1 抵掉条上 gap-1 的 4px，让终端标签正好从主机树右边缘起排）。 */}
+        <div
+          data-section="top-tabs-left"
+          data-aligned={alignToHostTree ? "true" : "false"}
+          className={cn("flex h-9 shrink-0 items-end gap-1 pl-3", alignToHostTree && "-mr-1 min-w-0")}
+          style={alignToHostTree ? { width: hostTreeWidth } : undefined}
+        >
+          <img
+            src={logoUrl}
+            alt="Z-SSH"
+            draggable={false}
+            data-tauri-drag-region
+            className="mb-2 h-[18px] w-[18px] shrink-0"
+          />
+          {/* 主机树侧栏开关（主机页和终端界面共用一个开关） */}
+          <SidebarToggle />
+          {/* 固定最左：主机页 */}
+          <TabShape
+            active={view === "vault"}
+            onClick={onShowVault}
+            className="rounded-md"
+            label="主机"
+            icon={<LayoutGrid size={14} />}
+          />
+        </div>
 
         {/* 终端标签 */}
         <div className="no-scrollbar flex h-9 min-w-0 flex-1 items-end gap-0.5 overflow-x-auto">

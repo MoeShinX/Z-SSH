@@ -69,6 +69,7 @@ import {
 import { Input } from "../ui/input";
 import { InstallKeyDialog } from "./SshKeyDialogs";
 import { ScrollArea } from "../ui/scroll-area";
+import { ResizeHandle, useHostTreeWidth } from "../ui/resize-handle";
 import { guideAttrs, treeGuideStyle, type TreeGuide } from "./treeGuides";
 import { hostCopyText, type HostCopyKind } from "../../state/hostAddress";
 
@@ -365,6 +366,8 @@ export function HostTreeAside({
   // 收起（本机布局）：主机页和终端界面共用这一个开关
   const collapsed = useSettings((state) => state["layout.vault_sidebar_collapsed"]);
   const setCollapsed = (value: boolean) => void updateSetting("layout.vault_sidebar_collapsed", value);
+  // 宽度可拖（UI-5）：主机页和终端界面共用 layout.host_tree_width，顶栏左侧块也读同一个值
+  const { width, bounds, onResize, onCommit, onReset } = useHostTreeWidth();
 
   return (
     <>
@@ -386,7 +389,19 @@ export function HostTreeAside({
         </aside>
         )
       ) : (
-      <aside data-section="vault-sidebar" className="flex w-56 shrink-0 flex-col border-r border-border/60 bg-background">
+      <aside
+        data-section="vault-sidebar"
+        className="relative flex shrink-0 flex-col border-r border-border/60 bg-background"
+        style={{ width }}
+      >
+        <ResizeHandle
+          side="right"
+          width={width}
+          bounds={bounds}
+          onResize={onResize}
+          onCommit={onCommit}
+          onReset={onReset}
+        />
         <div className="flex items-center gap-1 p-3">
           <Button
             variant="outline"

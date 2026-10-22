@@ -13,6 +13,7 @@ vi.mock("../../stores/settings", async () => {
   const store = create<Record<string, unknown>>(() => ({
     "layout.ai_panel_width": 400,
     "layout.aside_panel_width": 380,
+    "layout.host_tree_width": 224,
     update: (key: string, value: unknown) => {
       store.setState({ [key]: value });
       return Promise.resolve();
@@ -44,10 +45,12 @@ function Harness({
   kind = "ai",
   storageKey = "layout.ai_panel_width",
   fallback = 400,
+  side,
 }: {
   kind?: PanelKind;
   storageKey?: PanelWidthKey;
   fallback?: number;
+  side?: "left" | "right";
 }) {
   const { width, bounds, onResize, onCommit, onReset } = usePanelWidth(
     kind,
@@ -65,6 +68,7 @@ function Harness({
         onResize={onResize}
         onCommit={onCommit}
         onReset={onReset}
+        side={side}
       />
     </div>
   );
@@ -78,6 +82,7 @@ afterEach(() => {
   cleanup();
   seed("layout.ai_panel_width", 400);
   seed("layout.aside_panel_width", 380);
+  seed("layout.host_tree_width", 224);
 });
 
 describe("面板拖拽把手", () => {
@@ -141,5 +146,69 @@ describe("面板拖拽把手", () => {
     seed("layout.ai_panel_width", -5);
     render(<Harness />);
     expect(screen.getByTestId("panel").textContent).toBe("400");
+  });
+});
+
+describe("右边缘把手（主机树，UI-5）", () => {
+  const tree = () => (
+    <Harness kind="hostTree" storageKey="layout.host_tree_width" fallback={224} side="right" />
+  );
+
+  it("往右拖变宽、往左拖变窄，松手才保存", () => {
+    render(tree());
+    expect(screen.getByTestId("panel").textContent).toBe("224");
+
+    fireEvent.pointerDown(handle(), { clientX: 224, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientX: 304, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("304");
+    expect(stored("layout.host_tree_width")).toBe(224); // 拖动中不写
+
+    fireEvent.pointerMove(handle(), { clientX: 204, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("204");
+
+    fireEvent.pointerUp(handle(), { clientX: 204, pointerId: 1 });
+    expect(stored("layout.host_tree_width")).toBe(204); // 松手才写
+  });
+
+  it("拖动夹取在 180 和上限之间（jsdom 窗口宽 1024 → 40% = 409）", () => {
+    render(tree());
+    fireEvent.pointerDown(handle(), { clientX: 224, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientX: -1000, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("180");
+    fireEvent.pointerMove(handle(), { clientX: 5000, pointerId: 1 });
+    expect(Number(screen.getByTestId("panel").textContent)).toBe(Math.floor(1024 * 0.4));
+    fireEvent.pointerUp(handle(), { clientX: 5000, pointerId: 1 });
+    expect(stored("layout.host_tree_width")).toBe(Math.floor(1024 * 0.4));
+  });
+
+  it("双击恢复默认 224 并保存", () => {
+    seed("layout.host_tree_width", 300);
+    render(tree());
+    expect(screen.getByTestId("panel").textContent).toBe("300");
+    fireEvent.doubleClick(handle());
+    expect(screen.getByTestId("panel").textContent).toBe("224");
+    expect(stored("layout.host_tree_width")).toBe(224);
+  });
+
+  it("存的是脏数据时回退 224", () => {
+    seed("layout.host_tree_width", "wide");
+    render(tree());
+    expect(screen.getByTestId("panel").textContent).toBe("224");
+  });
+
+  it("把手骑在右边框上，并标明在右边", () => {
+    render(tree());
+    expect(handle().getAttribute("data-side")).toBe("right");
+    expect(handle().className).toContain("-right-1");
+    expect(handle().className).not.toContain("left-0");
+  });
+
+  it("左边缘把手的方向不受影响（往左拖变宽）", () => {
+    render(<Harness />);
+    expect(handle().getAttribute("data-side")).toBe("left");
+    fireEvent.pointerDown(handle(), { clientX: 500, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientX: 450, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("450");
+    fireEvent.pointerUp(handle(), { clientX: 450, pointerId: 1 });
   });
 });

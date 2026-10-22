@@ -16,6 +16,7 @@ vi.mock("../../api/editor", async () => {
   };
 });
 
+import { undo, undoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import * as api from "../../api/editor";
 import { applyEditEvent, useEditors } from "../../stores/editors";
@@ -354,6 +355,24 @@ describe("重新载入期间的输入（AUDIT-2 A04）", () => {
     await act(async () => userTypes("after:"));
     expect(editorText()).toBe("after:disk now\n");
     expect(useEditors.getState().docs[LOCAL_ID].dirty).toBe(true);
+  });
+
+  it("载入完成后撤销历史清空：Ctrl+Z 回不到载入前的文本，之后的新输入照常能撤销", async () => {
+    const reload = await startLocalReload();
+    await act(async () => reload.resolve("disk now\n"));
+    const view = EditorView.findFromDOM(document.querySelector(".cm-editor") as HTMLElement)!;
+    expect(undoDepth(view.state)).toBe(0);
+    await act(async () => {
+      expect(undo(view)).toBe(false);
+    });
+    expect(editorText()).toBe("disk now\n");
+    expect(useEditors.getState().docs[LOCAL_ID].dirty).toBe(false);
+
+    await act(async () => userTypes("after:"));
+    await act(async () => {
+      expect(undo(view)).toBe(true);
+    });
+    expect(editorText()).toBe("disk now\n");
   });
 
   it("载入完成后内容版本往前走一格，草稿 / 保存不会把新内容当成旧内容", async () => {
