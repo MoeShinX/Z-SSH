@@ -2078,6 +2078,17 @@ root password: hunter2" }),
             "systemctl -p show restart nginx",
             "docker --config ps rm -f web",
             "echo x >/dev/null.audit",
+            // AUDIT-3：要 shell 展开后才知道真实参数 / 展开发生在解析之前的写法
+            "sort $'\\x2do' out.txt input.txt",
+            "sort {-o,out.txt} input.txt",
+            "printf -v x %s '-o out.txt'; sort $x input.txt",
+            "sort $X input.txt",
+            "sort *",
+            "cat !!",
+            "echo \"!!\"",
+            "printf -v PROMPT_COMMAND %s x",
+            "$X file",
+            "echo $'\\'' ; touch f ; echo $'\\''",
         ];
         for command in write_forms {
             id += 1;
@@ -2116,6 +2127,15 @@ root password: hunter2" }),
             "ip addr show",
             "ip route",
             "ip -br link",
+            // AUDIT-3：不看参数的命令带展开照常执行；引号里的特殊字符是字面量
+            "cat /var/log/*.log",
+            "ls -la $HOME",
+            "echo $PATH",
+            "rg 'error.*timeout' /var/log",
+            "find /var/log -name '*.log'",
+            "sort -t'$' -k2 file",
+            "test ! -f x",
+            "printf '%s\\n' x",
         ];
         for command in read_forms {
             id += 1;

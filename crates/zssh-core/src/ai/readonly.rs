@@ -9,10 +9,15 @@
 //! - 用 `;`、`&&`、`||`、`|` 连起来的每一段都要是只读的。
 //! - 有参数筛选的命令（`sort`、`rg`、`date`、`ip`……）用**允许列表**：只放行列出来的选项，
 //!   长选项必须写全，不认识的参数 / 缩写一律要确认（细节见下面的 `Spec`）。
+//! - 允许列表检查的是展开前的文字，而 shell 执行前还会展开：这类命令的参数里只要有不受引号保护的
+//!   `$ { } * ? [`，就不去"计算"展开结果，直接要确认（见 [`rule_for`]）；不看参数的命令不受影响。
+//! - 命令是打进交互式终端的，bash 会先做历史展开（`!`），所以任何命令里可能触发历史展开的 `!`
+//!   都要确认（见 [`has_unsafe_shell_syntax`]）。只按 bash 的规则，zsh / fish 的额外展开不在范围。
 
-use super::safety::{split_segments, tokenize};
+use super::safety::{split_segments, tokenize_marked, Word};
 
-/// 无论带什么参数都只读的命令。
+/// 白名单里的程序名。其中要看参数的（`rg`、`sort`、`printf`……）在 [`rule_for`] 里另有登记，
+/// 那边优先；没登记的才是"带什么参数都只读"。
 const ALWAYS: &[&str] = &[
     "ls",
     "ll",
@@ -120,7 +125,7 @@ pub fn is_read_only(command: &str) -> bool {
     if command.contains("<(") || command.contains(">(") {
         return false;
     }
-    if has_write_redirect(command) {
+    if has_write_redirect(command) || has_unsafe_shell_syntax(command) {
         return false;
     }
     let segments = split_segments(command);
@@ -171,16 +176,17 @@ fn replace_at_word_end(text: &str, pattern: &str) -> String {
 
 /// 去掉 `2>&1`、`2>/dev/null`、`> /dev/null` 这类不写文件的重定向，免得被当成命令参数。
 /// 别的重定向在 [`has_write_redirect`] 里已经拦掉了。
-fn without_harmless_redirects(tokens: Vec<String>) -> Vec<String> {
+fn without_harmless_redirects(tokens: Vec<Word>) -> Vec<Word> {
     let is_redirect_op = |t: &str| matches!(t, ">" | "1>" | "2>" | "&>");
     let mut out = Vec::with_capacity(tokens.len());
     let mut iter = tokens.into_iter().peekable();
     while let Some(token) = iter.next() {
-        let dup = token.len() == 4 && token.as_bytes()[1..3] == *b">&";
-        if dup || token == ">&2" || token.ends_with(">/dev/null") {
+        let text = token.text.as_str();
+        let dup = text.len() == 4 && text.as_bytes()[1..3] == *b">&";
+        if dup || text == ">&2" || text.ends_with(">/dev/null") {
             continue;
         }
-        if is_redirect_op(&token) && iter.peek().is_some_and(|next| next == "/dev/null") {
+        if is_redirect_op(text) && iter.peek().is_some_and(|next| next.text == "/dev/null") {
             iter.next();
             continue;
         }
@@ -1084,103 +1090,204 @@ fn rpm_is_read_only(args: &[String]) -> bool {
     true
 }
 
-fn segment_is_read_only(segment: &str) -> bool {
-    let Ok(tokens) = tokenize(segment) else {
-        return false;
-    };
-    let tokens = without_harmless_redirects(tokens);
-    let Some(head) = tokens.first() else {
-        return true;
-    };
-    // `FOO=bar cmd` 能改命令的行为（LD_PRELOAD 之类），不算只读
-    if head.contains('=') {
-        return false;
-    }
-    let Some(name) = program_name(head) else {
-        return false;
-    };
-    let args = &tokens[1..];
-    if ALWAYS.contains(&name) {
-        return always_args_ok(name, args);
-    }
+/// 一类命令的参数规则。分类集中在 [`rule_for`] 一处：要看参数的命令只能在那里登记，
+/// 登记了就自动走"参数里不能有要 shell 展开的写法"这道检查，不用在每个分支各写一遍。
+enum Rule {
+    /// 没有任何能写文件 / 执行程序 / 改系统状态的选项：带什么参数都一样，展开成什么都无害。
+    Unfiltered,
+    /// 要看参数：参数里有任何需要 shell 展开才知道真实内容的词就直接要确认，
+    /// 否则再交给这个函数按允许列表检查。
+    Filtered(fn(&[String]) -> bool),
+    /// 不在白名单里。
+    Unknown,
+}
+
+fn rule_for(name: &str) -> Rule {
     match name {
+        // --pre / --pre-glob / --hostname-bin 会执行外部程序，-z 会调用解压程序，都不在列表里
+        "rg" => Rule::Filtered(|args| parse_args(&RG, args).is_some()),
+        "sort" => Rule::Filtered(|args| parse_args(&SORT, args).is_some()),
+        "uniq" => {
+            Rule::Filtered(|args| parse_args(&UNIQ, args).is_some_and(|rest| rest.len() <= 1))
+        }
+        "tree" => Rule::Filtered(|args| parse_args(&TREE, args).is_some()),
+        "file" => Rule::Filtered(|args| parse_args(&FILE, args).is_some()),
+        "ss" => Rule::Filtered(|args| parse_args(&SS, args).is_some()),
+        "blkid" => Rule::Filtered(|args| parse_args(&BLKID, args).is_some()),
+        "lastlog" => {
+            Rule::Filtered(|args| parse_args(&LASTLOG, args).is_some_and(|rest| rest.is_empty()))
+        }
+        // history -c 清空、-w 写文件、-d 删除……只认不带参数的
+        "history" => Rule::Filtered(|args| args.is_empty()),
+        "printf" => Rule::Filtered(printf_is_read_only),
         // find 的主表达式（-exec、-delete、-fprint…）必须写全，不能缩写，也不能合并，
         // 所以按完整名字拦就够了；带这些名字当值的写法（`-name -delete`）也一并要确认
-        "find" => !args.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "-exec"
-                    | "-execdir"
-                    | "-ok"
-                    | "-okdir"
-                    | "-delete"
-                    | "-fprint"
-                    | "-fprint0"
-                    | "-fprintf"
-                    | "-fls"
-            )
+        "find" => Rule::Filtered(|args| {
+            !args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-exec"
+                        | "-execdir"
+                        | "-ok"
+                        | "-okdir"
+                        | "-delete"
+                        | "-fprint"
+                        | "-fprint0"
+                        | "-fprintf"
+                        | "-fls"
+                )
+            })
         }),
         // 带位置参数的 hostname 是在改主机名
-        "hostname" => parse_args(&HOSTNAME, args).is_some_and(|positional| positional.is_empty()),
+        "hostname" => {
+            Rule::Filtered(|args| parse_args(&HOSTNAME, args).is_some_and(|rest| rest.is_empty()))
+        }
         // 位置参数只认 +格式；MMDDhhmm 这种是在改时间
-        "date" => parse_args(&DATE, args)
-            .is_some_and(|positional| positional.iter().all(|p| p.starts_with('+'))),
-        "env" => args.is_empty(),
-        "mount" => args.is_empty() || args.iter().all(|a| a == "-l"),
-        "dmesg" => parse_args(&DMESG, args).is_some(),
-        "journalctl" => parse_args(&JOURNALCTL, args).is_some(),
+        "date" => Rule::Filtered(|args| {
+            parse_args(&DATE, args).is_some_and(|rest| rest.iter().all(|p| p.starts_with('+')))
+        }),
+        "env" => Rule::Filtered(|args| args.is_empty()),
+        "mount" => Rule::Filtered(|args| args.is_empty() || args.iter().all(|a| a == "-l")),
+        "dmesg" => Rule::Filtered(|args| parse_args(&DMESG, args).is_some()),
+        "journalctl" => Rule::Filtered(|args| parse_args(&JOURNALCTL, args).is_some()),
         // sed 的选项只认下面几个完整写法，脚本只认纯打印，见 sed_is_read_only
-        "sed" => sed_is_read_only(args),
-        "ip" => ip_is_read_only(args),
-        "systemctl" => ctl_is_read_only(args, SYSTEMCTL_VERBS, false),
-        "service" => {
+        "sed" => Rule::Filtered(sed_is_read_only),
+        "ip" => Rule::Filtered(ip_is_read_only),
+        "systemctl" => Rule::Filtered(|args| ctl_is_read_only(args, SYSTEMCTL_VERBS, false)),
+        "service" => Rule::Filtered(|args| {
             (args.len() == 2 && !args[0].starts_with('-') && args[1] == "status")
                 || (args.len() == 1 && args[0] == "--status-all")
-        }
+        }),
         "timedatectl" | "hostnamectl" | "loginctl" | "localectl" | "networkctl" | "resolvectl" => {
-            ctl_is_read_only(args, OTHER_CTL_VERBS, true)
+            Rule::Filtered(|args| ctl_is_read_only(args, OTHER_CTL_VERBS, true))
         }
-        "docker" | "podman" => docker_is_read_only(args),
-        "kubectl" => kubectl_is_read_only(args),
+        "docker" | "podman" => Rule::Filtered(docker_is_read_only),
+        "kubectl" => Rule::Filtered(kubectl_is_read_only),
         // 不带参数的 nginx 会启动服务
-        "nginx" => {
+        "nginx" => Rule::Filtered(|args| {
             !args.is_empty()
                 && args
                     .iter()
                     .all(|a| a == "-t" || a == "-T" || a == "-v" || a == "-V")
-        }
-        "apt" | "apt-cache" => apt_is_read_only(args),
+        }),
+        "apt" | "apt-cache" => Rule::Filtered(apt_is_read_only),
         // 每个参数要么是下面几个完整选项，要么是不带 - 的包名 / 文件名，不会被缩写或合并写法绕过
-        "dpkg" => {
+        "dpkg" => Rule::Filtered(|args| {
             args.iter().all(|a| {
                 matches!(
                     a.as_str(),
                     "-l" | "-L" | "-s" | "-S" | "--list" | "--status" | "--listfiles" | "--search"
                 ) || !a.starts_with('-')
             }) && args.first().is_some_and(|a| a.starts_with('-'))
-        }
-        "rpm" => rpm_is_read_only(args),
-        _ => false,
+        }),
+        "rpm" => Rule::Filtered(rpm_is_read_only),
+        _ if ALWAYS.contains(&name) => Rule::Unfiltered,
+        _ => Rule::Unknown,
     }
 }
 
-/// 白名单里的命令再按参数筛一遍。没列在这里的命令（`ls`、`cat`、`grep`、`ps`……）
-/// 没有任何能写文件 / 执行程序 / 改系统状态的选项，带什么参数都一样；
-/// 列在这里的都是靠允许列表放行的，不认识的选项一律要确认。
-fn always_args_ok(name: &str, args: &[String]) -> bool {
-    match name {
-        // --pre / --pre-glob / --hostname-bin 会执行外部程序，-z 会调用解压程序，都不在列表里
-        "rg" => parse_args(&RG, args).is_some(),
-        "sort" => parse_args(&SORT, args).is_some(),
-        "uniq" => parse_args(&UNIQ, args).is_some_and(|positional| positional.len() <= 1),
-        "tree" => parse_args(&TREE, args).is_some(),
-        "file" => parse_args(&FILE, args).is_some(),
-        "ss" => parse_args(&SS, args).is_some(),
-        "blkid" => parse_args(&BLKID, args).is_some(),
-        "lastlog" => parse_args(&LASTLOG, args).is_some_and(|positional| positional.is_empty()),
-        // history -c 清空、-w 写文件、-d 删除……只认不带参数的
-        "history" => args.is_empty(),
-        _ => true,
+/// bash 内建 `printf -v 变量` 会给 shell 变量赋值（`PROMPT_COMMAND`、`PATH`……），
+/// 是在改终端会话的行为。只有 `printf 格式 参数…` 和 `printf -- 格式 …` 算只读。
+fn printf_is_read_only(args: &[String]) -> bool {
+    args.first()
+        .is_none_or(|first| !first.starts_with('-') || first == "--")
+}
+
+fn segment_is_read_only(segment: &str) -> bool {
+    let Ok(words) = tokenize_marked(segment) else {
+        return false;
+    };
+    let words = without_harmless_redirects(words);
+    let Some(head) = words.first() else {
+        return true;
+    };
+    // 命令名要展开（`$X file`、`{cat,x}`、`c*t x`）就不知道实际跑的是什么。
+    // 单独一个 `[` 是 test 的别名，不是通配符。
+    if head.expands && head.text != "[" {
+        return false;
+    }
+    // `FOO=bar cmd` 能改命令的行为（LD_PRELOAD 之类），不算只读
+    if head.text.contains('=') {
+        return false;
+    }
+    let Some(name) = program_name(&head.text) else {
+        return false;
+    };
+    match rule_for(name) {
+        Rule::Unfiltered => true,
+        Rule::Filtered(check) => {
+            // 参数要靠 shell 展开才知道真实内容（`sort $'\x2do'`、`sort {-o,x}`、`sort $X`）：
+            // 允许列表检查的是展开前的文字，对不上；不去"计算"展开结果，直接要确认
+            if words[1..].iter().any(|word| word.expands) {
+                return false;
+            }
+            let args: Vec<String> = words[1..].iter().map(|word| word.text.clone()).collect();
+            check(&args)
+        }
+        Rule::Unknown => false,
+    }
+}
+
+/// 整条命令按 bash 的引号规则扫一遍，找出"在解析之前 / 之外"就会改变命令含义的写法，有就要确认：
+/// - 历史展开 `!`：命令是打进交互式终端的，bash 会在解析之前把以前命令的文字拼进来，
+///   拼进来的 `;`、`|`、`>` 照样生效。单引号里和反斜杠转义的 `!` 不展开；
+///   `!` 后面紧跟空白、行尾、`=`、`(`（双引号里还有 `"`）也不展开（`test ! -f x`、`a != b`）。
+///   行首的 `^旧^新` 是同一套机制的快速替换；
+/// - 引号外的 `$'…'`：里面的 `\'` 不结束字符串，而 [`split_segments`] / [`tokenize`] 不认这个规则，
+///   会把引号配对错位，把真正的命令当成引号里的文字；
+/// - 引号外、词首的 `#`：bash 把它到行尾当注释，分段逻辑却不认，同样会错位。
+fn has_unsafe_shell_syntax(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    if chars.first() == Some(&'^') {
+        return true;
+    }
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if in_single {
+            in_single = c != '\'';
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if in_double {
+            match c {
+                '"' => in_double = false,
+                '!' if history_expansion_may_trigger(next, true) => return true,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            '$' if next == Some('\'') => return true,
+            '!' if history_expansion_may_trigger(next, false) => return true,
+            '#' if i == 0
+                || chars[i - 1].is_whitespace()
+                || matches!(chars[i - 1], ';' | '&' | '|' | '(' | ')') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn history_expansion_may_trigger(next: Option<char>, in_double: bool) -> bool {
+    match next {
+        None | Some('=' | '(') => false,
+        Some('"') if in_double => false,
+        Some(c) => !c.is_whitespace(),
     }
 }
 
@@ -1631,5 +1738,250 @@ mod tests {
             "dpkg -l -i foo.deb",
             "dpkg --purge x",
         ]);
+    }
+
+    /// AUDIT-3：允许列表检查的是展开前的文字，shell 展开后参数可能变成选项。
+    #[test]
+    fn expansion_in_arguments_of_filtered_commands_needs_approval() {
+        assert_all_need_approval(&[
+            // 复审的三条
+            "sort $'\\x2do' out.txt in.txt",
+            "sort {-o,out.txt} in.txt",
+            "printf -v x %s '-o out.txt'; sort $x in.txt",
+            // 变量 / 花括号 / 算术 / 引用形式
+            "sort ${X} in",
+            "sort \"$X\" in",
+            "sort $\"-o\" out in",
+            "sort $((1+1)) in",
+            "sort a${X}b in",
+            "date $X",
+            "ip $X",
+            "systemctl $X",
+            "hostname {a,b}",
+            "rg $PATTERN /var/log",
+            "journalctl -u $UNIT",
+            "find $DIR -name x",
+            "docker ps $X",
+            "kubectl get $X",
+            "sed -n $X file",
+            "dpkg -l $X",
+            "rpm -qa $X",
+            "apt show $X",
+            "uniq $X",
+            "tree $X",
+            "file $X",
+            "ss $X",
+            "blkid $X",
+            "lastlog $X",
+            "dmesg $X",
+            "service $X status",
+            "timedatectl $X",
+            "nginx -t $X",
+            "mount $X",
+            "env $X",
+            "history $X",
+            // 通配符
+            "sort *",
+            "sort -k1 [ab]*",
+            "sort -k1 a?",
+            "find /var/log -name *.log",
+            "rg foo *.conf",
+            // 引号里有、引号外还有
+            "sort '-k1' $X",
+            "sort -t'$'\" $X\" in",
+            "sort \"a\"$X in",
+        ]);
+    }
+
+    #[test]
+    fn expansion_in_the_command_name_needs_approval() {
+        assert_all_need_approval(&[
+            "$X file",
+            "{cat,x}",
+            "c*t x",
+            "c?t x",
+            "ca[t] x",
+            "${X} file",
+            "$'cat' x",
+            "\"$X\" file",
+            "ls; $X file",
+            "ls | $X",
+        ]);
+    }
+
+    /// 历史展开发生在解析之前，拼进来的 `;`、`|`、`>` 照样生效，连不看参数的命令也不能放行。
+    #[test]
+    fn history_expansion_needs_approval() {
+        assert_all_need_approval(&[
+            "cat !!",
+            "cat !$",
+            "ls !-1:*",
+            "echo \"!!\"",
+            "grep x !rm",
+            "echo hi !x",
+            "echo \"a !b\"",
+            "echo \"it's !!\"",
+            "^a^b",
+            "echo x; ls !!",
+            "echo x | cat !-2:*",
+            "echo a#b !1",
+            "echo '!' !!",
+            "echo \"\\\\\" !!",
+        ]);
+        assert_all_read_only(&[
+            "test ! -f x",
+            "[ a != b ]",
+            "[ ! -f /etc/hosts ]",
+            "find . ! -name x",
+            "find /var/log ! -name '*.gz'",
+            "echo 'a!b'",
+            "echo a\\!b",
+            "echo \"a\\!b\"",
+            "echo \"hi!\"",
+            "echo hi!",
+            "echo !",
+            "echo '!!'",
+            "echo \"it's\" 'say !!'",
+            "grep 'x$' file",
+            "echo a!=b",
+            "echo \"!\"",
+            "ls ^a^b",
+        ]);
+    }
+
+    /// 引号外的 `$'…'` 里 `\'` 不结束字符串，词首的 `#` 是注释，分段逻辑都不认。
+    /// 这两种会让分段错位、把真正的命令藏进"引号"里，所以整条要确认。
+    #[test]
+    fn quote_state_that_the_segmenter_cannot_follow_needs_approval() {
+        assert_all_need_approval(&[
+            "echo $'\\'' ; rm -rf x ; echo $'\\''",
+            "echo $'a'",
+            "echo x # '\nrm /tmp/y\n# '",
+            "echo x #",
+            "# hello",
+            "ls;# x",
+        ]);
+        assert_all_read_only(&["echo a#b", "echo 'a #b'", "echo \"a #b\""]);
+    }
+
+    #[test]
+    fn printf_that_assigns_shell_variables_needs_approval() {
+        assert_all_need_approval(&[
+            "printf -v PROMPT_COMMAND %s x",
+            "printf -vX %s y",
+            "printf -v PATH %s /tmp",
+            "printf -x",
+            "printf --help",
+            "printf -",
+            "printf $X",
+            "printf \"$X\" y",
+            // 引号包着的格式串以 - 开头，bash 照样当选项解析
+            "printf '-v\\n'",
+        ]);
+        assert_all_read_only(&[
+            "printf '%s\\n' x",
+            "printf 'a\\n'",
+            "printf -- '%s' x",
+            "printf",
+            "printf '%s %s\\n' a b | sort -k2",
+            "printf '%s\\n' -v",
+        ]);
+    }
+
+    /// 不看参数的命令：展开成什么都无害，日常写法必须照常自动执行。
+    #[test]
+    fn unfiltered_commands_still_accept_expansion() {
+        assert_all_read_only(&[
+            "cat /var/log/*.log",
+            "ls -la $HOME",
+            "echo $PATH",
+            "grep foo *.conf",
+            "ls {a,b}",
+            "ls ~/x",
+            "head -n 5 /var/log/syslog.?",
+            "ls /etc/[a-c]*",
+            "echo ${HOME}",
+            "tail -n 20 \"$LOG\"",
+            "ps aux | grep $USER",
+            "[ -f /etc/hosts ]",
+            "test -d $HOME",
+            "[ -n \"$X\" ]",
+        ]);
+    }
+
+    /// 写在引号里的写法不展开，照常放行。
+    #[test]
+    fn quoted_arguments_of_filtered_commands_pass() {
+        assert_all_read_only(&[
+            "rg 'error.*timeout' /var/log",
+            "journalctl -u nginx --since '1 hour ago'",
+            "sort -t'$' -k2 file",
+            "sort -t '$' -k2 file",
+            "date '+%F %T'",
+            "find /var/log -name '*.log'",
+            "find /var/log -name \"*.log\" -mtime -1",
+            "sed -n '/a.*b/p' file",
+            "sed -n '5,10p' file",
+            "rg \"a{2}\" /etc",
+            "rg 'a[0-9]+' /etc",
+            "rg \"a[b]?\" /etc",
+            "rg a\\*b /etc",
+            "rg a\\{1\\} /etc",
+            "docker ps --format \"{{.Names}}\"",
+            "sort -k2 file",
+            "date +%F",
+            "ip a",
+        ]);
+    }
+
+    /// 凡是登记成"要看参数"的命令都自动走展开检查：先确认正常写法是只读，
+    /// 再在后面加一个要展开的参数，必须变成要确认。
+    #[test]
+    fn every_filtered_command_rejects_expansion_in_arguments() {
+        let samples = [
+            "rg foo /etc",
+            "sort file",
+            "uniq",
+            "tree -L 2",
+            "file x",
+            "ss -s",
+            "blkid",
+            "lastlog",
+            "history",
+            "printf '%s' x",
+            "find . -name x",
+            "hostname",
+            "date",
+            "env",
+            "mount",
+            "dmesg",
+            "journalctl -n 5",
+            "sed -n 1p f",
+            "ip a",
+            "systemctl status x",
+            "service x status",
+            "timedatectl",
+            "hostnamectl",
+            "loginctl",
+            "localectl",
+            "networkctl",
+            "resolvectl",
+            "docker ps",
+            "podman ps",
+            "kubectl get pods",
+            "nginx -t",
+            "apt show x",
+            "apt-cache policy x",
+            "dpkg -l",
+            "rpm -qa",
+        ];
+        for sample in samples {
+            assert!(is_read_only(sample), "正常写法应该算只读：{sample}");
+            assert!(is_read_only(&format!("/usr/bin/{sample}")), "{sample}");
+            for arg in ["$X", "${X}", "$\"a\"", "{a,b}", "*", "?", "[a]"] {
+                let command = format!("{sample} {arg}");
+                assert!(!is_read_only(&command), "不该算只读：{command}");
+            }
+        }
     }
 }

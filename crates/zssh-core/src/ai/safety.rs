@@ -995,9 +995,29 @@ fn flush_segment(segments: &mut Vec<String>, current: &mut String) {
     }
 }
 
+/// 一个词，附带"含不受引号保护的展开字符"的标记。
+/// 只读自动批准据此判断：这个词交给程序时的真实内容能不能静态确定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Word {
+    pub(crate) text: String,
+    /// 词里有没有 shell 会在执行前展开的字符：不在引号里也没被反斜杠转义的
+    /// `$ { } * ? [`，或双引号里的 `$`（`$'…'`、`$"…"`、`${…}`、`$((…))` 的 `$` 都算）。
+    /// 单引号里的、反斜杠转义的、双引号里的 `{ } * ? [` 都是字面量，不算。
+    pub(crate) expands: bool,
+}
+
 pub(crate) fn tokenize(segment: &str) -> Result<Vec<String>, ()> {
+    Ok(tokenize_marked(segment)?
+        .into_iter()
+        .map(|word| word.text)
+        .collect())
+}
+
+/// 和 [`tokenize`] 切出同样的词，只是多带一个展开标记；引号规则按 bash。
+pub(crate) fn tokenize_marked(segment: &str) -> Result<Vec<Word>, ()> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut expands = false;
     let mut has_content = false;
     let mut in_single = false;
     let mut in_double = false;
@@ -1024,6 +1044,9 @@ pub(crate) fn tokenize(segment: &str) -> Result<Vec<String>, ()> {
             if c == '"' {
                 in_double = false;
             } else {
+                if c == '$' {
+                    expands = true;
+                }
                 current.push(c);
             }
             continue;
@@ -1039,11 +1062,17 @@ pub(crate) fn tokenize(segment: &str) -> Result<Vec<String>, ()> {
             }
             c if c.is_whitespace() => {
                 if has_content {
-                    tokens.push(std::mem::take(&mut current));
+                    tokens.push(Word {
+                        text: std::mem::take(&mut current),
+                        expands: std::mem::take(&mut expands),
+                    });
                     has_content = false;
                 }
             }
             _ => {
+                if matches!(c, '$' | '{' | '}' | '*' | '?' | '[') {
+                    expands = true;
+                }
                 current.push(c);
                 has_content = true;
             }
@@ -1053,7 +1082,10 @@ pub(crate) fn tokenize(segment: &str) -> Result<Vec<String>, ()> {
         return Err(());
     }
     if has_content {
-        tokens.push(current);
+        tokens.push(Word {
+            text: current,
+            expands,
+        });
     }
     Ok(tokens)
 }
