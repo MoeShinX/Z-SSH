@@ -1799,3 +1799,273 @@ async fn a_second_upload_fails_while_the_first_still_waits_for_the_conflict_answ
     let report = drain_until_finished(&mut events, first, Duration::from_secs(20)).await;
     assert_eq!(report.state, TransferState::Skipped, "{report:?}");
 }
+
+// ---------------------------------------------------------------------------
+// 冲突批次（SFTP-7）：同一次提交里的任务共享"全部应用"
+// ---------------------------------------------------------------------------
+
+type DecideFn = Box<dyn Fn(usize, &ConflictInfo) -> ConflictDecision + Send + Sync>;
+
+/// 记下每次提问、按固定脚本回答的 resolver。
+struct Scripted {
+    asked: Mutex<Vec<ConflictInfo>>,
+    decide: DecideFn,
+}
+
+impl Scripted {
+    fn new(
+        decide: impl Fn(usize, &ConflictInfo) -> ConflictDecision + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            asked: Mutex::new(Vec::new()),
+            decide: Box::new(decide),
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+}
+
+impl ConflictResolver for Scripted {
+    fn decide<'a>(&'a self, info: ConflictInfo) -> BoxFuture<'a, ConflictDecision> {
+        Box::pin(async move {
+            let index = {
+                let mut asked = self.asked.lock().unwrap();
+                asked.push(info.clone());
+                asked.len() - 1
+            };
+            (self.decide)(index, &info)
+        })
+    }
+}
+
+fn answer(action: ConflictAction, apply_to_all: bool, rename_to: Option<&str>) -> ConflictDecision {
+    ConflictDecision {
+        action,
+        apply_to_all,
+        rename_to: rename_to.map(str::to_owned),
+    }
+}
+
+type BatchFixture = (
+    Arc<TransferEngine>,
+    mpsc::UnboundedReceiver<TransferEvent>,
+    Arc<MemoryEndpoints>,
+    Vec<TransferJob>,
+    crate::test_util::TestDir,
+);
+
+/// 一个串行（并发 1）的引擎；本地有 `count` 个源文件，远端已有同名的旧文件。
+fn batch_fixture(tag: &str, count: usize, resolver: Arc<Scripted>) -> BatchFixture {
+    let root = temp_root(tag);
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    let mut jobs = Vec::new();
+    for index in 0..count {
+        let source = root.join(format!("f{index}.bin"));
+        std::fs::write(&source, vec![b'N'; 2048]).unwrap();
+        endpoints.put_remote(&format!("/remote/f{index}.bin"), vec![b'O'; 100]);
+        jobs.push(TransferJob {
+            direction: Direction::Upload,
+            source: source.display().to_string(),
+            target: format!("/remote/f{index}.bin"),
+            recursive: false,
+            peer: None,
+        });
+    }
+    let (engine, events) = TransferEngine::new(
+        endpoints.clone(),
+        resolver as Arc<dyn ConflictResolver>,
+        TransferOptions {
+            concurrency: 1,
+            ..local_options()
+        },
+    );
+    (engine, events, endpoints, jobs, root)
+}
+
+#[tokio::test]
+async fn apply_to_all_in_a_batch_covers_the_other_jobs_of_that_batch() {
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Overwrite, true, None));
+    let (engine, mut events, endpoints, jobs, _root) =
+        batch_fixture("batch-overwrite", 3, Arc::clone(&resolver));
+    let batch = engine.new_batch();
+    let ids: Vec<_> = jobs
+        .into_iter()
+        .map(|job| engine.submit_in_batch(job, &batch))
+        .collect();
+    for id in ids {
+        let report = drain_until_finished(&mut events, id, Duration::from_secs(30)).await;
+        assert_eq!(report.state, TransferState::Done, "{report:?}");
+    }
+    assert_eq!(resolver.count(), 1, "勾了全部应用之后同批次不再问");
+    assert_eq!(
+        resolver.asked.lock().unwrap()[0].batch,
+        Some(batch.id()),
+        "提问要带批次号，界面靠它认出同批次的提问"
+    );
+    for index in 0..3 {
+        assert_eq!(
+            endpoints.remote_contents(&format!("/remote/f{index}.bin")),
+            vec![b'N'; 2048],
+            "第 {index} 个文件应该被覆盖"
+        );
+    }
+}
+
+#[tokio::test]
+async fn batches_and_unbatched_jobs_do_not_share_apply_to_all() {
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Overwrite, true, None));
+    let (engine, mut events, _endpoints, jobs, _root) =
+        batch_fixture("batch-isolated", 6, Arc::clone(&resolver));
+    let mut jobs = jobs.into_iter();
+    let batch_a = engine.new_batch();
+    let batch_b = engine.new_batch();
+    assert_ne!(batch_a.id(), batch_b.id());
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(engine.submit_in_batch(jobs.next().unwrap(), &batch_a));
+    }
+    for _ in 0..2 {
+        ids.push(engine.submit_in_batch(jobs.next().unwrap(), &batch_b));
+    }
+    // 不属于任何批次的任务：勾了全部应用也只管它自己，所以各问各的。
+    for _ in 0..2 {
+        ids.push(engine.submit(jobs.next().unwrap()));
+    }
+    for id in ids {
+        let report = drain_until_finished(&mut events, id, Duration::from_secs(30)).await;
+        assert_eq!(report.state, TransferState::Done, "{report:?}");
+    }
+    // A 批问 1 次、B 批问 1 次、两个单独任务各问 1 次。
+    assert_eq!(resolver.count(), 4);
+    let asked = resolver.asked.lock().unwrap();
+    assert_eq!(asked.iter().filter(|info| info.batch.is_none()).count(), 2);
+    assert!(asked.iter().any(|info| info.batch == Some(batch_a.id())));
+    assert!(asked.iter().any(|info| info.batch == Some(batch_b.id())));
+}
+
+#[tokio::test]
+async fn rename_for_the_whole_batch_names_only_the_first_file_by_hand() {
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, true, Some("mine.bin")));
+    let (engine, mut events, endpoints, jobs, _root) =
+        batch_fixture("batch-rename", 3, Arc::clone(&resolver));
+    let batch = engine.new_batch();
+    let ids: Vec<_> = jobs
+        .into_iter()
+        .map(|job| engine.submit_in_batch(job, &batch))
+        .collect();
+    for id in ids {
+        let report = drain_until_finished(&mut events, id, Duration::from_secs(30)).await;
+        assert_eq!(report.state, TransferState::Done, "{report:?}");
+    }
+    assert_eq!(resolver.count(), 1);
+    assert!(
+        endpoints.remote_exists("/remote/mine.bin"),
+        "用户给的名字只用在被问的那个文件上"
+    );
+    let auto_named = (0..3)
+        .filter(|index| endpoints.remote_exists(&format!("/remote/f{index} (2).bin")))
+        .count();
+    assert_eq!(auto_named, 2, "其余文件各自用自动名字，不能都叫 mine.bin");
+    for index in 0..3 {
+        assert_eq!(
+            endpoints.remote_contents(&format!("/remote/f{index}.bin")),
+            vec![b'O'; 100],
+            "改名时原文件不动"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_retried_job_asks_again_and_leaves_the_batch() {
+    // 第一次回答「跳过 + 全部应用」，重试那次回答「覆盖 + 全部应用」。
+    let resolver = Scripted::new(|index, _| {
+        if index == 0 {
+            answer(ConflictAction::Skip, true, None)
+        } else {
+            answer(ConflictAction::Overwrite, true, None)
+        }
+    });
+    let (engine, mut events, endpoints, jobs, _root) =
+        batch_fixture("batch-retry", 3, Arc::clone(&resolver));
+    let batch = engine.new_batch();
+    let ids: Vec<_> = jobs
+        .into_iter()
+        .map(|job| engine.submit_in_batch(job, &batch))
+        .collect();
+    for id in &ids {
+        let report = drain_until_finished(&mut events, *id, Duration::from_secs(30)).await;
+        assert_eq!(report.state, TransferState::Skipped, "{report:?}");
+    }
+    assert_eq!(resolver.count(), 1, "批次里的跳过替另外两个回答了");
+
+    // 重试第二个：批次里旧的「跳过」不能再替它回答，要重新问。
+    assert!(engine.retry(ids[1]));
+    let report = drain_until_finished(&mut events, ids[1], Duration::from_secs(30)).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(resolver.count(), 2, "重试的任务重新问了一次");
+    assert_eq!(
+        resolver.asked.lock().unwrap()[1].batch,
+        None,
+        "重试后脱离批次"
+    );
+    assert_eq!(
+        endpoints.remote_contents("/remote/f1.bin"),
+        vec![b'N'; 2048]
+    );
+    // 它勾的全部应用只管它自己：第三个任务重试时还是要自己问。
+    assert!(engine.retry(ids[2]));
+    let report = drain_until_finished(&mut events, ids[2], Duration::from_secs(30)).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(resolver.count(), 3);
+}
+
+/// 复制粘贴的任务在批次里选了"重命名"：其余文件的自动名字是「名字 - 副本」，不是「名字 (2)」。
+#[tokio::test]
+async fn copy_jobs_in_a_batch_get_copy_style_names_when_renaming_for_all() {
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, true, None));
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    for index in 0..2 {
+        endpoints.put_remote(&format!("/src/c{index}.txt"), vec![b'S'; 300]);
+        endpoints.put_remote(&format!("/dst/c{index}.txt"), vec![b'D'; 50]);
+    }
+    let (engine, mut events) = TransferEngine::new(
+        endpoints.clone(),
+        Arc::clone(&resolver) as Arc<dyn ConflictResolver>,
+        TransferOptions {
+            concurrency: 1,
+            ..local_options()
+        },
+    );
+    let batch = engine.new_batch();
+    let ids: Vec<_> = (0..2)
+        .map(|index| {
+            engine.submit_in_batch(
+                TransferJob {
+                    direction: Direction::RemoteCopy,
+                    source: format!("/src/c{index}.txt"),
+                    target: format!("/dst/c{index}.txt"),
+                    recursive: false,
+                    peer: None,
+                },
+                &batch,
+            )
+        })
+        .collect();
+    for id in ids {
+        let report = drain_until_finished(&mut events, id, Duration::from_secs(30)).await;
+        assert_eq!(report.state, TransferState::Done, "{report:?}");
+    }
+    assert_eq!(resolver.count(), 1);
+    for index in 0..2 {
+        assert_eq!(
+            endpoints.remote_contents(&format!("/dst/c{index} - 副本.txt")),
+            vec![b'S'; 300]
+        );
+        assert_eq!(
+            endpoints.remote_contents(&format!("/dst/c{index}.txt")),
+            vec![b'D'; 50]
+        );
+    }
+}

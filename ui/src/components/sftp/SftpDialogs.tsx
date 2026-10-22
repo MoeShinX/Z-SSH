@@ -58,12 +58,19 @@ export function conflictDefaultAction(
 
 interface ConflictDialogProps {
   prompt: SftpConflictPrompt;
+  /** 同一批次里还在排队等的提问数（显示在"全部应用"后面）；没有就不传。 */
+  pendingInBatch?: number;
   onAnswer: (answer: ConflictAnswer) => void;
   /** 用户直接关掉对话框（Esc / 点遮罩）：按"跳过"处理（M3-2 第 1 节）。 */
   onDismissAsSkip: () => void;
 }
 
-export function SftpConflictDialog({ prompt, onAnswer, onDismissAsSkip }: ConflictDialogProps) {
+export function SftpConflictDialog({
+  prompt,
+  pendingInBatch = 0,
+  onAnswer,
+  onDismissAsSkip,
+}: ConflictDialogProps) {
   const copying = isCopyConflict(prompt);
   const canResume = conflictResumeEnabled(prompt);
   const [action, setAction] = useState<ConflictAnswer["action"]>(conflictDefaultAction(prompt));
@@ -192,7 +199,8 @@ export function SftpConflictDialog({ prompt, onAnswer, onDismissAsSkip }: Confli
             onChange={(event) => setApplyToAll(event.target.checked)}
             className="accent-primary"
           />
-          对后续所有冲突都这样处理
+          本次其余同名文件都这样处理
+          {pendingInBatch > 0 && <span>（还有 {pendingInBatch} 个）</span>}
         </label>
 
         <DialogFooter>

@@ -57,3 +57,22 @@ export function nextConflict(
 export function conflictTimeLeft(item: PendingConflict, now: number): number {
   return Math.max(0, item.receivedAt + CONFLICT_PROMPT_TTL_MS - now);
 }
+
+/** 同一批次（同一次提交 / 粘贴）的标识：会话 + 批次号；提问没带批次号就不属于任何批次。 */
+export function batchKey(sftpId: string, prompt: Pick<SftpConflictPrompt, "batch">): string | null {
+  return prompt.batch === undefined ? null : `${sftpId}#${prompt.batch}`;
+}
+
+/** 队列里和 `head` 同批次、还没回答的其余提问（不含 `head` 自己，按先后顺序）。 */
+export function batchPeers(
+  queue: readonly PendingConflict[],
+  head: PendingConflict,
+): PendingConflict[] {
+  const key = batchKey(head.sftpId, head.prompt);
+  if (key === null) return [];
+  return queue.filter(
+    (item) =>
+      item.prompt.conflict_id !== head.prompt.conflict_id &&
+      batchKey(item.sftpId, item.prompt) === key,
+  );
+}

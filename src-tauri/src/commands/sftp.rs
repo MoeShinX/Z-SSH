@@ -209,6 +209,10 @@ pub struct ConflictPromptDto {
     pub can_resume: bool,
     /// 冲突里建议的新名字（`name (2).ext`），用户可以改。
     pub suggested_name: String,
+    /// 属于哪个批次（同一次提交 / 粘贴）。界面勾了"全部应用"之后，用它把同批次还在排队的
+    /// 提问一并回答掉。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<u64>,
 }
 
 /// 删除进度事件。
@@ -572,6 +576,7 @@ impl ConflictResolver for UiConflictResolver {
                 target_mtime: info.target_mtime.map(u64::from),
                 can_resume: info.can_resume,
                 suggested_name: file_name_of(&suggested).to_owned(),
+                batch: info.batch,
             };
             if let Err(err) = self
                 .app
@@ -1157,6 +1162,9 @@ pub async fn sftp_transfer_submit(
     if target.trim().is_empty() {
         return Err("目标目录不能为空".to_owned());
     }
+    // 一次提交的所有任务属于同一个冲突批次：任何一个任务的对话框里勾了"全部应用"，
+    // 同批次后面撞上同名的就不再问。
+    let batch = tab.engine.new_batch();
     let mut ids = Vec::with_capacity(sources.len());
     for source in sources {
         if source.trim().is_empty() {
@@ -1181,7 +1189,7 @@ pub async fn sftp_transfer_submit(
             recursive: true,
             peer: None,
         };
-        let id = tab.engine.submit(job.clone());
+        let id = tab.engine.submit_in_batch(job.clone(), &batch);
         tab.remember_job(id, job);
         ids.push(id);
     }

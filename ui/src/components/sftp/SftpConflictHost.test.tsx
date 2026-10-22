@@ -174,3 +174,105 @@ describe("对话框默认选覆盖", () => {
     expect(mocks.answer).toHaveBeenCalledWith(1, "skip", false, undefined);
   });
 });
+
+describe("全部应用对整个批次生效（SFTP-7）", () => {
+  const applyAllBox = () => screen.getByLabelText(/本次其余同名文件都这样处理/);
+
+  it("勾了全部应用：同批次排队的提问用同一个动作回答掉，别的批次和没有批次的照常弹", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1, { batch: 5 }));
+    await emit("s1", prompt(2, { batch: 5 }));
+    await emit("s1", prompt(3, { batch: 5 }));
+    await emit("s1", prompt(4, { batch: 6 }));
+    await emit("s1", prompt(5));
+
+    // 当前这批队列里还有 2 个同名提问在等
+    expect(screen.getByText("（还有 2 个）")).toBeTruthy();
+    fireEvent.click(applyAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+
+    expect(mocks.answer).toHaveBeenCalledTimes(3);
+    expect(mocks.answer).toHaveBeenCalledWith(1, "overwrite", true, undefined);
+    expect(mocks.answer).toHaveBeenCalledWith(2, "overwrite", true, undefined);
+    expect(mocks.answer).toHaveBeenCalledWith(3, "overwrite", true, undefined);
+
+    // 轮到别的批次：照常弹，也没有"还有 N 个"
+    expect(await screen.findByText("/srv/file4.txt")).toBeTruthy();
+    expect(screen.queryByText(/还有/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenLastCalledWith(4, "overwrite", false, undefined);
+
+    // 没有批次的提问：勾不勾都只管自己
+    expect(await screen.findByText("/srv/file5.txt")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenLastCalledWith(5, "overwrite", false, undefined);
+    expect(mocks.answer).toHaveBeenCalledTimes(5);
+  });
+
+  it("没勾全部应用：同批次的提问一条一条弹", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1, { batch: 5 }));
+    await emit("s1", prompt(2, { batch: 5 }));
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("/srv/file2.txt")).toBeTruthy();
+  });
+
+  it("勾了之后才到的同批次提问（事件在路上）也直接回答，不弹", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1, { batch: 5 }));
+    fireEvent.click(applyAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenCalledTimes(1);
+
+    await emit("s1", prompt(2, { batch: 5 }));
+    expect(mocks.answer).toHaveBeenCalledTimes(2);
+    expect(mocks.answer).toHaveBeenLastCalledWith(2, "overwrite", true, undefined);
+    expect(screen.queryByText("目标已存在")).toBeNull();
+  });
+
+  it("重命名 + 全部应用：自己改的名字只给当前这条，其余不带名字（后端用自动名字）", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1, { batch: 5 }));
+    await emit("s1", prompt(2, { batch: 5 }));
+    fireEvent.click(screen.getByText("重命名"));
+    fireEvent.change(screen.getByPlaceholderText("新名字"), { target: { value: "mine.txt" } });
+    fireEvent.click(applyAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenNthCalledWith(1, 1, "rename", true, "mine.txt");
+    expect(mocks.answer).toHaveBeenNthCalledWith(2, 2, "rename", true, undefined);
+  });
+
+  it("「取消（按跳过）」只跳过当前这条，不算全部应用", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1, { batch: 5 }));
+    await emit("s1", prompt(2, { batch: 5 }));
+    fireEvent.click(applyAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "取消（按跳过）" }));
+    expect(mocks.answer).toHaveBeenCalledTimes(1);
+    expect(mocks.answer).toHaveBeenCalledWith(1, "skip", false, undefined);
+    expect(await screen.findByText("/srv/file2.txt")).toBeTruthy();
+  });
+
+  it("不同会话里批次号相同也不是同一批", async () => {
+    await mount(["s1", "s2"]);
+    await emit("s1", prompt(1, { batch: 1 }));
+    await emit("s2", prompt(2, { batch: 1 }));
+    expect(screen.queryByText(/还有/)).toBeNull();
+    fireEvent.click(applyAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("/srv/file2.txt")).toBeTruthy();
+  });
+
+  it("复制粘贴方向的提问同样按批次回答，各自用后端的自动名字", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1, { direction: "remote_copy", batch: 9, suggested_name: "a - 副本.txt" }));
+    await emit("s1", prompt(2, { direction: "remote_copy", batch: 9, suggested_name: "b - 副本.txt" }));
+    expect(screen.getByText("（还有 1 个）")).toBeTruthy();
+    fireEvent.click(applyAllBox());
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    expect(mocks.answer).toHaveBeenNthCalledWith(1, 1, "rename", true, "a - 副本.txt");
+    expect(mocks.answer).toHaveBeenNthCalledWith(2, 2, "rename", true, undefined);
+  });
+});

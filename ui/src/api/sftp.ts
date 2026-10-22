@@ -76,6 +76,8 @@ export interface SftpConflictPrompt {
   target_mtime?: number;
   can_resume: boolean;
   suggested_name: string;
+  /** 属于哪次提交 / 粘贴（同一批次共享"全部应用"）；没有 = 不属于任何批次。 */
+  batch?: number;
 }
 
 /** 删除事件（进度 / 结束共用一个事件名，tag 区分）。 */

@@ -26,8 +26,8 @@ use zssh_core::sftp::server_copy::{
     CopyConflictInfo, CopyConflictResolver, CopyMethod, CopyOptions, CopyProgress, CpFailure,
 };
 use zssh_core::sftp::transfer::{
-    copy_path, with_file_name, ConflictAction, ConflictDecision, ConflictInfo, ConflictResolver,
-    Direction, TransferJob,
+    copy_path, with_file_name, ConflictAction, ConflictBatch, ConflictDecision, ConflictInfo,
+    ConflictResolver, Direction, TransferJob,
 };
 use zssh_core::sftp::SftpChannel;
 
@@ -186,8 +186,10 @@ enum Dest {
     Skip,
 }
 
+/// 一次粘贴里"先在这里问"的冲突用的状态：和这次粘贴提交的传输任务共用同一个批次，
+/// 所以在哪里勾了"全部应用"，其余同名的（不管是这里问的还是引擎逐个文件问的）都按它处理。
 struct ConflictState {
-    remembered: Option<ConflictAction>,
+    batch: Arc<ConflictBatch>,
 }
 
 /// 粘贴命令。远端：`sftp_id` 是**目标**所在的会话；本地：随便一个能弹冲突对话框的会话。
@@ -259,10 +261,11 @@ pub async fn sftp_paste_cancel(
 ///
 /// 顶层的「覆盖」只表示"合并这个文件夹"，里面的同名文件仍然逐个问；用户勾了
 /// "对后续都这样处理"之后，后面的同名文件按记住的动作处理（和传输引擎一致）。
+/// "记住"放在这次粘贴的批次里：合并多个文件夹时第二个文件夹不会再从头问。
 struct MergeConflictBridge<'a> {
     resolver: &'a UiConflictResolver,
     browse: &'a SftpChannel,
-    remembered: std::sync::Mutex<Option<ConflictAction>>,
+    batch: &'a Arc<ConflictBatch>,
 }
 
 impl MergeConflictBridge<'_> {
@@ -309,10 +312,7 @@ impl CopyConflictResolver for MergeConflictBridge<'_> {
     ) -> zssh_core::ssh::BoxFuture<'a, Result<CopyConflictDecision, zssh_core::sftp::SftpError>>
     {
         Box::pin(async move {
-            let remembered = *self
-                .remembered
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let remembered = self.batch.action();
             let decision = match remembered {
                 Some(action) => ConflictDecision {
                     action,
@@ -331,15 +331,13 @@ impl CopyConflictResolver for MergeConflictBridge<'_> {
                             source_mtime: info.source_mtime,
                             target_mtime: info.target_mtime,
                             can_resume: false,
+                            batch: Some(self.batch.id()),
                         })
                         .await
                 }
             };
             if decision.apply_to_all {
-                *self
-                    .remembered
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decision.action);
+                self.batch.remember(decision.action);
             }
             match decision.action {
                 ConflictAction::Skip => Ok(CopyConflictDecision::Skip),
@@ -413,7 +411,11 @@ async fn paste_remote(
         }
     }
 
-    let mut conflicts = ConflictState { remembered: None };
+    // 这一次粘贴的冲突批次：先在这里问的和提交给引擎的任务共用，"全部应用"对整次粘贴生效。
+    let batch = target_tab.engine.new_batch();
+    let mut conflicts = ConflictState {
+        batch: Arc::clone(&batch),
+    };
     let mut results = Vec::new();
     let mut job_ids = Vec::new();
     // 这一次粘贴实际用的办法（第一个条目决定，后面的沿用）。
@@ -495,7 +497,7 @@ async fn paste_remote(
 
         // 复制。
         if !same_host {
-            match submit_relay(target_tab, &source_id, item, &dest, same_host) {
+            match submit_relay(target_tab, &batch, &source_id, item, &dest, same_host) {
                 Ok(id) => {
                     method = Some(CopyMethod::Relay);
                     job_ids.push(id);
@@ -509,7 +511,7 @@ async fn paste_remote(
         // 已经决定用中转（用户点了重试、或者上一个条目已经改成中转）：同一台主机也走
         // 引擎（数据经过本机）。
         if method == Some(CopyMethod::Relay) {
-            match submit_relay(target_tab, &source_id, item, &dest, same_host) {
+            match submit_relay(target_tab, &batch, &source_id, item, &dest, same_host) {
                 Ok(id) => {
                     job_ids.push(id);
                     results.push(queued_item(item, None));
@@ -530,7 +532,7 @@ async fn paste_remote(
                 .unwrap_or(false);
         if merging && !supports_copy_data(target_tab.browse.caps()) {
             method = Some(CopyMethod::Relay);
-            match submit_relay(target_tab, &source_id, item, &dest, same_host) {
+            match submit_relay(target_tab, &batch, &source_id, item, &dest, same_host) {
                 Ok(id) => {
                     job_ids.push(id);
                     results.push(queued_item(
@@ -562,7 +564,7 @@ async fn paste_remote(
                         format!("远端的登录 shell 不是 POSIX（{}）", shell_kind_label(shell))
                     };
                     method = Some(CopyMethod::Relay);
-                    match submit_relay(target_tab, &source_id, item, &dest, same_host) {
+                    match submit_relay(target_tab, &batch, &source_id, item, &dest, same_host) {
                         Ok(id) => {
                             job_ids.push(id);
                             results
@@ -577,11 +579,10 @@ async fn paste_remote(
         };
         match chosen {
             CopyMethod::CopyData => {
-                let merge_remembered = std::sync::Mutex::new(None);
                 let merge_bridge = MergeConflictBridge {
                     resolver,
                     browse: target_tab.browse.as_ref(),
-                    remembered: merge_remembered,
+                    batch: &batch,
                 };
                 let mut item_options = CopyOptions {
                     owner: &owner,
@@ -641,7 +642,7 @@ async fn paste_remote(
                     Err(CpFailure::NotAvailable(reason)) => {
                         // 命令没法用：改走中转（这是"用不了"，不是"做失败了"）。
                         tracing::info!(%reason, "服务器上没法用 cp，改经本机中转");
-                        match submit_relay(target_tab, &source_id, item, &dest, same_host) {
+                        match submit_relay(target_tab, &batch, &source_id, item, &dest, same_host) {
                             Ok(id) => {
                                 method = Some(CopyMethod::Relay);
                                 job_ids.push(id);
@@ -683,6 +684,7 @@ async fn paste_remote(
 
 fn submit_relay(
     target_tab: &Arc<SftpTab>,
+    batch: &Arc<ConflictBatch>,
     source_id: &str,
     item: &PasteItem,
     dest: &str,
@@ -695,7 +697,7 @@ fn submit_relay(
         recursive: true,
         peer: (!same_host).then(|| source_id.to_owned()),
     };
-    let id = target_tab.engine.submit(job.clone());
+    let id = target_tab.engine.submit_in_batch(job.clone(), batch);
     target_tab.remember_job(id, job);
     Ok(id)
 }
@@ -726,6 +728,7 @@ async fn resolve_remote_dest(
             source_mtime: source_attrs.as_ref().and_then(|attrs| attrs.mtime),
             target_mtime: existing.mtime,
             can_resume: false,
+            batch: Some(state.batch.id()),
         },
         same_entry,
     )
@@ -779,12 +782,12 @@ async fn resolve_remote_dest(
 
 /// 问一次冲突（"对后续都这样处理"记在 `state` 里；覆盖自己这种不能记）。
 async fn ask(
-    resolver: &UiConflictResolver,
+    resolver: &dyn ConflictResolver,
     state: &mut ConflictState,
     info: ConflictInfo,
     same_entry: bool,
 ) -> ConflictDecision {
-    if let Some(action) = state.remembered {
+    if let Some(action) = state.batch.action() {
         if !(same_entry && action == ConflictAction::Overwrite) {
             return ConflictDecision {
                 action,
@@ -796,7 +799,7 @@ async fn ask(
     let decision = resolver.decide(info).await;
     // "对后续都这样处理"；但「覆盖」不能因为这一项是自己覆盖自己就记下来。
     if decision.apply_to_all && !(same_entry && decision.action == ConflictAction::Overwrite) {
-        state.remembered = Some(decision.action);
+        state.batch.remember(decision.action);
     }
     decision
 }
@@ -819,7 +822,10 @@ async fn paste_local(
             return Err(reason);
         }
     }
-    let mut conflicts = ConflictState { remembered: None };
+    let batch = tab.engine.new_batch();
+    let mut conflicts = ConflictState {
+        batch: Arc::clone(&batch),
+    };
     let mut results = Vec::new();
     let mut job_ids = Vec::new();
 
@@ -846,7 +852,7 @@ async fn paste_local(
             dest
         };
 
-        let id = submit_local_copy(tab, item, &dest);
+        let id = submit_local_copy(tab, &batch, item, &dest);
         job_ids.push(id);
         results.push(queued_item(item, None));
     }
@@ -860,7 +866,12 @@ async fn paste_local(
     })
 }
 
-fn submit_local_copy(tab: &Arc<SftpTab>, item: &PasteItem, dest: &Path) -> u64 {
+fn submit_local_copy(
+    tab: &Arc<SftpTab>,
+    batch: &Arc<ConflictBatch>,
+    item: &PasteItem,
+    dest: &Path,
+) -> u64 {
     let job = TransferJob {
         direction: Direction::LocalCopy,
         source: item.path.clone(),
@@ -868,7 +879,7 @@ fn submit_local_copy(tab: &Arc<SftpTab>, item: &PasteItem, dest: &Path) -> u64 {
         recursive: true,
         peer: None,
     };
-    let id = tab.engine.submit(job.clone());
+    let id = tab.engine.submit_in_batch(job.clone(), batch);
     tab.remember_job(id, job);
     id
 }
@@ -903,6 +914,7 @@ async fn resolve_local_dest(
             source_mtime: source_meta.as_ref().and_then(mtime),
             target_mtime: mtime(&existing),
             can_resume: false,
+            batch: Some(state.batch.id()),
         },
         same_entry,
     )

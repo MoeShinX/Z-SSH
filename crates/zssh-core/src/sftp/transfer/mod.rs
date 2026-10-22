@@ -159,6 +159,9 @@ pub struct ConflictInfo {
     pub target_mtime: Option<u32>,
     /// 能不能续传（目标比源小）。
     pub can_resume: bool,
+    /// 这次提问属于哪个批次（同一次提交 / 粘贴）。界面用它把同批次还在排队的提问一起回答；
+    /// `None` = 不属于任何批次（单独提交的任务、重试过的任务）。
+    pub batch: Option<u64>,
 }
 
 /// 冲突决定。
@@ -170,6 +173,47 @@ pub struct ConflictDecision {
     /// 选"重命名"时用户改过的目标名（None = 用自动生成的 `名字 (2)`）。
     /// 只对这一次生效：勾了"对后续都这样"时，后面的文件仍用自动名字。
     pub rename_to: Option<String>,
+}
+
+/// 同一次提交（一次 `sftp_transfer_submit`、一次粘贴）里所有任务共享的"全部应用"选择。
+///
+/// 引擎按任务各记一份 `conflict_all`，一次传 10 个同名文件就是 10 个任务，第一个对话框里勾了
+/// "都这样处理"只管它自己。批次把这个选择放到任务之上：同批次里任何一个任务勾了，后面撞上
+/// 同名的任务直接按它处理，不再问。
+#[derive(Debug)]
+pub struct ConflictBatch {
+    id: u64,
+    action: Mutex<Option<ConflictAction>>,
+}
+
+impl ConflictBatch {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            action: Mutex::new(None),
+        }
+    }
+
+    /// 批次号（在同一个引擎里唯一；提问事件带着它）。
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// 这个批次已经记住的"全部应用"动作。
+    pub fn action(&self) -> Option<ConflictAction> {
+        *self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 记下"全部应用"的动作（后写的覆盖先写的）。
+    pub fn remember(&self, action: ConflictAction) {
+        *self
+            .action
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(action);
+    }
 }
 
 /// 冲突回调：界面弹窗实现它；测试里用固定策略。
@@ -251,6 +295,8 @@ struct JobState {
     id: TransferId,
     job: TransferJob,
     control: ControlFlag,
+    /// 所属批次；重试时摘掉（重试要重新问，不受批次里旧的选择影响）。
+    batch: Mutex<Option<Arc<ConflictBatch>>>,
     /// 用户暂停之后唤醒的开关。
     resume_signal: Notify,
     progress: Mutex<JobProgress>,
@@ -313,6 +359,7 @@ pub struct TransferEngine {
     events: mpsc::UnboundedSender<TransferEvent>,
     jobs: Mutex<HashMap<TransferId, Arc<JobState>>>,
     next_id: AtomicU64,
+    next_batch: AtomicU64,
     /// 这个引擎的标识：和任务号一起组成临时文件名里的任务标识（不同引擎、不同次启动不会撞）。
     nonce: String,
     /// 同时进行的文件数上限。
@@ -340,6 +387,7 @@ impl TransferEngine {
                 events,
                 jobs: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
+                next_batch: AtomicU64::new(1),
                 nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
                 this,
             }
@@ -351,13 +399,32 @@ impl TransferEngine {
         &self.options
     }
 
-    /// 把一个任务排进队列（立即返回任务号；真正干活在后台）。
+    /// 开一个冲突批次：同一次提交 / 粘贴的所有任务用 [`Self::submit_in_batch`] 排进同一个批次，
+    /// 共享"全部应用"的选择。
+    pub fn new_batch(&self) -> Arc<ConflictBatch> {
+        Arc::new(ConflictBatch::new(
+            self.next_batch.fetch_add(1, Ordering::SeqCst),
+        ))
+    }
+
+    /// 把一个任务排进队列（立即返回任务号；真正干活在后台）。不属于任何批次：
+    /// "全部应用"只管这个任务自己。
     pub fn submit(&self, job: TransferJob) -> TransferId {
+        self.submit_with(job, None)
+    }
+
+    /// 同 [`Self::submit`]，但任务属于一个批次。
+    pub fn submit_in_batch(&self, job: TransferJob, batch: &Arc<ConflictBatch>) -> TransferId {
+        self.submit_with(job, Some(Arc::clone(batch)))
+    }
+
+    fn submit_with(&self, job: TransferJob, batch: Option<Arc<ConflictBatch>>) -> TransferId {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let state = Arc::new(JobState {
             id,
             job: job.clone(),
             control: ControlFlag::new(),
+            batch: Mutex::new(batch),
             resume_signal: Notify::new(),
             progress: Mutex::new(JobProgress::new()),
             state: Mutex::new(TransferState::Queued),
@@ -411,6 +478,12 @@ impl TransferEngine {
             progress.conflict_all = None;
             progress.conflicted_targets.clear();
         }
+        // 同理，重试的任务脱离原来的批次：批次里旧的"全部应用"不再替它回答，它重新问，
+        // 重试后勾的"全部应用"也只管它自己。
+        *state
+            .batch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         state.control.reset();
         {
             // set_state 对终态只读，重试要显式改回去。
@@ -959,7 +1032,16 @@ impl TransferEngine {
         let target_mtime = target.existing_mtime().await.unwrap_or(None);
         // 续传只在"目标比源小"的时候有意义（不然没有要补的部分）。
         let can_resume = source_size.is_some_and(|source_size| existing_size < source_size);
-        let remembered = self.lock_progress(state).conflict_all;
+        // 先看任务自己记的，再看批次的（同一次提交里别的任务勾过"全部应用"）。
+        let batch = state
+            .batch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let remembered = self
+            .lock_progress(state)
+            .conflict_all
+            .or_else(|| batch.as_ref().and_then(|batch| batch.action()));
         let decision = match remembered {
             Some(action) => ConflictDecision {
                 action,
@@ -982,6 +1064,7 @@ impl TransferEngine {
                         source_mtime,
                         target_mtime,
                         can_resume,
+                        batch: batch.as_ref().map(|batch| batch.id()),
                     })
                     .await;
                 self.set_state(state, TransferState::Running);
@@ -991,6 +1074,9 @@ impl TransferEngine {
         };
         if decision.apply_to_all {
             self.lock_progress(state).conflict_all = Some(decision.action);
+            if let Some(batch) = &batch {
+                batch.remember(decision.action);
+            }
         }
         let outcome = self.apply_conflict_decision(state, &decision, can_resume, target_path);
         let remembered = match &outcome {
@@ -1046,7 +1132,11 @@ impl TransferEngine {
                     .map(str::trim)
                     .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
                     .map(|name| with_file_name(target_path, name))
-                    .unwrap_or_else(|| renamed_path(target_path, 2));
+                    .unwrap_or_else(|| match state.job.direction {
+                        // 复制粘贴的自动名字和粘贴时的习惯一致：「名字 - 副本」，不是「名字 (2)」。
+                        Direction::RemoteCopy | Direction::LocalCopy => copy_path(target_path, 1),
+                        Direction::Upload | Direction::Download => renamed_path(target_path, 2),
+                    });
                 self.push_note(state, format!("目标已存在，改成 {renamed}"));
                 ConflictOutcome::Renamed(renamed)
             }

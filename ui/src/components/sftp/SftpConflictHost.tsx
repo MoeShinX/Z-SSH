@@ -10,12 +10,23 @@ import { useEffect, useRef } from "react";
 
 import { onSftpConflict, sftpConflictAnswer } from "../../api/sftp";
 import {
+  batchKey,
+  batchPeers,
   conflictTimeLeft,
   nextConflict,
   useSftpConflicts,
+  type PendingConflict,
 } from "../../state/sftpConflicts";
 import { toast } from "../ui/toast";
 import { SftpConflictDialog, type ConflictAnswer } from "./SftpDialogs";
+
+/** 用批次里记住的动作回答一条提问（不弹窗）：改名不带用户输入的名字，由后端用自动名字。 */
+function answerQuietly(item: PendingConflict, action: ConflictAnswer["action"]) {
+  useSftpConflicts.getState().remove(item.prompt.conflict_id);
+  void sftpConflictAnswer(item.prompt.conflict_id, action, true, undefined).catch(
+    (error: unknown) => toast.error(String(error)),
+  );
+}
 
 interface SftpConflictHostProps {
   /** 本窗口现有的 SFTP 会话 id（独立标签 + 停靠面板的会话）。 */
@@ -26,6 +37,9 @@ export default function SftpConflictHost({ sessionIds }: SftpConflictHostProps) 
   const ownedRef = useRef<ReadonlySet<string>>(new Set());
   ownedRef.current = new Set(sessionIds);
   const owns = (sftpId: string) => ownedRef.current.has(sftpId);
+  // 勾过"全部应用"的批次和当时选的动作。后端会让同批次后面的任务直接按它处理，但已经发出、
+  // 还在路上或在队列里的提问要靠这里回答掉。
+  const batchChoicesRef = useRef(new Map<string, ConflictAnswer["action"]>());
 
   const queue = useSftpConflicts((state) => state.queue);
   const push = useSftpConflicts((state) => state.push);
@@ -49,6 +63,17 @@ export default function SftpConflictHost({ sessionIds }: SftpConflictHostProps) 
       stop?.();
     };
   }, [push]);
+
+  // 同批次的提问：选过"全部应用"之后到的（事件在路上、会话刚搬来）也直接回答掉。
+  useEffect(() => {
+    if (batchChoicesRef.current.size === 0) return;
+    for (const item of queue) {
+      if (!ownedRef.current.has(item.sftpId)) continue;
+      const key = batchKey(item.sftpId, item.prompt);
+      const action = key === null ? undefined : batchChoicesRef.current.get(key);
+      if (action !== undefined) answerQuietly(item, action);
+    }
+  }, [queue]);
 
   // 后端等满 2 分钟已经按「跳过」处理了：队列里对应的提问也撤掉（不然用户答了也没人收，
   // 回答还会报错）；本窗口的提问撤掉时说一声，别的窗口的会话不关这里的事。
@@ -75,6 +100,8 @@ export default function SftpConflictHost({ sessionIds }: SftpConflictHostProps) 
   const head = nextConflict(queue, owns);
   if (!head) return null;
 
+  const peers = batchPeers(queue, head).filter((item) => owns(item.sftpId));
+
   const answer = (reply: ConflictAnswer) => {
     remove(head.prompt.conflict_id);
     void sftpConflictAnswer(
@@ -83,12 +110,19 @@ export default function SftpConflictHost({ sessionIds }: SftpConflictHostProps) 
       reply.applyToAll,
       reply.renameTo,
     ).catch((error: unknown) => toast.error(String(error)));
+    // 勾了"全部应用"：同批次还在排队的提问用同一个动作回答掉；之后才到的靠上面的 effect。
+    if (reply.applyToAll) {
+      const key = batchKey(head.sftpId, head.prompt);
+      if (key !== null) batchChoicesRef.current.set(key, reply.action);
+      for (const item of peers) answerQuietly(item, reply.action);
+    }
   };
 
   return (
     <SftpConflictDialog
       key={head.prompt.conflict_id}
       prompt={head.prompt}
+      pendingInBatch={peers.length}
       onAnswer={answer}
       onDismissAsSkip={() => answer({ action: "skip", applyToAll: false })}
     />

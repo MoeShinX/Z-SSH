@@ -82,3 +82,122 @@ fn name_of_handles_both_separators_and_trailing_ones() {
     assert_eq!(name_of(r"C:\work\file.txt"), "file.txt");
     assert_eq!(name_of(r"C:\work\dir\"), "dir");
 }
+
+// ---------------------------------------------------------------------------
+// 冲突批次（SFTP-7）：一次粘贴里"先在这里问"的冲突和引擎的任务共用批次
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex as StdMutex;
+
+use zssh_core::sftp::transfer::memory::MemoryEndpoints;
+use zssh_core::sftp::transfer::{TransferEngine, TransferOptions};
+
+/// 记下被问了几次、按固定动作回答的 resolver。
+struct Fixed {
+    asked: StdMutex<Vec<ConflictInfo>>,
+    action: ConflictAction,
+    apply_to_all: bool,
+}
+
+impl Fixed {
+    fn new(action: ConflictAction, apply_to_all: bool) -> Self {
+        Self {
+            asked: StdMutex::new(Vec::new()),
+            action,
+            apply_to_all,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+}
+
+impl ConflictResolver for Fixed {
+    fn decide<'a>(&'a self, info: ConflictInfo) -> zssh_core::ssh::BoxFuture<'a, ConflictDecision> {
+        Box::pin(async move {
+            self.asked.lock().unwrap().push(info);
+            ConflictDecision {
+                action: self.action,
+                apply_to_all: self.apply_to_all,
+                rename_to: Some("手改的名字".to_owned()),
+            }
+        })
+    }
+}
+
+fn paste_state() -> ConflictState {
+    let (engine, _events) = TransferEngine::new(
+        Arc::new(MemoryEndpoints::new("/remote")),
+        Arc::new(zssh_core::sftp::transfer::OverwriteAll),
+        TransferOptions::default(),
+    );
+    ConflictState {
+        batch: engine.new_batch(),
+    }
+}
+
+fn info() -> ConflictInfo {
+    ConflictInfo {
+        job: 0,
+        direction: Direction::RemoteCopy,
+        source: "/a/x.txt".to_owned(),
+        target: "/b/x.txt".to_owned(),
+        source_size: Some(1),
+        target_size: Some(2),
+        source_mtime: None,
+        target_mtime: None,
+        can_resume: false,
+        batch: None,
+    }
+}
+
+#[tokio::test]
+async fn apply_to_all_asked_here_is_remembered_in_the_pastes_batch() {
+    let mut state = paste_state();
+    let resolver = Fixed::new(ConflictAction::Skip, true);
+    let first = ask(&resolver, &mut state, info(), false).await;
+    assert_eq!(first.action, ConflictAction::Skip);
+    // 同一次粘贴里后面的同名条目直接用记住的动作，不再问。
+    let second = ask(&resolver, &mut state, info(), false).await;
+    assert_eq!(second.action, ConflictAction::Skip);
+    assert_eq!(resolver.count(), 1);
+    // 引擎里的任务看的是同一个批次。
+    assert_eq!(state.batch.action(), Some(ConflictAction::Skip));
+}
+
+#[tokio::test]
+async fn a_choice_made_by_an_engine_job_answers_the_precheck_too() {
+    let mut state = paste_state();
+    // 引擎里某个任务勾了"全部应用"（它和这里共用批次）。
+    state.batch.remember(ConflictAction::Rename);
+    let resolver = Fixed::new(ConflictAction::Overwrite, false);
+    let decision = ask(&resolver, &mut state, info(), false).await;
+    assert_eq!(decision.action, ConflictAction::Rename);
+    assert_eq!(
+        decision.rename_to, None,
+        "手改的名字只用于被问的那个，其余用自动名字"
+    );
+    assert_eq!(resolver.count(), 0);
+}
+
+#[tokio::test]
+async fn not_ticking_apply_to_all_asks_every_time() {
+    let mut state = paste_state();
+    let resolver = Fixed::new(ConflictAction::Overwrite, false);
+    ask(&resolver, &mut state, info(), false).await;
+    ask(&resolver, &mut state, info(), false).await;
+    assert_eq!(resolver.count(), 2);
+    assert_eq!(state.batch.action(), None);
+}
+
+#[tokio::test]
+async fn overwriting_itself_is_never_remembered_for_the_rest() {
+    let mut state = paste_state();
+    let resolver = Fixed::new(ConflictAction::Overwrite, true);
+    // 粘贴到自己所在的文件夹：用它自己覆盖自己没有意义，这个选择不能带给后面的条目。
+    ask(&resolver, &mut state, info(), true).await;
+    assert_eq!(state.batch.action(), None);
+    ask(&resolver, &mut state, info(), false).await;
+    assert_eq!(resolver.count(), 2);
+}
