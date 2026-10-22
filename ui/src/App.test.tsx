@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   ),
   sessionOpenQuick: vi.fn(async () => "sess-quick"),
   sessionDuplicate: vi.fn(async () => "sess-dup"),
-  sessionClose: vi.fn(async () => {}),
+  sessionClose: vi.fn(async (_sessionId: string) => {}),
   termWrite: vi.fn(async () => {}),
   termResize: vi.fn(async () => {}),
   termAck: vi.fn(async () => {}),
@@ -31,6 +31,9 @@ const mocks = vi.hoisted(() => ({
   onPromptClosed: vi.fn(async () => () => {}),
   // 每个 pane 的 onReady / onResize 回调，测试手动触发（模拟终端量到尺寸）
   ready: new Map<string, (cols: number, rows: number) => void>(),
+  reconnect: new Map<string, () => void>(),
+  /** 终端层收到的输出块（paneId + 字节数）。 */
+  written: [] as { paneId: string; bytes: number }[],
   onTargetConnect: vi.fn(async () => () => {}),
   aiTargetConnectResult: vi.fn(async () => {}),
   hostPanelMounts: 0,
@@ -110,17 +113,37 @@ vi.mock("./components/vault/VaultView", () => ({
   ),
 }));
 // 终端层：把每个 pane 的 onReady 回调交出来，测试手动触发
-vi.mock("./components/PaneView", () => ({
-  default: (props: {
-    paneId: string;
-    onReady: (paneId: string, cols: number, rows: number) => void;
-    onResize: (paneId: string, cols: number, rows: number) => void;
-  }) => {
-    mocks.ready.set(props.paneId, (cols, rows) => props.onReady(props.paneId, cols, rows));
-    mocks.paneRenders += 1;
-    return null;
-  },
-}));
+vi.mock("./components/PaneView", async () => {
+  const { useEffect } = await import("react");
+  return {
+    default: (props: {
+      paneId: string;
+      onReady: (paneId: string, cols: number, rows: number) => void;
+      onResize: (paneId: string, cols: number, rows: number) => void;
+      onReconnect: (paneId: string) => void;
+      registerWriter: (paneId: string, writer: ((chunk: ArrayBuffer) => void) | null) => void;
+      session: { sessionId: string | null; phase: string };
+    }) => {
+      const { paneId, registerWriter } = props;
+      mocks.ready.set(paneId, (cols, rows) => props.onReady(paneId, cols, rows));
+      mocks.reconnect.set(paneId, () => props.onReconnect(paneId));
+      mocks.paneRenders += 1;
+      // 和真的 PaneView 一样把写输出的函数交给 App；写进来的块记在 written 里
+      useEffect(() => {
+        registerWriter(paneId, (chunk) => mocks.written.push({ paneId, bytes: chunk.byteLength }));
+        return () => registerWriter(paneId, null);
+      }, [paneId, registerWriter]);
+      // 渲染一个带 pane id 的空 div：测试靠它判断窗格还在不在、会话认领没有
+      return (
+        <div
+          data-pane-id={paneId}
+          data-phase={props.session.phase}
+          data-session={props.session.sessionId ?? ""}
+        />
+      );
+    },
+  };
+});
 // 标题栏 / 设置页 / 面板在 jsdom 下不需要真的渲染
 // 齿轮按钮和设置页的 × 只留一个按钮，测设置页的进出（R-11）
 vi.mock("./components/titlebar/TopTabs", () => ({
@@ -195,6 +218,8 @@ beforeEach(() => {
   mocks.sessionsReset.mockClear();
   mocks.sessionsReset.mockResolvedValue(0);
   mocks.ready.clear();
+  mocks.reconnect.clear();
+  mocks.written.length = 0;
   // 终端层（App 里没被 mock）要它量 pane 矩形
   globalThis.ResizeObserver = class {
     observe() {}
@@ -240,6 +265,227 @@ describe("App 打开会话的守卫", () => {
 
     expect(mocks.sessionOpen).toHaveBeenCalledTimes(1);
     expect(mocks.sessionOpen).toHaveBeenCalledWith(7, 120, 30, expect.anything());
+  });
+});
+
+describe("打开会话的结果回来时 pane 已经关了（TERM-1 T02）", () => {
+  /** 一个手动决定何时返回的 Promise。 */
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+  const paneIdsInDom = () =>
+    [...document.querySelectorAll("[data-pane-id]")].map((el) => el.getAttribute("data-pane-id"));
+  const closeFocusedPane = () =>
+    act(async () => {
+      fireEvent.keyDown(window, { key: "W", ctrlKey: true, shiftKey: true });
+    });
+  const splitFocusedPane = () =>
+    act(async () => {
+      fireEvent.keyDown(window, { key: "D", ctrlKey: true, shiftKey: true });
+    });
+  /** 捕获 App 订阅的会话状态回调，测试手动推事件。 */
+  function captureStateEvents() {
+    mocks.stateHandlers.length = 0;
+    mocks.onSessionState.mockImplementation((async (handler: (event: unknown) => void) => {
+      mocks.stateHandlers.push(handler);
+      return () => {};
+    }) as unknown as () => Promise<() => void>);
+    return (event: Record<string, unknown>) => {
+      for (const handler of mocks.stateHandlers) handler(event);
+    };
+  }
+
+  afterEach(() => {
+    mocks.onSessionState.mockImplementation(async () => () => {});
+    mocks.sessionDuplicate.mockReset();
+    mocks.sessionDuplicate.mockResolvedValue("sess-dup");
+  });
+
+  it("关窗格时 ID 还没回来，之后才返回：马上关掉这个会话，不登记", async () => {
+    const open = deferred<string>();
+    mocks.sessionOpen.mockImplementationOnce(() => open.promise);
+    const emit = captureStateEvents();
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    expect(mocks.sessionOpen).toHaveBeenCalledTimes(1);
+    expect(paneIdsInDom()).toHaveLength(1);
+
+    // ID 回来之前，后端的状态事件已经先到了（会被按 ID 缓冲）
+    await act(async () => emit({ session_id: "late-session", state: "connected" }));
+
+    await closeFocusedPane();
+    expect(paneIdsInDom()).toHaveLength(0);
+    expect(mocks.sessionClose).not.toHaveBeenCalled(); // 关的时候还没有 ID 可关
+
+    await act(async () => open.resolve("late-session"));
+
+    expect(mocks.sessionClose).toHaveBeenCalledTimes(1);
+    expect(mocks.sessionClose).toHaveBeenCalledWith("late-session");
+    // 之后这个会话的事件（比如关闭产生的 disconnected）直接丢，不会再有人认领
+    await act(async () => emit({ session_id: "late-session", state: "disconnected", reason: "x" }));
+    expect(mocks.sessionClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("对照：ID 先回来、之后再关窗格，照旧关掉这个会话", async () => {
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await waitFor(() =>
+      expect(document.querySelector("[data-pane-id]")?.getAttribute("data-session")).toBe("sess-1"),
+    );
+
+    await closeFocusedPane();
+
+    // 只剩一个窗格时 closePaneAt 会转去 closeTab，原本就会发两次 close（后端幂等），这里不管次数
+    expect(mocks.sessionClose).toHaveBeenCalledWith("sess-1");
+    expect(new Set(mocks.sessionClose.mock.calls.map((call) => call[0]))).toEqual(
+      new Set(["sess-1"]),
+    );
+  });
+
+  it("对照：窗格还在时 ID 回来：登记到这个窗格，并重放先到的事件", async () => {
+    const open = deferred<string>();
+    mocks.sessionOpen.mockImplementationOnce(() => open.promise);
+    const emit = captureStateEvents();
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await act(async () => emit({ session_id: "sess-1", state: "connected" }));
+
+    await act(async () => open.resolve("sess-1"));
+
+    const pane = document.querySelector("[data-pane-id]");
+    expect(pane?.getAttribute("data-session")).toBe("sess-1");
+    expect(pane?.getAttribute("data-phase")).toBe("connected");
+    expect(mocks.sessionClose).not.toHaveBeenCalled();
+  });
+
+  it("等待期间打开失败、窗格已经关了：不关任何会话，也不报错", async () => {
+    const open = deferred<string>();
+    mocks.sessionOpen.mockImplementationOnce(() => open.promise);
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await closeFocusedPane();
+
+    await act(async () => open.reject(new Error("认证失败")));
+
+    expect(mocks.sessionClose).not.toHaveBeenCalled();
+    expect(paneIdsInDom()).toHaveLength(0);
+  });
+
+  it("分屏 duplicate 的结果回来时窗格已关：同样关掉返回的 ID", async () => {
+    const dup = deferred<string>();
+    mocks.sessionDuplicate.mockImplementationOnce(() => dup.promise);
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await waitFor(() =>
+      expect(document.querySelector("[data-pane-id]")?.getAttribute("data-session")).toBe("sess-1"),
+    );
+
+    await splitFocusedPane();
+    await waitFor(() => expect(mocks.ready.size).toBe(2));
+    const newPaneId = paneIdsInDom().find((id) => id !== [...mocks.ready.keys()][0]) as string;
+    await act(async () => mocks.ready.get(newPaneId)?.(100, 30));
+    expect(mocks.sessionDuplicate).toHaveBeenCalledWith("sess-1", 100, 30, expect.anything());
+
+    await closeFocusedPane(); // 焦点在新窗格上
+    expect(paneIdsInDom()).toEqual([[...mocks.ready.keys()][0]]);
+    expect(mocks.sessionClose).not.toHaveBeenCalled();
+
+    await act(async () => dup.resolve("late-dup"));
+
+    expect(mocks.sessionClose).toHaveBeenCalledTimes(1);
+    expect(mocks.sessionClose).toHaveBeenCalledWith("late-dup");
+  });
+
+  it("duplicate 失败改走重新连接的回退：窗格已关时不再重新连接", async () => {
+    const dup = deferred<string>();
+    mocks.sessionDuplicate.mockImplementationOnce(() => dup.promise);
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await waitFor(() =>
+      expect(document.querySelector("[data-pane-id]")?.getAttribute("data-session")).toBe("sess-1"),
+    );
+    await splitFocusedPane();
+    await waitFor(() => expect(mocks.ready.size).toBe(2));
+    const oldPaneId = [...mocks.ready.keys()][0];
+    const newPaneId = paneIdsInDom().find((id) => id !== oldPaneId) as string;
+    await act(async () => mocks.ready.get(newPaneId)?.(100, 30));
+    await closeFocusedPane();
+
+    await act(async () => dup.reject(new Error("duplicate 失败")));
+
+    expect(mocks.sessionOpen).toHaveBeenCalledTimes(1); // 只有最初那一次
+    expect(mocks.sessionClose).not.toHaveBeenCalled();
+  });
+
+  it("duplicate 失败改走重新连接，回退的结果回来时窗格已关：关掉返回的 ID", async () => {
+    const fallback = deferred<string>();
+    mocks.sessionDuplicate.mockRejectedValueOnce(new Error("duplicate 失败"));
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await waitFor(() =>
+      expect(document.querySelector("[data-pane-id]")?.getAttribute("data-session")).toBe("sess-1"),
+    );
+    mocks.sessionOpen.mockImplementationOnce(() => fallback.promise);
+    await splitFocusedPane();
+    await waitFor(() => expect(mocks.ready.size).toBe(2));
+    const oldPaneId = [...mocks.ready.keys()][0];
+    const newPaneId = paneIdsInDom().find((id) => id !== oldPaneId) as string;
+    await act(async () => mocks.ready.get(newPaneId)?.(100, 30));
+    await waitFor(() => expect(mocks.sessionOpen).toHaveBeenCalledTimes(2)); // 回退发出了
+
+    await closeFocusedPane();
+    await act(async () => fallback.resolve("late-fallback"));
+
+    expect(mocks.sessionClose).toHaveBeenCalledTimes(1);
+    expect(mocks.sessionClose).toHaveBeenCalledWith("late-fallback");
+  });
+});
+
+describe("重连后旧会话通道上迟到的输出（TERM-1 T06）", () => {
+  it("新一次连接开始后，旧通道的块直接丢；新通道的块照常写进终端", async () => {
+    mocks.stateHandlers.length = 0;
+    mocks.onSessionState.mockImplementation((async (handler: (event: unknown) => void) => {
+      mocks.stateHandlers.push(handler);
+      return () => {};
+    }) as unknown as () => Promise<() => void>);
+    try {
+      const ready = await openHost();
+      await act(async () => ready(100, 30));
+      await waitFor(() =>
+        expect(document.querySelector("[data-pane-id]")?.getAttribute("data-session")).toBe(
+          "sess-1",
+        ),
+      );
+      const oldChannel = mocks.sessionOpen.mock.calls[0][3] as (chunk: ArrayBuffer) => void;
+
+      oldChannel(new ArrayBuffer(10));
+      expect(mocks.written).toHaveLength(1);
+
+      // 断线 → 点重连
+      await act(async () => {
+        for (const handler of mocks.stateHandlers) {
+          handler({ session_id: "sess-1", state: "disconnected", reason: "网络中断" });
+        }
+      });
+      mocks.sessionOpen.mockResolvedValueOnce("sess-2");
+      const paneId = [...mocks.reconnect.keys()][0];
+      await act(async () => mocks.reconnect.get(paneId)?.());
+      await waitFor(() => expect(mocks.sessionOpen).toHaveBeenCalledTimes(2));
+      const newChannel = mocks.sessionOpen.mock.calls[1][3] as (chunk: ArrayBuffer) => void;
+
+      oldChannel(new ArrayBuffer(20)); // 旧会话的尾巴
+      newChannel(new ArrayBuffer(30));
+
+      expect(mocks.written.map((item) => item.bytes)).toEqual([10, 30]);
+    } finally {
+      mocks.onSessionState.mockImplementation(async () => () => {});
+    }
   });
 });
 

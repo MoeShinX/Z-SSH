@@ -9,10 +9,12 @@
 //! 按同样的方式算（含最小 2 列 / 1 行），测试就能直接摆布"容器先是 0 尺寸、
 //! 再变成正常尺寸"这个时序。
 
-import { act, render } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { createRef } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import TerminalView from "./TerminalView";
+import { useSettings } from "../stores/settings";
+import TerminalView, { type TerminalHandle } from "./TerminalView";
 
 /** 单格像素尺寸（测试自定；行为只取决于宽高和它的比例）。 */
 const CELL_WIDTH = 8;
@@ -30,6 +32,8 @@ const fake = vi.hoisted(() => ({
   /** 终端挂在哪个元素上（就是被量尺寸的容器）。 */
   openedEl: null as HTMLElement | null,
   disposed: 0,
+  /** xterm 的 paste 被调用时收到的文本（真正送进会话的内容）。 */
+  pasted: [] as string[],
 }));
 
 vi.mock("../terminal/terminal", () => {
@@ -60,7 +64,9 @@ vi.mock("../terminal/terminal", () => {
     getSelection() {
       return "";
     },
-    paste() {},
+    paste(text: string) {
+      fake.pasted.push(text);
+    },
     focus() {},
     dispose() {
       fake.disposed += 1;
@@ -103,6 +109,7 @@ beforeEach(() => {
   fake.fits = 0;
   fake.openedEl = null;
   fake.disposed = 0;
+  fake.pasted = [];
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   // jsdom 没有 ResizeObserver
   globalThis.ResizeObserver = class {
@@ -223,5 +230,115 @@ describe("TerminalView 的初始尺寸", () => {
     // 再切回来：照常报新尺寸
     resize(600, 400);
     expect(onResize).toHaveBeenLastCalledWith(75, 23);
+  });
+});
+
+describe("粘贴入口的多行确认（TERM-1 T04）", () => {
+  afterEach(cleanup);
+
+  function renderWithHandle(pasteTarget: string | null = null) {
+    const ref = createRef<TerminalHandle>();
+    const view = render(
+      <TerminalView
+        ref={ref}
+        theme={{}}
+        onData={() => {}}
+        onResize={() => {}}
+        pasteTarget={pasteTarget}
+      />,
+    );
+    const rerenderWith = (target: string | null) =>
+      view.rerender(
+        <TerminalView
+          ref={ref}
+          theme={{}}
+          onData={() => {}}
+          onResize={() => {}}
+          pasteTarget={target}
+        />,
+      );
+    return { ref, view, rerenderWith };
+  }
+
+  it("开着确认：通过对外的 handle 粘贴多行文本也会弹确认，确认前不送进终端", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { ref, view } = renderWithHandle();
+
+    act(() => ref.current?.paste("a\nb"));
+
+    expect(view.queryByRole("dialog")).not.toBeNull();
+    expect(fake.pasted).toEqual([]);
+
+    fireEvent.click(view.getByText("粘贴"));
+    expect(fake.pasted).toEqual(["a\nb"]);
+    expect(view.queryByRole("dialog")).toBeNull();
+  });
+
+  it("点取消：不送进终端", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { ref, view } = renderWithHandle();
+
+    act(() => ref.current?.paste("a\nb"));
+    fireEvent.click(view.getByText("取消"));
+
+    expect(fake.pasted).toEqual([]);
+    expect(view.queryByRole("dialog")).toBeNull();
+  });
+
+  it("单行文本（拖入的路径）：不弹确认，直接送进终端、不加回车", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { ref, view } = renderWithHandle();
+
+    act(() => ref.current?.paste("'/srv/a b.txt'"));
+
+    expect(view.queryByRole("dialog")).toBeNull();
+    expect(fake.pasted).toEqual(["'/srv/a b.txt'"]);
+  });
+
+  it("关掉确认开关：多行文本直接送进终端", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: false });
+    const { ref, view } = renderWithHandle();
+
+    act(() => ref.current?.paste("a\nb"));
+
+    expect(view.queryByRole("dialog")).toBeNull();
+    expect(fake.pasted).toEqual(["a\nb"]);
+  });
+
+  it("浏览器 paste 事件（对照）：同样弹确认", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { view } = renderWithHandle();
+
+    fireEvent.paste(fake.openedEl as HTMLElement, {
+      clipboardData: { getData: () => "a\nb" },
+    });
+
+    expect(view.queryByRole("dialog")).not.toBeNull();
+    expect(fake.pasted).toEqual([]);
+  });
+
+  it("等确认期间目标会话变了（重连）：这次粘贴作废，弹窗收起，不发给新会话", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { ref, view, rerenderWith } = renderWithHandle("old-session");
+
+    act(() => ref.current?.paste("a\nb"));
+    expect(view.queryByRole("dialog")).not.toBeNull();
+
+    rerenderWith(null); // 断线
+    rerenderWith("new-session"); // 重连成新会话
+
+    expect(view.queryByRole("dialog")).toBeNull();
+    expect(fake.pasted).toEqual([]);
+  });
+
+  it("目标没变：确认之后照常送出", () => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { ref, view, rerenderWith } = renderWithHandle("s1");
+
+    act(() => ref.current?.paste("a\nb"));
+    rerenderWith("s1");
+    fireEvent.click(view.getByText("粘贴"));
+
+    expect(fake.pasted).toEqual(["a\nb"]);
   });
 });

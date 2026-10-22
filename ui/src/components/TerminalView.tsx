@@ -42,7 +42,10 @@ export interface TerminalHandle {
   /** 当前行列数。 */
   size(): { cols: number; rows: number };
   focus(): void;
-  /** 往输入行插入文本（带括号粘贴的处理交给 xterm），不加回车、不执行。 */
+  /**
+   * 往输入行插入文本（带括号粘贴的处理交给 xterm），不加回车、不执行。
+   * 和键盘、剪贴板、右键粘贴走同一套多行确认：开了「多行粘贴前确认」且带换行就先弹确认。
+   */
   paste(text: string): void;
 }
 
@@ -56,6 +59,11 @@ interface TerminalViewProps {
   onResize: (cols: number, rows: number) => void;
   /** 挂载并完成第一次量测（这个尺寸就是后面开会话用的初始尺寸）。 */
   onReady?: (cols: number, rows: number) => void;
+  /**
+   * 粘贴内容要发给谁（一般是会话 ID）。等确认期间它变了（断线重连、换了会话），
+   * 这次粘贴作废，不会发给新的会话。不传表示不区分。
+   */
+  pasteTarget?: string | null;
 }
 
 export default function TerminalView({
@@ -64,6 +72,7 @@ export default function TerminalView({
   onData,
   onResize,
   onReady,
+  pasteTarget = null,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -94,16 +103,31 @@ export default function TerminalView({
   const lightTerminal = useTerminalMode() === "light";
   const behaviorRef = useRef({ copyOnSelect, rightClickPaste, confirmMultiline });
   behaviorRef.current = { copyOnSelect, rightClickPaste, confirmMultiline };
-  // 等用户确认的多行粘贴内容
-  const [pendingPaste, setPendingPaste] = useState<string | null>(null);
-  /** 所有粘贴都走这里：带换行且开了确认就先问，否则直接送进终端。 */
+  const pasteTargetRef = useRef(pasteTarget);
+  pasteTargetRef.current = pasteTarget;
+  // 等用户确认的多行粘贴内容，连同请求粘贴那一刻的目标
+  const [pending, setPending] = useState<{ text: string; target: string | null } | null>(null);
+  const pendingPaste = pending?.text ?? null;
+  /**
+   * 所有往会话里粘贴文本的入口都走这里（键盘、剪贴板、右键、拖放的 handle.paste）：
+   * 带换行且开了确认就先问，否则直接送进终端。
+   */
   const requestPaste = (text: string) => {
     if (!text) return;
-    if (behaviorRef.current.confirmMultiline && multilinePaste(text)) setPendingPaste(text);
-    else terminalRef.current?.paste(text);
+    if (behaviorRef.current.confirmMultiline && multilinePaste(text)) {
+      setPending({ text, target: pasteTargetRef.current });
+    } else {
+      terminalRef.current?.paste(text);
+    }
   };
   const requestPasteRef = useRef(requestPaste);
   requestPasteRef.current = requestPaste;
+  // 等确认的时候目标会话变了（断线重连等）：这次粘贴作废，别把内容发给新的会话
+  useEffect(() => {
+    if (pending === null || pending.target === pasteTarget) return;
+    setPending(null);
+    toast.info("会话已变化，已取消待确认的粘贴");
+  }, [pasteTarget, pending]);
   // mount effect 里存的 refit 函数，设置变了拿它重新量一次行列数
   const refitRef = useRef<(() => void) | null>(null);
 
@@ -322,7 +346,7 @@ export default function TerminalView({
         return { cols: terminal?.cols ?? 80, rows: terminal?.rows ?? 24 };
       },
       paste(text) {
-        terminalRef.current?.paste(text);
+        requestPasteRef.current(text);
       },
       focus() {
         terminalRef.current?.focus();
@@ -350,13 +374,18 @@ export default function TerminalView({
           confirmLabel="粘贴"
           onOpenChange={(open) => {
             if (!open) {
-              setPendingPaste(null);
+              setPending(null);
               terminalRef.current?.focus();
             }
           }}
           onConfirm={() => {
-            terminalRef.current?.paste(pendingPaste);
-            setPendingPaste(null);
+            // 再核对一次目标：确认按钮按下时它还得是请求粘贴时的那个会话
+            if (pending && pending.target === pasteTargetRef.current) {
+              terminalRef.current?.paste(pending.text);
+            } else {
+              toast.info("会话已变化，已取消粘贴");
+            }
+            setPending(null);
             terminalRef.current?.focus();
           }}
         />

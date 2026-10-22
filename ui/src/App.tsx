@@ -444,6 +444,18 @@ export default function App() {
    * 同步可见。
    */
   const openingPanes = useRef(new Set<PaneId>());
+  /**
+   * 每个 pane 当前有效的「打开尝试」代次（pane → 代次）。
+   *
+   * 打开会话是异步的：命令返回会话 ID 之前用户可能已经关掉了标签 / 窗格，而关闭时只能关
+   * 当时已经有 \`sessionId\` 的会话。所以每次尝试领一个代次，关 pane 时把它删掉；结果回来时
+   * 代次对不上（或 pane 已经没了），说明没人再要这个会话，必须马上关掉返回的 ID。
+   * 只在发请求前检查是不够的，关闭恰好落在"请求已发出、ID 还没回来"这个窗口里。
+   */
+  const openAttempts = useRef(new Map<PaneId, number>());
+  const openAttemptSeq = useRef(0);
+  /** 迟到之后被我们关掉的会话 ID：它们后续的状态事件直接丢，不再按"还没认领"缓冲。 */
+  const discardedSessions = useRef(new Set<string>());
 
   // 界面启动：叫后端把上一页留下的会话收掉（刷新 / 热更新 / 崩溃）。
   // 见下面的 startResetOnce：整个页面生命周期只发一次。
@@ -655,6 +667,10 @@ export default function App() {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void onSessionState((event) => {
+      if (discardedSessions.current.has(event.session_id)) {
+        if (event.state === "disconnected") discardedSessions.current.delete(event.session_id);
+        return;
+      }
       const paneId = sessionToPane.current.get(event.session_id);
       if (paneId) {
         applyEvent(paneId, event);
@@ -733,10 +749,24 @@ export default function App() {
     [authPrompt],
   );
 
+  /**
+   * 某次打开尝试的输出通道。尝试被新的一次取代（重连）或作废（关 pane）之后，
+   * 旧通道上还在路上的块直接丢：它们属于已经结束的会话，不能写进新会话的终端、
+   * 也不能算进新会话的流控。
+   */
   const outputFor = useCallback(
-    (paneId: PaneId) => (chunk: ArrayBuffer) => writers.current.get(paneId)?.(chunk),
+    (paneId: PaneId, isCurrent: () => boolean) => (chunk: ArrayBuffer) => {
+      if (isCurrent()) writers.current.get(paneId)?.(chunk);
+    },
     [],
   );
+
+  /** 迟到返回、已经没人要的会话：关掉，不登记映射，清掉它的缓冲。 */
+  const discardLateSession = useCallback((sessionId: string) => {
+    bufferedEvents.current.delete(sessionId);
+    discardedSessions.current.add(sessionId);
+    void sessionClose(sessionId).catch(() => {});
+  }, []);
 
   /** 给一个 pane 开会话（语义和 M1-06 一样：立即返回 ID，事件驱动）。 */
   const openPane = useCallback(
@@ -757,7 +787,12 @@ export default function App() {
 
       const duplicateSource = duplicateFrom.current.get(paneId) ?? null;
       duplicateFrom.current.delete(paneId);
-      const onOutput = outputFor(paneId);
+      // 领一个新的尝试代次；关 pane 会把它删掉（或被后一次尝试取代），之后回来的结果就不再有效。
+      const attempt = ++openAttemptSeq.current;
+      openAttempts.current.set(paneId, attempt);
+      const isCurrent = () =>
+        openAttempts.current.get(paneId) === attempt && wsRef.current.panes[paneId] !== undefined;
+      const onOutput = outputFor(paneId, isCurrent);
       const origin = pane.origin;
 
       const openByOrigin = async (): Promise<string | null> => {
@@ -778,11 +813,19 @@ export default function App() {
           try {
             sessionId = await sessionDuplicate(duplicateSource, cols, rows, onOutput);
           } catch (error) {
+            // 等的时候 pane 已经关了：不要再为一个没人要的 pane 重新开连接
+            if (!isCurrent()) return;
             console.warn("session_duplicate 失败，改为重新连接", error);
             sessionId = await openByOrigin();
           }
         } else {
           sessionId = await openByOrigin();
+        }
+        // 结果回来时 pane 已经被关、或这次尝试已作废：会话没人管了，立刻关掉
+        // （不登记映射、不重放缓冲里它的事件）。
+        if (!isCurrent()) {
+          if (sessionId !== null) discardLateSession(sessionId);
+          return;
         }
         if (sessionId === null) {
           setPane(paneId, { phase: "idle", status: "" });
@@ -790,6 +833,7 @@ export default function App() {
         }
         claimSession(paneId, sessionId);
       } catch (error) {
+        if (!isCurrent()) return; // pane 已经没了，失败也不用再提示
         const reason = errorText(error);
         showHostAfterFailedConnect(paneId, reason);
         setPane(paneId, {
@@ -804,7 +848,7 @@ export default function App() {
         openingPanes.current.delete(paneId);
       }
     },
-    [claimSession, outputFor, setPane, showHostAfterFailedConnect],
+    [claimSession, discardLateSession, outputFor, setPane, showHostAfterFailedConnect],
   );
 
   const handlePaneReady = useCallback(
@@ -1401,6 +1445,7 @@ export default function App() {
       writers.current.delete(paneId);
       sizes.current.delete(paneId);
       duplicateFrom.current.delete(paneId);
+      openAttempts.current.delete(paneId); // 还在路上的打开结果作废（T02）
     }
 
     setWs((current) => {
@@ -1433,6 +1478,7 @@ export default function App() {
       writers.current.delete(paneId);
       sizes.current.delete(paneId);
       duplicateFrom.current.delete(paneId);
+      openAttempts.current.delete(paneId); // 还在路上的打开结果作废（T02）
 
       const { tree, focus } = closePaneWithFocus(tab.tree, paneId, tab.focus);
       if (tree === null) {
