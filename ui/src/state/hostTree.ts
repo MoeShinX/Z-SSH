@@ -139,7 +139,8 @@ export function treeFilterFor(groups: Group[], hosts: Host[], rawText: string): 
   const counts = new Map<number, number>();
   let ungrouped = ungroupedNameHit;
   for (const group of groups) {
-    if (nameHit(group.id)) groupIds.add(group.id);
+    // 名字命中的分组连同它的整条祖先路径一起留下：嵌套在没命中的父分组里的（哪怕是空分组）也要看得到
+    if (nameHit(group.id)) for (const id of chain(group.id)) groupIds.add(id);
   }
   for (const host of hosts) {
     const visible =

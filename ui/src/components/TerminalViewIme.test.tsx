@@ -5,12 +5,20 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const ime = vi.hoisted(() => ({ calls: [] as boolean[], textarea: null as HTMLTextAreaElement | null }));
+const ime = vi.hoisted(() => ({
+  calls: [] as boolean[],
+  textarea: null as HTMLTextAreaElement | null,
+  pendingHandlers: [] as (() => void)[],
+}));
 
 vi.mock("../api/ime", () => ({
   imeTerminalFocus: vi.fn(async (focused: boolean) => {
     ime.calls.push(focused);
     return focused;
+  }),
+  onImeRestorePending: vi.fn(async (handler: () => void) => {
+    ime.pendingHandlers.push(handler);
+    return () => {};
   }),
 }));
 vi.mock("../api/settings", () => ({
@@ -58,6 +66,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   ime.calls.length = 0;
   ime.textarea = null;
+  ime.pendingHandlers.length = 0;
   if (!document.fonts) {
     Object.defineProperty(document, "fonts", { configurable: true, value: { ready: Promise.resolve() } });
   }
@@ -96,6 +105,67 @@ const makeAi = () => {
   document.body.appendChild(ai);
   return ai;
 };
+
+/** 后端广播 ime_restore_pending（别的窗口被关掉、恢复没成功）。 */
+const backendOwesRestore = () =>
+  act(() => {
+    for (const handler of ime.pendingHandlers) handler();
+  });
+
+describe("别的窗口被关掉、恢复没成功（ime_restore_pending）", () => {
+  it("主窗口此前没进过英文区：收到广播后焦点进 AI 输入框，补发一次离开", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
+    mount();
+    const ai = makeAi();
+    const button = document.createElement("button");
+    document.body.append(button);
+    act(() => button.focus());
+    await settle();
+    expect(ime.calls).toEqual([]);
+    backendOwesRestore();
+    await settle();
+    // 通知本身不发请求：等焦点进跟随区
+    expect(ime.calls).toEqual([]);
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([false]);
+    // 补成功后清掉：再进一次 AI 输入框不重复发
+    act(() => button.focus());
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([false]);
+  });
+
+  it("没有广播（没有欠恢复）：进 AI 输入框什么都不发，不改输入法", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
+    mount();
+    const ai = makeAi();
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([]);
+  });
+
+  it("焦点此刻就在 AI 输入框里收到广播：马上开始等并补发", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
+    mount();
+    const ai = makeAi();
+    act(() => ai.focus());
+    await settle();
+    backendOwesRestore();
+    await settle();
+    expect(ime.calls).toEqual([false]);
+  });
+
+  it("设置里关着（没在管理输入法）：忽略广播，不发任何请求", async () => {
+    useSettings.setState({ terminal_ime_english: false, loaded: true });
+    mount();
+    const ai = makeAi();
+    backendOwesRestore();
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([]);
+  });
+});
 
 describe("默认使用英文输入", () => {
   it("终端获得焦点切英文，焦点进了 AI 输入框才恢复", async () => {

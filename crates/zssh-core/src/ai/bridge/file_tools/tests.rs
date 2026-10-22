@@ -827,4 +827,11 @@ async fn file_tools_open_the_bound_session_and_report_where_they_run() {
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].target_id, "host-7");
     assert_eq!(approvals[0].session_id.as_deref(), Some("sess-9"));
+    // 每次调用一个编号，写文件的确认请求带的就是它回报的那个。
+    let mut ids: Vec<&str> = reports.iter().map(|r| r.exec_id.as_str()).collect();
+    assert!(ids.iter().all(|id| !id.is_empty()));
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 4, "四次调用四个不同的编号");
+    assert_eq!(approvals[0].exec_id, reports[3].exec_id);
 }

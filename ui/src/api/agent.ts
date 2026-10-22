@@ -322,6 +322,8 @@ export function onDownloadProgress(
 export interface ApprovalRequest {
   req_id: number;
   scope: string;
+  /** 这次工具调用的执行编号（和 `ai_exec_target` 回报、工具结果末尾的标记是同一个）。 */
+  exec_id: string;
   host_label: string;
   command: string;
   danger: string;
@@ -352,6 +354,11 @@ export interface ApprovalRequest {
  */
 export interface ExecTargetReport {
   scope: string;
+  /**
+   * 这次工具调用的执行编号（AI-SCOPE-3）：后端每接到一个工具请求生成一个，工具结果文本末尾
+   * 带 `[zssh exec <编号>]` 一行。界面拿结果里的编号校正卡片和回报的配对。只是关联用，不是凭据。
+   */
+  exec_id: string;
   /** 不带前缀的工具名：`run_command`、`read_terminal`、`list_dir`、`read_file`、`write_file`、`stat`。 */
   tool: string;
   /** 对到卡片上用的键：命令原文 / 调用时给的路径原文 / 空（`read_terminal`）。 */

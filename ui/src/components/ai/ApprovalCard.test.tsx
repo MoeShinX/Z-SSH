@@ -25,6 +25,7 @@ function runCall(command: string) {
 function approval(command: string): PendingApproval {
   return {
     reqId: 3,
+    execId: "pfx-3",
     hostLabel: "web-1",
     command,
     danger: "dangerous",

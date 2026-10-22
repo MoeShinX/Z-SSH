@@ -12,6 +12,7 @@ vi.mock("../../api/ime", () => ({
     ime.calls.push(focused);
     return focused;
   }),
+  onImeRestorePending: vi.fn(async () => () => {}),
 }));
 vi.mock("../../api/settings", () => ({
   settingsGet: vi.fn(async () => null),

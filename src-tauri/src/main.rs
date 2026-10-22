@@ -505,7 +505,8 @@ fn main() {
             tauri::WindowEvent::Destroyed => {
                 file_window::on_window_destroyed(window.app_handle(), window.label());
                 // 前端来不及发"离开"：直接把这个窗口从输入法英文区名单里移除
-                commands::ime::window_destroyed(window.label());
+                // 恢复没成功时广播给剩下的窗口（它们不知道有一次恢复欠着）
+                commands::ime::on_window_destroyed(window.app_handle(), window.label());
             }
             tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
                 schedule_window_state_save(window.app_handle());

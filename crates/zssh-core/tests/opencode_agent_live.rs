@@ -244,6 +244,12 @@ async fn opencode_driver_runs_remote_command_and_cannot_touch_the_local_machine(
         redact(&server, &reply)
     );
     println!("远端执行：回复里出现 {REMOTE_MARKER}");
+    // 工具结果末尾有桥给这次调用的执行编号标记：界面靠它把结果对回执行层的回报（AI-SCOPE-3）。
+    assert!(
+        reply.contains("[zssh exec "),
+        "工具结果里该有执行编号标记：{}",
+        redact(&server, &reply)
+    );
 
     // 审计里要有这条 run_command 的记录。
     let rows = database

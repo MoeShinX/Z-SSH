@@ -267,50 +267,6 @@ export function diffSummary(diff: Pick<FileDiffView, "added" | "removed" | "is_n
   return `+${diff.added} −${diff.removed}`;
 }
 
-/** 待确认请求里和文件有关的部分（`PendingApproval` 的子集，方便单测）。 */
-export interface FileApprovalLike {
-  reqId: number;
-  tool: string;
-  command: string;
-  filePath?: string;
-}
-
-/**
- * 哪条待确认请求属于这张工具卡片（`status` 是卡片当前状态，只有 `running` 的卡片才会走退路）。
- *
- * - `run_command`：命令全文相同；
- * - `write_file`：请求里的路径是服务器上解析后的绝对路径，工具输入里可能是相对路径或
- *   `~/…`，所以按"绝对路径等于它，或以它（去掉 `~/` `./`）结尾"来对；
- *   工具输入的路径对不上时（比如带了 `..`），退回"只有一条写文件请求在等"。
- */
-export function matchApproval<T extends FileApprovalLike>(
-  approvals: T[],
-  tool: string,
-  input: unknown,
-  status: string = "running",
-): T | undefined {
-  const bare = bareToolName(tool);
-  if (bare === "run_command") {
-    const command = commandOf(input);
-    return approvals.find((a) => a.tool === "run_command" && a.command === command);
-  }
-  if (bare !== "write_file") return undefined;
-  const candidates = approvals.filter((a) => a.tool === "write_file");
-  const raw = pathOf(input);
-  if (raw) {
-    const tail = raw.replace(/^~\//, "").replace(/^(\.\/)+/, "");
-    const hit = candidates.find(
-      (a) =>
-        a.filePath === raw ||
-        (tail !== "" && !tail.startsWith("/") && !tail.includes("..") && a.filePath?.endsWith(`/${tail}`)),
-    );
-    if (hit) return hit;
-  }
-  // 路径对不上时的退路只给**还在等结果的**卡片：已经写完的卡片不能把新一条确认抢走
-  // （M3-4 截图里出现过：新的系统路径确认被挂到了前一张已完成的卡片上）。
-  return status === "running" && candidates.length === 1 ? candidates[0] : undefined;
-}
-
 /**
  * 把智能体包的 JSON 拆成可读文本。
  *

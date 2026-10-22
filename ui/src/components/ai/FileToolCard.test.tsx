@@ -17,6 +17,7 @@ function approvalWith(lines: number, patch: Partial<PendingApproval> = {}): Pend
   }));
   return {
     reqId: 5,
+    execId: "pfx-5",
     hostLabel: "web-1",
     command: "write_file /home/u/app.conf",
     danger: "safe",

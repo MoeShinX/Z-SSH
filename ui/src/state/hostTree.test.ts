@@ -59,6 +59,13 @@ describe("主机树", () => {
     expect(hostsUnder(hosts, null, null).map((h) => h.name)).toEqual(["loose"]);
   });
 
+  it("分组名命中：连同没命中的上级分组一起显示，嵌套的空分组也看得到", () => {
+    const nested = [...groups, group(4, "Archive", 3)];
+    const filter = treeFilterFor(nested, hosts, "archive")!;
+    expect([...filter.groupIds].sort()).toEqual([2, 3, 4]);
+    expect(filter.hostIds.size).toBe(0);
+  });
+
   it("没在搜索（空白词）时没有过滤结果", () => {
     expect(treeFilterFor(groups, hosts, "")).toBeNull();
     expect(treeFilterFor(groups, hosts, "   ")).toBeNull();

@@ -18,7 +18,11 @@
 // - 等待期间焦点回了英文区、或去了不可输入的元素：取消，不发；
 // - 窗口失去焦点（切到别的程序）时若焦点在英文区，仍照旧发一次离开，窗口回来再进入；
 //   后端说"还没恢复成功"（窗口不在前台、写进去没生效）就一直算待恢复，下一次焦点进
-//   跟随区时再发。窗口失焦不会把跟随区的输入框切成英文。
+//   跟随区时再发（窗口重新激活、焦点本来就停在跟随区也算，因为那时没有新的 focusin）。
+//   窗口失焦不会把跟随区的输入框切成英文；
+// - 另一个窗口被关掉、恢复没成功时，后端广播 ime_restore_pending：这个窗口此前没进过
+//   英文区，自己不知道有一次恢复欠着，收到后同样算待恢复（markRestoreOwed），走同一条
+//   队列和同一个延迟补发。没有这条通知，进 AI 输入框时不会发任何请求，恢复永远补不上。
 
 import { imeTerminalFocus } from "../api/ime";
 
@@ -81,6 +85,12 @@ export interface ImeFocusController {
    * 停止时若还处在英文区的状态，立刻恢复用户原来的模式。
    */
   enable(): () => void;
+  /**
+   * 后端通知：有窗口被关掉、恢复没成功，输入法还停在英文。把"后端还欠恢复"标记置上，
+   * 下一次焦点进跟随区时按现有延迟发一次离开（焦点已经在跟随区就马上开始等）；成功后清掉。
+   * 没在管理输入法（开关没开过）时忽略：这个窗口没动过输入法。
+   */
+  markRestoreOwed(): void;
 }
 
 /**
@@ -141,9 +151,16 @@ export function createImeFocusController(
     if (isEnglishZone(imeZoneOf(document.activeElement))) scheduleLeave();
   };
 
-  // 窗口回来：焦点还在英文区的话重新进入（不依赖浏览器是否补发 focusin）
+  // 窗口回来：焦点还在英文区的话重新进入（不依赖浏览器是否补发 focusin）；
+  // 焦点还在跟随区、而后台还欠着一次恢复（之前那次没成功）的话，按现有延迟补一次：
+  // 窗口只是重新激活，焦点本来就在那个输入框里，不会再有新的 focusin
   const onWindowFocus = () => {
-    if (isEnglishZone(imeZoneOf(document.activeElement))) enter();
+    const zone = imeZoneOf(document.activeElement);
+    if (isEnglishZone(zone)) {
+      enter();
+      return;
+    }
+    if (zone !== null && needsRestore()) scheduleRestore();
   };
 
   const startListening = () => {
@@ -225,6 +242,13 @@ export function createImeFocusController(
   };
 
   return {
+    markRestoreOwed() {
+      if (!listening) return;
+      backendInEnglish = true;
+      // 用户此刻就停在 AI 输入框里：不会再有焦点变化，现在就开始等
+      const zone = imeZoneOf(document.activeElement);
+      if (zone !== null && !isEnglishZone(zone)) scheduleRestore();
+    },
     enable() {
       enabledCount++;
       startListening();

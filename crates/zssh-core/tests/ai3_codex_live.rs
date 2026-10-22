@@ -303,6 +303,12 @@ async fn codex_driver_runs_commands_and_cannot_touch_the_local_machine() {
         redact(&server, &reply)
     );
     assert!(reply.contains("exit_code: 0"), "退出码要是 0：{reply}");
+    // 工具结果末尾有桥给这次调用的执行编号标记：界面靠它把结果对回执行层的回报（AI-SCOPE-3）。
+    assert!(
+        reply.contains("[zssh exec "),
+        "工具结果里该有执行编号标记：{}",
+        redact(&server, &reply)
+    );
     println!("终端执行：{REMOTE_MARKER}，location: terminal，exit_code: 0");
 
     // 终端里真的跑过（环形缓冲里有命令原文）。

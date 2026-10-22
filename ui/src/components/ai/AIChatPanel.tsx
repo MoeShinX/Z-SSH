@@ -92,12 +92,18 @@ import {
   type PinnedHost,
   type ScopeSession,
 } from "./scopeTargets";
+import type { ActivityEvent } from "../../state/aiActivity";
 import type { TargetRef } from "../../state/aiTarget";
 import {
+  applyResultExecId,
   execTargetOf,
   execTargetOfApproval,
   findCallForReport,
+  pairApproval,
+  reportArrived,
+  splitExecMarker,
   trackCall,
+  type ExecChange,
   type TrackedCall,
 } from "./execTargets";
 import {
@@ -142,7 +148,6 @@ import {
   friendlyAgentError,
   isDangerous,
   isFileTool,
-  matchApproval,
   ownerChangeOf,
   pathOf,
   readableOutput,
@@ -160,6 +165,8 @@ const AGENT_LABELS: Record<AgentId, string> = {
 /** 等待确认的命令（手动模式）：来自 `ai_approval_request`。 */
 export interface PendingApproval {
   reqId: number;
+  /** 这次工具调用的执行编号：和工具卡片认领的回报的编号对上，才把「执行 / 拒绝」放到那张卡片上。 */
+  execId: string;
   hostLabel: string;
   command: string;
   danger: string;
@@ -176,11 +183,8 @@ export interface PendingApproval {
 
 export type { PinnedHost };
 
-/** AI 在终端里执行命令的开始 / 结束（App 据此在后台标签上显示活动提示）。 */
-export type AiActivityEvent =
-  | { kind: "start"; callId: string; targetId: string; sessionId: string | null }
-  | { kind: "end"; callId: string }
-  | { kind: "reset" };
+/** AI 在终端里执行命令的开始 / 结束 / 位置纠正（App 据此在后台标签上显示活动提示）。 */
+export type AiActivityEvent = ActivityEvent;
 
 /** 一个 @ 主机（或者当前那台）的连接状态（标签上的状态点）。 */
 export type HostConnectionState = "connected" | "connecting" | "offline";
@@ -351,11 +355,59 @@ export default function AIChatPanel({
    */
   const trackedCallsRef = useRef<TrackedCall[]>([]);
   const pendingReportsRef = useRef<ExecTargetReport[]>([]);
+  /** 收到过的回报（按执行编号）：工具结果里的编号靠它找回对应的那份回报，上限 300 份。 */
+  const reportsRef = useRef(new Map<string, ExecTargetReport>());
   /** 回报 → 卡片上的执行位置：对话里有不止一个目标、或者当时没有"当前"目标时要标出主机名。 */
   const execOfReport = useCallback((report: ExecTargetReport): ExecTarget => {
     const state = targetStateRef.current;
     return execTargetOf(report, state.count > 1 || state.currentId === null);
   }, []);
+
+  /**
+   * 配对变了（按编号校正，或者回报到了）：更新卡片上的执行位置；还在跑的 run_command 把活动点
+   * 挪到新对应的那个终端（`start` 事件按 callId 覆盖原来的记录）。
+   */
+  const applyExecChanges = useCallback(
+    (changes: ExecChange[]) => {
+      if (changes.length === 0) return;
+      const execs = new Map(
+        changes.map((change) => [
+          change.callId,
+          change.report ? execOfReport(change.report) : undefined,
+        ]),
+      );
+      setItems((prev) =>
+        prev.map((item) => {
+          if (item.kind !== "tool" || !execs.has(item.call.callId)) return item;
+          const { exec: _old, ...rest } = item.call;
+          const exec = execs.get(item.call.callId);
+          return { kind: "tool", call: exec ? { ...rest, exec } : rest };
+        }),
+      );
+      for (const change of changes) {
+        const call = trackedCallsRef.current.find((c) => c.callId === change.callId);
+        if (!call || call.tool !== "run_command") continue;
+        if (call.ended) {
+          // 已经返回的调用不再点亮活动点；它结束时若已经在某个标签上标过「有新输出」，
+          // 位置被纠正了就把那个点收回来、挪到正确的标签（App 里没记过的调用不会补点）。
+          activityRef.current?.({
+            kind: "retarget",
+            callId: call.callId,
+            targetId: change.report?.target_id ?? null,
+            sessionId: change.report?.session_id ?? null,
+          });
+        } else if (change.report) {
+          activityRef.current?.({
+            kind: "start",
+            callId: call.callId,
+            targetId: change.report.target_id,
+            sessionId: change.report.session_id,
+          });
+        }
+      }
+    },
+    [execOfReport],
+  );
 
   const keyRef = useRef<string | null>(null);
   const scopeIdRef = useRef<string | null>(null);
@@ -405,6 +457,8 @@ export default function AIChatPanel({
     // 带目标的调用先登记，等执行层回报实际执行位置；回报先到的这里立刻认领。
     let tracked: TrackedCall | null = null;
     let earlyExec: ExecTarget | undefined;
+    // 工具结果去掉末尾的执行编号标记后的文本（用户看到、存历史的都是它）。
+    let output = "";
     if (payload.kind === "tool_start") {
       tracked = trackCall(payload.call_id, payload.tool, payload.input);
       if (tracked) {
@@ -417,6 +471,7 @@ export default function AIChatPanel({
         if (early >= 0) {
           const [report] = pendingReportsRef.current.splice(early, 1);
           tracked.claimed = true;
+          tracked.execId = report.exec_id;
           earlyExec = execOfReport(report);
           if (tracked.tool === "run_command") {
             activityRef.current?.({
@@ -429,6 +484,20 @@ export default function AIChatPanel({
         }
       }
     } else if (payload.kind === "tool_end") {
+      // 工具结果末尾的执行编号：拿它按编号校正这张卡片对应的回报（卡片开始时只能先按「工具 +
+      // 命令」猜）。要在标记 ended 之前做，这样还在跑的活动点能先挪到正确的终端再结束。
+      const { text, execId } = splitExecMarker(payload.output);
+      output = text;
+      if (execId) {
+        applyExecChanges(
+          applyResultExecId(
+            trackedCallsRef.current,
+            reportsRef.current,
+            payload.call_id,
+            execId,
+          ),
+        );
+      }
       const call = trackedCallsRef.current.find((c) => c.callId === payload.call_id);
       if (call) call.ended = true;
       if (isRunCommand(payload.tool)) {
@@ -464,18 +533,18 @@ export default function AIChatPanel({
                   kind: "tool",
                   call: {
                     ...item.call,
-                    output: payload.output,
+                    output,
                     // 被拒绝的命令显示"已拒绝"，不是"失败"（AI-2c 0.2）；
                     // 用户点停止中止的显示"已停止"（AI-2e 3.1）。
                     status: payload.error
-                      ? isAborted(payload.output)
+                      ? isAborted(output)
                         ? "stopped"
-                        : isRejection(payload.output)
+                        : isRejection(output)
                           ? "rejected"
                           : "error"
                       : "done",
-                    location: locationOf(payload.output),
-                    fallbackReason: fallbackReasonOf(payload.output),
+                    location: locationOf(output),
+                    fallbackReason: fallbackReasonOf(output),
                   },
                 }
               : item,
@@ -505,40 +574,30 @@ export default function AIChatPanel({
         toast.error(friendlyAgentError(payload.message));
       }
     }
-  }, [flushText, execOfReport]);
+  }, [flushText, execOfReport, applyExecChanges]);
 
   // 执行层回报的实际执行位置：对到工具卡片上（卡片的主机名、「查看终端」、标签活动点都用它）。
   // 对不上卡片的先存着，卡片出现时认领。
   const handleExecReport = useCallback(
     (report: ExecTargetReport) => {
       if (report.scope !== scopeIdRef.current) return;
-      const call = findCallForReport(trackedCallsRef.current, report);
-      if (!call) {
+      const known = reportsRef.current;
+      known.set(report.exec_id, report);
+      if (known.size > 300) {
+        const oldest = known.keys().next().value;
+        if (oldest !== undefined) known.delete(oldest);
+      }
+      // 有卡片的结果已经指明要这份回报就按编号配，否则按启发式临时配。
+      const arrived = reportArrived(trackedCallsRef.current, known, report);
+      if (!arrived) {
         const pending = pendingReportsRef.current;
         pending.push(report);
         if (pending.length > 50) pending.splice(0, pending.length - 50);
         return;
       }
-      call.claimed = true;
-      const exec = execOfReport(report);
-      setItems((prev) =>
-        prev.map((item) =>
-          item.kind === "tool" && item.call.callId === call.callId
-            ? { kind: "tool", call: { ...item.call, exec } }
-            : item,
-        ),
-      );
-      // 已经返回的调用（回报晚到）不再点亮活动点。
-      if (call.tool === "run_command" && !call.ended) {
-        activityRef.current?.({
-          kind: "start",
-          callId: call.callId,
-          targetId: report.target_id,
-          sessionId: report.session_id,
-        });
-      }
+      applyExecChanges(arrived.changes);
     },
-    [execOfReport],
+    [applyExecChanges],
   );
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -617,6 +676,7 @@ export default function AIChatPanel({
         ...prev,
         {
           reqId: request.req_id,
+          execId: request.exec_id ?? "",
           hostLabel: request.host_label,
           command: request.command,
           danger: request.danger,
@@ -681,6 +741,7 @@ export default function AIChatPanel({
     knownTargetsRef.current.clear();
     trackedCallsRef.current = [];
     pendingReportsRef.current = [];
+    reportsRef.current.clear();
     setPinned((prev) => (prev.some((p) => p.retained) ? prev.filter((p) => !p.retained) : prev));
     setContextLost(false);
     setApprovals([]);
@@ -810,10 +871,21 @@ export default function AIChatPanel({
     () =>
       groupChatItems(
         items,
-        (call) => matchApproval(approvals, call.tool, call.input, call.status) !== undefined,
+        (call) => pairApproval(approvals, call, items) !== undefined,
       ),
     [items, approvals],
   );
+
+  /** 已经放到某张工具卡片上的确认请求；其余的单独显示（带各自的主机名和命令）。 */
+  const pairedApprovals = useMemo(() => {
+    const paired = new Set<number>();
+    for (const item of items) {
+      if (item.kind !== "tool") continue;
+      const hit = pairApproval(approvals, item.call, items);
+      if (hit) paired.add(hit.reqId);
+    }
+    return paired;
+  }, [items, approvals]);
 
   const send = useCallback(async () => {
     const text = input.trim();
@@ -1294,12 +1366,7 @@ export default function AIChatPanel({
             }
             // 等待批准的调用：完整卡片不折叠，卡片上带"执行 / 拒绝"按钮。
             // 一条命令只显示一张卡片。
-            const approval = matchApproval(
-              approvals,
-              row.call.tool,
-              row.call.input,
-              row.call.status,
-            );
+            const approval = pairApproval(approvals, row.call, items);
             return (
               <ToolMessage
                 key={row.call.callId}
@@ -1315,16 +1382,10 @@ export default function AIChatPanel({
           {showThinking(running, items, approvals.length > 0) && (
             <ThinkingIndicator since={turnStartedAt} />
           )}
-          {/* 没有匹配到工具卡片的审批（比如工具卡片还没到）：单独显示，别丢掉。 */}
+          {/* 没有配到工具卡片的审批（工具卡片还没到，或者同样的命令在几处同时执行、对不唯一）：
+              单独显示，别丢掉；它按自己的编号回答，不会批准到别的请求上。 */}
           {approvals
-            .filter(
-              (a) =>
-                !items.some(
-                  (item) =>
-                    item.kind === "tool" &&
-                    matchApproval([a], item.call.tool, item.call.input, item.call.status) !== undefined,
-                ),
-            )
+            .filter((a) => !pairedApprovals.has(a.reqId))
             .map((approval) => (
               <ToolCard
                 key={approval.reqId}

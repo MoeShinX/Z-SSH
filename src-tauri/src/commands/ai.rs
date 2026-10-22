@@ -38,6 +38,8 @@ pub const AI_EXEC_TARGET: &str = "ai_exec_target";
 #[derive(Debug, Clone, Serialize)]
 pub struct AiExecTargetPayload {
     pub scope: String,
+    /// 这次工具调用的执行编号（工具结果末尾的标记里是同一个）：界面拿结果里的编号校正卡片。
+    pub exec_id: String,
     /// 工具名（不带前缀）。
     pub tool: String,
     /// 界面对到卡片上用的键：命令原文 / 路径原文 / 空。
@@ -51,6 +53,7 @@ impl From<ExecTargetReport> for AiExecTargetPayload {
     fn from(report: ExecTargetReport) -> Self {
         AiExecTargetPayload {
             scope: report.scope,
+            exec_id: report.exec_id,
             tool: report.tool,
             key: report.key,
             target_id: report.target_id,
@@ -65,6 +68,8 @@ impl From<ExecTargetReport> for AiExecTargetPayload {
 pub struct AiApprovalPayload {
     pub req_id: u64,
     pub scope: String,
+    /// 这次工具调用的执行编号（和 `ai_exec_target` 回报里的同一个）。
+    pub exec_id: String,
     pub host_label: String,
     pub command: String,
     pub danger: String,
@@ -97,6 +102,7 @@ impl AiApprovalPayload {
         AiApprovalPayload {
             req_id,
             scope: request.scope,
+            exec_id: request.exec_id,
             host_label: request.host_label,
             command: zssh_core::ai::command_text::escape_invisible_chars(&request.command),
             danger: request.danger.as_str().to_string(),
@@ -950,6 +956,7 @@ mod tests {
         let payload = AiApprovalPayload {
             req_id: 7,
             scope: "abc123".to_owned(),
+            exec_id: "3f2a1b-4".to_owned(),
             host_label: "web-1".to_owned(),
             command: "rm -rf /".to_owned(),
             danger: "dangerous".to_owned(),
@@ -963,6 +970,7 @@ mod tests {
         assert_eq!(value["target_id"], "host-7");
         assert_eq!(value["session_id"], "sess-2");
         assert_eq!(value["req_id"], 7);
+        assert_eq!(value["exec_id"], "3f2a1b-4");
         assert_eq!(value["scope"], "abc123");
         assert_eq!(value["host_label"], "web-1");
         assert_eq!(value["danger"], "dangerous");
@@ -975,6 +983,7 @@ mod tests {
     fn exec_target_payload_serializes_for_the_frontend() {
         let payload = AiExecTargetPayload::from(ExecTargetReport {
             scope: "abc123".to_owned(),
+            exec_id: "3f2a1b-9".to_owned(),
             tool: "run_command".to_owned(),
             key: "ls".to_owned(),
             target_id: "host-7".to_owned(),
@@ -983,6 +992,7 @@ mod tests {
         });
         let value = serde_json::to_value(&payload).expect("序列化");
         assert_eq!(value["scope"], "abc123");
+        assert_eq!(value["exec_id"], "3f2a1b-9");
         assert_eq!(value["tool"], "run_command");
         assert_eq!(value["key"], "ls");
         assert_eq!(value["target_id"], "host-7");
@@ -996,6 +1006,7 @@ mod tests {
         // 转义形式，而不是让用户看到一个和实际执行内容不一致的命令。
         let request = ApprovalRequest {
             scope: "abc123".to_owned(),
+            exec_id: "3f2a1b-2".to_owned(),
             target_id: "host-7".to_owned(),
             session_id: None,
             host_label: "web-1".to_owned(),
@@ -1015,6 +1026,7 @@ mod tests {
             payload.command
         );
         assert_eq!(payload.tool, "run_command");
+        assert_eq!(payload.exec_id, "3f2a1b-2");
 
         // 前端从事件里拿到的也是转义后的文本。
         let value = serde_json::to_value(&payload).expect("序列化");
@@ -1036,6 +1048,7 @@ c
         let payload = AiApprovalPayload {
             req_id: 8,
             scope: "abc123".to_owned(),
+            exec_id: "3f2a1b-5".to_owned(),
             host_label: "web-1".to_owned(),
             command: "write_file /etc/hosts".to_owned(),
             danger: "dangerous".to_owned(),

@@ -3,6 +3,7 @@
 
 import { useEffect } from "react";
 
+import { onImeRestorePending } from "../api/ime";
 import { useSettings } from "../stores/settings";
 import { imeFocus } from "./imeFocus";
 
@@ -14,4 +15,20 @@ export function useImeDefaultEnglish(): void {
     if (!loaded || !enabled) return;
     return imeFocus.enable();
   }, [loaded, enabled]);
+
+  // 别的窗口被关掉时输入法没恢复成功：后端广播，这个窗口才知道还欠着一次恢复
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void onImeRestorePending(() => imeFocus.markRestoreOwed())
+      .then((stop) => {
+        if (cancelled) stop();
+        else unlisten = stop;
+      })
+      .catch((error: unknown) => console.warn("订阅输入法待恢复通知失败", error));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 }

@@ -52,12 +52,19 @@ impl Bridge {
         scope: &Arc<Scope>,
         method: &str,
         params: Value,
+        call_id: &str,
     ) -> Result<Value, String> {
         match method {
             METHOD_LIST_DIR => {
                 let params: PathParams = parse(params)?;
                 let (summary, fs, ticket, _) = self
-                    .file_target(scope, params.target_id.as_deref(), "list_dir", &params.path)
+                    .file_target(
+                        scope,
+                        params.target_id.as_deref(),
+                        "list_dir",
+                        &params.path,
+                        call_id,
+                    )
                     .await?;
                 let started = std::time::Instant::now();
                 self.ensure_still_valid(
@@ -96,7 +103,13 @@ impl Bridge {
             METHOD_STAT => {
                 let params: PathParams = parse(params)?;
                 let (summary, fs, ticket, _) = self
-                    .file_target(scope, params.target_id.as_deref(), "stat", &params.path)
+                    .file_target(
+                        scope,
+                        params.target_id.as_deref(),
+                        "stat",
+                        &params.path,
+                        call_id,
+                    )
                     .await?;
                 let started = std::time::Instant::now();
                 self.ensure_still_valid(
@@ -137,6 +150,7 @@ impl Bridge {
                         params.target_id.as_deref(),
                         "read_file",
                         &params.path,
+                        call_id,
                     )
                     .await?;
                 let started = std::time::Instant::now();
@@ -174,7 +188,7 @@ impl Bridge {
             }
             METHOD_WRITE_FILE => {
                 let params: WriteFileParams = parse(params)?;
-                self.write_file(scope, params).await
+                self.write_file(scope, params, call_id).await
             }
             other => Err(format!("未知方法：{other}")),
         }
@@ -190,9 +204,10 @@ impl Bridge {
         target_id: Option<&str>,
         tool: &str,
         key: &str,
+        call_id: &str,
     ) -> Result<FileTarget, String> {
         let resolved = self
-            .resolve_exec_target(scope, target_id, tool, key)
+            .resolve_exec_target(scope, target_id, tool, key, call_id)
             .await?;
         // 票据是解析会话之前记下的（连接可能要等好一会儿）。
         let fs = self.host.remote_fs(&resolved.exec_id).await?;
@@ -254,6 +269,7 @@ impl Bridge {
         &self,
         scope: &Arc<Scope>,
         params: WriteFileParams,
+        call_id: &str,
     ) -> Result<Value, String> {
         // 之后目标被移出 / 用户点了停止，批准了也不能再写（R-9 F11、F12）。
         let (summary, fs, ticket, session_id) = self
@@ -262,6 +278,7 @@ impl Bridge {
                 params.target_id.as_deref(),
                 "write_file",
                 &params.path,
+                call_id,
             )
             .await?;
         let started = std::time::Instant::now();
@@ -286,6 +303,7 @@ impl Bridge {
                 &ticket,
                 ApprovalRequest {
                     scope: scope.id.clone(),
+                    exec_id: call_id.to_owned(),
                     target_id: summary.id.clone(),
                     session_id: session_id.clone(),
                     host_label: summary.host_label.clone(),

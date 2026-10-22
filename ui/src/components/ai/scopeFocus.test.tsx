@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-//! AI-SCOPE-1、AI-SCOPE-2：一台主机一个逻辑目标（绑定会话跟着焦点走）、对话中切焦点保留范围、
-//! 卡片标主机名 + 查看终端、后台标签的执行活动事件。
+//! AI-SCOPE-1、AI-SCOPE-2、AI-SCOPE-3：一台主机一个逻辑目标（绑定会话跟着焦点走）、对话中切焦点
+//! 保留范围、卡片标主机名 + 查看终端、后台标签的执行活动事件、工具结果里的执行编号校正配对。
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -169,10 +169,14 @@ function emit(payload: AgentEventPayload) {
   });
 }
 
+/** 后端给每次工具调用的执行编号（测试里自增，不同调用互不相同）。 */
+let execSeq = 0;
+
 /** 执行层的回报（默认是 run_command 落在 web-1 的 s-web 上）。 */
-function emitReport(over: Partial<ExecTargetReport> = {}) {
+function emitReport(over: Partial<ExecTargetReport> = {}): ExecTargetReport {
   const report: ExecTargetReport = {
     scope: "scope-1",
+    exec_id: `pfx-${++execSeq}`,
     tool: "run_command",
     key: "",
     target_id: "host-3",
@@ -183,6 +187,7 @@ function emitReport(over: Partial<ExecTargetReport> = {}) {
   act(() => {
     for (const handler of mocks.execHandlers) handler(report);
   });
+  return report;
 }
 
 function emitApproval(request: ApprovalRequest) {
@@ -198,17 +203,19 @@ const callStart = (id: string, input: Record<string, unknown>, tool = "zssh_run_
   tool,
   input,
 });
-const callEnd = (id: string, tool = "zssh_run_command") => ({
+/** 工具结束事件；给了 `execId` 就像真实的桥那样在结果末尾带一行编号标记。 */
+const callEnd = (id: string, tool = "zssh_run_command", execId?: string) => ({
   session_key: "ai-1",
   kind: "tool_end" as const,
   call_id: id,
   tool,
-  output: "exit_code: 0\nlocation: terminal",
+  output: "exit_code: 0\nlocation: terminal" + (execId ? `\n[zssh exec ${execId}]` : ""),
   error: false,
 });
 
 beforeEach(() => {
   clearCatalogCache();
+  execSeq = 0;
   mocks.handlers.length = 0;
   mocks.execHandlers.length = 0;
   mocks.approvalHandlers.length = 0;
@@ -626,6 +633,7 @@ describe("工具卡片：执行层回报的执行位置和查看终端（AI-SCOP
     emitApproval({
       req_id: 5,
       scope: "scope-1",
+      exec_id: "pfx-77",
       host_label: "web-1",
       command: "systemctl restart nginx",
       danger: "safe",
@@ -649,6 +657,284 @@ describe("工具卡片：执行层回报的执行位置和查看终端（AI-SCOP
     view.rerender(panel([DB]));
     await expandGroup();
     expect(targetLabel()).toBe("web-1");
+  });
+});
+
+describe("工具结果里的执行编号校正配对（AI-SCOPE-3）", () => {
+  async function expandGroup() {
+    const toggle = await waitFor(() => {
+      const el = document.querySelector<HTMLElement>('[data-action="toggle-tool-group"]');
+      if (!el) throw new Error("没有折叠行");
+      return el;
+    });
+    fireEvent.click(toggle);
+  }
+  const labels = () =>
+    [...document.querySelectorAll('[data-section="call-target"]')].map((el) => el.textContent);
+
+  it("省略 target_id 的同一条命令调两次、中间切换了默认主机、回报乱序：结果回来后两张卡片各自正确", async () => {
+    const onViewTarget = vi.fn();
+    const events: AiActivityEvent[] = [];
+    render(panel([WEB, DB], { onViewTarget, onAiActivity: (e) => events.push(e) }));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { command: "uptime" }));
+    emit(callStart("c2", { command: "uptime" }));
+    // c1 实际落在 web-1，c2 实际落在 db-1；回报先到的是 c2 的，启发式只能按先后配，配反。
+    const r2 = emitReport({
+      key: "uptime",
+      target_id: "host-4",
+      session_id: "s-db",
+      host_label: "db-1",
+    });
+    const r1 = emitReport({
+      key: "uptime",
+      target_id: "host-3",
+      session_id: "s-web",
+      host_label: "web-1",
+    });
+    expect(events.filter((e) => e.kind === "start")).toEqual([
+      { kind: "start", callId: "c1", targetId: "host-4", sessionId: "s-db" },
+      { kind: "start", callId: "c2", targetId: "host-3", sessionId: "s-web" },
+    ]);
+    // c1 的结果回来：编号是 r1，卡片和活动点都挪到 web-1，再结束。
+    events.length = 0;
+    emit(callEnd("c1", "zssh_run_command", r1.exec_id));
+    expect(events).toEqual([
+      { kind: "start", callId: "c1", targetId: "host-3", sessionId: "s-web" },
+      { kind: "start", callId: "c2", targetId: "host-4", sessionId: "s-db" },
+      { kind: "end", callId: "c1" },
+    ]);
+    emit(callEnd("c2", "zssh_run_command", r2.exec_id));
+    await expandGroup();
+    expect(labels()).toEqual(["web-1", "db-1"]);
+    const buttons = [...document.querySelectorAll<HTMLElement>('[data-action="view-terminal"]')];
+    fireEvent.click(buttons[0]);
+    fireEvent.click(buttons[1]);
+    expect(onViewTarget.mock.calls).toEqual([
+      [{ targetId: "host-3", sessionId: "s-web" }],
+      [{ targetId: "host-4", sessionId: "s-db" }],
+    ]);
+  });
+
+  it("已经结束的卡片被后来的编号纠正：发出 retarget，让 App 把「有新输出」点挪到正确的标签", async () => {
+    const events: AiActivityEvent[] = [];
+    render(panel([WEB, DB], { onAiActivity: (e) => events.push(e) }));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { command: "uptime" }));
+    emit(callStart("c2", { command: "uptime" }));
+    // 回报先到的是 db 的 r2，被临时配给先出现的 c1；web 的 r1 配给 c2：都配反了。
+    const r2 = emitReport({ key: "uptime", ...{ target_id: "host-4", session_id: "s-db", host_label: "db-1" } });
+    emitReport({ key: "uptime", target_id: "host-3", session_id: "s-web", host_label: "web-1" });
+    // c1 先结束（结果里没带编号），点留在了 db 的标签上
+    emit(callEnd("c1"));
+    // c2 的结果说它是 r2（db）：c2 改到 db，原来占着 r2 的 c1 拿到 c2 原来的 web 回报
+    events.length = 0;
+    emit(callEnd("c2", "zssh_run_command", r2.exec_id));
+    expect(events).toEqual([
+      { kind: "start", callId: "c2", targetId: "host-4", sessionId: "s-db" },
+      { kind: "retarget", callId: "c1", targetId: "host-3", sessionId: "s-web" },
+      { kind: "end", callId: "c2" },
+    ]);
+  });
+
+  it("没有回报就结束的调用，回报晚到、被认领：不补点（retarget 由 App 忽略），卡片照样更新", async () => {
+    const events: AiActivityEvent[] = [];
+    render(panel([WEB], { onAiActivity: (e) => events.push(e) }));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { command: "uptime" }));
+    emit(callEnd("c1"));
+    events.length = 0;
+    emitReport({ key: "uptime" });
+    expect(events).toEqual([
+      { kind: "retarget", callId: "c1", targetId: "host-3", sessionId: "s-web" },
+    ]);
+  });
+
+  it("同一台主机的两个会话：切换绑定后同一条命令调两次，「查看终端」去的是实际执行的会话", async () => {
+    const onViewTarget = vi.fn();
+    render(panel([WEB, WEB2, DB], { onViewTarget }));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { target_id: "host-3", command: "uptime" }));
+    emit(callStart("c2", { target_id: "host-3", command: "uptime" }));
+    // 都是同一台主机、同一条命令、输入里目标也一样：键完全相同，只有编号能分清。
+    const first = emitReport({ key: "uptime", session_id: "s-web2" });
+    const second = emitReport({ key: "uptime", session_id: "s-web" });
+    // c1 其实是第二份回报（落在 s-web），c2 是第一份（落在 s-web2）。
+    emit(callEnd("c1", "zssh_run_command", second.exec_id));
+    emit(callEnd("c2", "zssh_run_command", first.exec_id));
+    await expandGroup();
+    const buttons = [...document.querySelectorAll<HTMLElement>('[data-action="view-terminal"]')];
+    fireEvent.click(buttons[0]);
+    fireEvent.click(buttons[1]);
+    expect(onViewTarget.mock.calls).toEqual([
+      [{ targetId: "host-3", sessionId: "s-web" }],
+      [{ targetId: "host-3", sessionId: "s-web2" }],
+    ]);
+  });
+
+  it("工具结果比回报先到：记下编号，回报一到就按编号配对，不被别的同名调用抢走", async () => {
+    render(panel([WEB, DB]));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { command: "uptime" }));
+    emit(callStart("c2", { command: "uptime" }));
+    // c1 的结果先回来，说它是 pfx-2（落在 db-1），但这份回报还没到。
+    emit(callEnd("c1", "zssh_run_command", "pfx-2"));
+    emitReport({ key: "uptime", target_id: "host-3", session_id: "s-web", host_label: "web-1" }); // pfx-1
+    emitReport({ key: "uptime", target_id: "host-4", session_id: "s-db", host_label: "db-1" }); // pfx-2
+    emit(callEnd("c2", "zssh_run_command", "pfx-1"));
+    await expandGroup();
+    expect(labels()).toEqual(["db-1", "web-1"]);
+  });
+
+  it("结果里的编号标记不显示在卡片输出里，也不进历史", async () => {
+    render(panel([WEB]));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { command: "uptime" }));
+    const report = emitReport({ key: "uptime" });
+    emit(callEnd("c1", "zssh_run_command", report.exec_id));
+    await expandGroup();
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("exit_code: 0");
+    expect(text).not.toContain("zssh exec");
+    expect(text).not.toContain(report.exec_id);
+    // 卡片仍然识别出执行位置（标记去掉之后其余解析照旧）。
+    expect(text).toContain("已在终端里执行");
+  });
+
+  it("命令输出里恰好有同样格式的文字：只去掉末尾那一行真标记", async () => {
+    render(panel([WEB]));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { command: "cat log" }));
+    const report = emitReport({ key: "cat log" });
+    emit({
+      session_key: "ai-1",
+      kind: "tool_end",
+      call_id: "c1",
+      tool: "zssh_run_command",
+      output: `exit_code: 0\nlog line [zssh exec fake-9] end\n[zssh exec ${report.exec_id}]`,
+      error: false,
+    });
+    await expandGroup();
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("log line [zssh exec fake-9] end");
+    expect(text).not.toContain(report.exec_id);
+  });
+});
+
+describe("确认请求按执行编号配卡片，不按命令文本猜（AI-SCOPE-3 追加）", () => {
+  const approvalOf = (
+    reqId: number,
+    report: ExecTargetReport,
+    over: Partial<ApprovalRequest> = {},
+  ): ApprovalRequest => ({
+    req_id: reqId,
+    scope: "scope-1",
+    exec_id: report.exec_id,
+    host_label: report.host_label,
+    command: report.key,
+    danger: "safe",
+    reasons: [],
+    target_id: report.target_id,
+    session_id: report.session_id,
+    tool: "run_command",
+    ...over,
+  });
+  const WEB_R = { target_id: "host-3", session_id: "s-web", host_label: "web-1" };
+  const DB_R = { target_id: "host-4", session_id: "s-db", host_label: "db-1" };
+  /** 按钮所在卡片标的主机名。 */
+  const hostOfButton = (button: HTMLElement) =>
+    button.closest(".rounded-lg")?.querySelector('[data-section="call-target"]')?.textContent;
+  const buttons = (name: string) =>
+    screen.getAllByRole("button", { name }).filter((b) => b.closest(".rounded-lg") !== null);
+  const buttonFor = (name: string, host: string) => {
+    const found = buttons(name).find((b) => hostOfButton(b) === host);
+    if (!found) throw new Error(`没有 ${host} 的「${name}」按钮`);
+    return found;
+  };
+
+  async function twoHostsWaiting(tool: "zssh_run_command" | "zssh_write_file") {
+    render(panel([WEB, DB]));
+    await startConversation();
+    await send("检查");
+    const input = (target_id: string) =>
+      tool === "zssh_run_command"
+        ? { target_id, command: "systemctl restart app" }
+        : { target_id, path: "/etc/app.conf" };
+    const key = tool === "zssh_run_command" ? "systemctl restart app" : "/etc/app.conf";
+    const toolName = tool === "zssh_run_command" ? "run_command" : "write_file";
+    emit(callStart("c1", input("host-3"), tool));
+    emit(callStart("c2", input("host-4"), tool));
+    // db 的回报和确认请求先到，web 的后到：和卡片出现的先后相反
+    const rDb = emitReport({ ...DB_R, tool: toolName, key });
+    const rWeb = emitReport({ ...WEB_R, tool: toolName, key });
+    const extra: Partial<ApprovalRequest> =
+      tool === "zssh_write_file" ? { command: `write_file ${key}`, tool: "write_file" } : {};
+    emitApproval(approvalOf(22, rDb, extra)); // db 的请求 22
+    emitApproval(approvalOf(11, rWeb, extra)); // web 的请求 11
+    await waitFor(() => expect(buttons("执行")).toHaveLength(2));
+    return { rWeb, rDb };
+  }
+
+  it("两台主机同时等同一条命令：点 web 卡片的「执行」批准的是 web 那条，点 db 的是 db 那条", async () => {
+    await twoHostsWaiting("zssh_run_command");
+    fireEvent.click(buttonFor("执行", "web-1"));
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(11, true));
+    expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledTimes(1);
+    fireEvent.click(buttonFor("执行", "db-1"));
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(22, true));
+    expect(mocks.api.aiApprovalAnswer.mock.calls).toEqual([
+      [11, true],
+      [22, true],
+    ]);
+  });
+
+  it("拒绝同理：拒绝 db 的只回答 db 那条，web 的还在等", async () => {
+    await twoHostsWaiting("zssh_run_command");
+    fireEvent.click(buttonFor("拒绝", "db-1"));
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(22, false));
+    expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledTimes(1);
+    expect(buttons("执行")).toHaveLength(1);
+    expect(hostOfButton(buttons("执行")[0])).toBe("web-1");
+    fireEvent.click(buttonFor("拒绝", "web-1"));
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(11, false));
+  });
+
+  it("文件写入两台主机同一路径：同样按各自的请求回答", async () => {
+    await twoHostsWaiting("zssh_write_file");
+    fireEvent.click(buttonFor("执行", "web-1"));
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(11, true));
+    fireEvent.click(buttonFor("拒绝", "db-1"));
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(22, false));
+    expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledTimes(2);
+  });
+
+  it("命令不同、配得上：确认按钮就在各自的工具卡片上，点哪张回答哪条", async () => {
+    render(panel([WEB, DB]));
+    await startConversation();
+    await send("检查");
+    emit(callStart("c1", { target_id: "host-3", command: "uptime" }));
+    emit(callStart("c2", { target_id: "host-4", command: "df -h" }));
+    const r1 = emitReport({ ...WEB_R, key: "uptime" });
+    const r2 = emitReport({ ...DB_R, key: "df -h" });
+    emitApproval(approvalOf(31, r2));
+    emitApproval(approvalOf(30, r1));
+    await waitFor(() => expect(buttons("执行")).toHaveLength(2));
+    // 不是单独显示的确认卡片：每张工具卡片里只有自己的命令
+    const cardOf = (b: HTMLElement) => b.closest(".rounded-lg")?.textContent ?? "";
+    const onDf = buttons("执行").find((b) => cardOf(b).includes("df -h"));
+    const onUptime = buttons("执行").find((b) => cardOf(b).includes("uptime"));
+    expect(cardOf(onDf as HTMLElement)).not.toContain("uptime");
+    fireEvent.click(onDf as HTMLElement);
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(31, true));
+    fireEvent.click(onUptime as HTMLElement);
+    await waitFor(() => expect(mocks.api.aiApprovalAnswer).toHaveBeenCalledWith(30, true));
   });
 });
 

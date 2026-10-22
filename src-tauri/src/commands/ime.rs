@@ -146,11 +146,13 @@ impl SharedIme {
             return false;
         }
         if self.state.apply(false, ime) {
-            // 恢复没成功：留着记录，等下一次补发离开
+            // 恢复没成功：留着记录，等下一次补发离开。顺手补发的窗口（不是登记者）也要
+            // 得到 true：它的前端据此继续算「后端还欠恢复」，下一次进跟随区再补，
+            // 不会因为这一次失败就把欠着的恢复忘了
             if was_owner {
                 self.owners.insert(window.to_owned());
             }
-            was_owner
+            true
         } else {
             false
         }
@@ -159,11 +161,18 @@ impl SharedIme {
     /// 窗口销毁：前端来不及发离开，从这里直接把它从英文区名单里去掉。
     /// 它是最后一个在英文区的就恢复；恢复没成功时记录保留（`owners` 已空），
     /// 由之后任意窗口的下一次离开补上。没登记过的窗口什么都不做。
-    fn window_destroyed(&mut self, window: &str, ime: &mut impl ImeControl) {
-        if !self.owners.remove(window) || !self.owners.is_empty() {
-            return;
+    /// 返回处理完以后是不是还欠着一次恢复（见 [`SharedIme::restore_owed`]）。
+    fn window_destroyed(&mut self, window: &str, ime: &mut impl ImeControl) -> bool {
+        if self.owners.remove(window) && self.owners.is_empty() {
+            self.state.apply(false, ime);
         }
-        self.state.apply(false, ime);
+        self.restore_owed()
+    }
+
+    /// 没有任何窗口在英文区、输入法却还停在英文区设定的状态（恢复没成功）：没有窗口会
+    /// 自己想起来补，必须通知所有窗口（`ime_restore_pending`），让下一次焦点进跟随区时补发。
+    fn restore_owed(&self) -> bool {
+        self.owners.is_empty() && self.state.saved.is_some()
     }
 }
 
@@ -185,12 +194,31 @@ pub async fn ime_terminal_focus(window: tauri::Window, focused: bool) -> Result<
     }
 }
 
+/// 事件名：销毁窗口时恢复输入法没成功，没有窗口自己还欠着这次恢复（广播给所有窗口）。
+pub const IME_RESTORE_PENDING: &str = "ime_restore_pending";
+
 /// 窗口被销毁（主窗口、文件窗口）：把它从英文区名单里移除，必要时恢复输入法。
-pub fn window_destroyed(label: &str) {
+/// 返回恢复是否仍欠着（前台不是本进程之类）：此时剩下的窗口前端并不知道，调用方要广播
+/// [`IME_RESTORE_PENDING`]，否则主窗口此前没进过英文区，再也不会发离开，这次恢复永远补不上。
+pub fn window_destroyed(label: &str) -> bool {
     #[cfg(windows)]
-    imp::window_destroyed(label);
+    {
+        imp::window_destroyed(label)
+    }
     #[cfg(not(windows))]
-    let _ = label;
+    {
+        let _ = label;
+        false
+    }
+}
+
+/// 窗口销毁时处理输入法：移除名单、必要时恢复；恢复没成功就通知所有窗口补发。
+pub fn on_window_destroyed(app: &tauri::AppHandle, label: &str) {
+    if window_destroyed(label) {
+        use tauri::Emitter;
+        // 窗口可能正在关，发不出去无所谓：下一次任何窗口的离开仍会顺手补。
+        let _ = app.emit(IME_RESTORE_PENDING, ());
+    }
 }
 
 #[cfg(windows)]
@@ -224,13 +252,13 @@ mod imp {
             .apply(window, focused, &mut Win32Ime)
     }
 
-    pub fn window_destroyed(window: &str) {
+    pub fn window_destroyed(window: &str) -> bool {
         let mut state = STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(shared) = state.as_mut() {
-            shared.window_destroyed(window, &mut Win32Ime);
-        }
+        state
+            .as_mut()
+            .is_some_and(|shared| shared.window_destroyed(window, &mut Win32Ime))
     }
 
     struct Win32Ime;
@@ -727,5 +755,82 @@ mod tests {
         assert_eq!(shared.state.saved, Some(CHINESE));
         assert!(!shared.apply("main", false, &mut ime));
         assert_eq!(ime.mode, CHINESE);
+    }
+
+    #[test]
+    fn a_make_up_leave_that_fails_keeps_reporting_owed_until_it_succeeds() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("files", true, &mut ime);
+        ime.reachable = false;
+        assert!(shared.window_destroyed("files", &mut ime));
+        // 主窗口顺手补发，但窗口不在前台：没成功，仍然欠着（返回 true，前端继续等下一次）
+        assert!(shared.apply("main", false, &mut ime));
+        assert!(shared.restore_owed());
+        assert!(
+            !shared.owners.contains("main"),
+            "补发的窗口不因此成为登记者"
+        );
+        ime.reachable = true;
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+        assert!(!shared.restore_owed());
+    }
+
+    #[test]
+    fn destroying_reports_whether_a_restore_is_still_owed() {
+        // 恢复成功：不欠，不用通知别的窗口
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("files", true, &mut ime);
+        assert!(!shared.window_destroyed("files", &mut ime));
+        assert!(!shared.restore_owed());
+
+        // 恢复没成功：欠着，要广播给剩下的窗口
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("files", true, &mut ime);
+        ime.reachable = false;
+        assert!(shared.window_destroyed("files", &mut ime));
+        assert!(shared.restore_owed());
+        // 补上之后不再欠
+        ime.reachable = true;
+        shared.apply("main", false, &mut ime);
+        assert!(!shared.restore_owed());
+        assert_eq!(ime.mode, CHINESE);
+    }
+
+    #[test]
+    fn destroying_does_not_report_owed_while_another_window_is_still_in_english() {
+        // 还有窗口在英文区：那个窗口自己会离开，不用通知
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("main", true, &mut ime);
+        shared.apply("files", true, &mut ime);
+        ime.reachable = false;
+        assert!(!shared.window_destroyed("files", &mut ime));
+        assert!(!shared.restore_owed());
+    }
+
+    #[test]
+    fn destroying_an_unregistered_window_reports_nothing_owed() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        assert!(!shared.window_destroyed("files", &mut ime));
+        assert!(ime.writes.is_empty());
+    }
+
+    #[test]
+    fn a_leave_when_nothing_is_owed_writes_nothing() {
+        // 没有欠恢复时，主窗口进 AI 输入框补发的离开不改输入法
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("files", true, &mut ime);
+        assert!(!shared.window_destroyed("files", &mut ime));
+        ime.mode = ENGLISH; // 用户自己切成了英文
+        ime.writes.clear();
+        assert!(!shared.apply("main", false, &mut ime));
+        assert!(ime.writes.is_empty());
+        assert_eq!(ime.mode, ENGLISH);
     }
 }

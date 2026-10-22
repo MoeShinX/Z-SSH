@@ -85,6 +85,13 @@ import {
   setHostTreeRightReserved,
 } from "./state/panelWidths";
 import AIChatPanel, { type AiActivityEvent } from "./components/ai/AIChatPanel";
+import {
+  EMPTY_ACTIVITY,
+  markTabSeen,
+  reduceActivity,
+  unseenTabs,
+  type ActivityState,
+} from "./state/aiActivity";
 import { loadDoubleClickTime } from "./state/doubleClickTime";
 import { aiTabBadges, locateTarget, tabForTarget, type TargetRef } from "./state/aiTarget";
 import { aiTabFor } from "./state/aiTab";
@@ -2337,34 +2344,23 @@ export default function App() {
   // 后台标签的 AI 活动提示（AI-SCOPE-1 第 4 节）：AI 正在某个没在看的标签里执行命令时
   // 显示活动点；跑完还没看过显示「有新输出」点；切过去就清掉。位置用执行层回报的实际执行会话
   // （AI-SCOPE-2），不自己猜。
-  const [aiRunning, setAiRunning] = useState<Record<string, TargetRef>>({});
-  const aiRunningRef = useRef<Record<string, TargetRef>>({});
-  const [aiUnseen, setAiUnseen] = useState<string[]>([]);
+  // 记账按调用记（见 state/aiActivity.ts）：执行位置被执行编号纠正时，错的标签上的点会收回来，
+  // 挪到正确的标签。
+  const [aiActivity, setAiActivity] = useState<ActivityState>(EMPTY_ACTIVITY);
   const handleAiActivity = useCallback((event: AiActivityEvent) => {
-    if (event.kind === "start") {
-      aiRunningRef.current = {
-        ...aiRunningRef.current,
-        [event.callId]: { targetId: event.targetId, sessionId: event.sessionId },
-      };
-      setAiRunning(aiRunningRef.current);
-    } else if (event.kind === "end") {
-      const running = aiRunningRef.current[event.callId];
-      if (running === undefined) return;
-      const { [event.callId]: _done, ...rest } = aiRunningRef.current;
-      aiRunningRef.current = rest;
-      setAiRunning(rest);
-      const current = wsRef.current;
-      const tabId = tabForTarget(current.tabs, current.panes, running);
-      if (tabId) setAiUnseen((prev) => (prev.includes(tabId) ? prev : [...prev, tabId]));
-    } else if (Object.keys(aiRunningRef.current).length > 0) {
-      aiRunningRef.current = {};
-      setAiRunning({});
-    }
+    setAiActivity((prev) =>
+      reduceActivity(prev, event, (target) => {
+        const current = wsRef.current;
+        return tabForTarget(current.tabs, current.panes, target);
+      }),
+    );
   }, []);
+  const aiRunning = aiActivity.running;
+  const aiUnseen = useMemo(() => unseenTabs(aiActivity), [aiActivity]);
   const watchedTabId = view === "terminal" ? ws.activeTabId : null;
   useEffect(() => {
     if (watchedTabId && aiUnseen.includes(watchedTabId)) {
-      setAiUnseen((prev) => prev.filter((id) => id !== watchedTabId));
+      setAiActivity((prev) => markTabSeen(prev, watchedTabId));
     }
   }, [watchedTabId, aiUnseen]);
   const aiBadges = useMemo(

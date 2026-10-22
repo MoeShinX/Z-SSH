@@ -27,6 +27,8 @@ export interface ToolCall {
 
 /** 一次工具调用实际执行在哪个目标上（执行层解析并回报的）。 */
 export interface ExecTarget {
+  /** 这次调用的执行编号（后端给的；回报和审批事件里的同一个），配审批请求用。 */
+  execId: string;
   /** 逻辑目标 ID：`host-<id>`，快速连接是会话 ID。 */
   targetId: string;
   /** 执行用的会话；这台主机当时没有可用会话（自动连接）时为 null。 */

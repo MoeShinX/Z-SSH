@@ -155,6 +155,11 @@ fn user_events(message: &Value, state: &mut TranslateState) -> Vec<AgentEvent> {
         let output = match &block["content"] {
             Value::String(text) => text.clone(),
             Value::Null => String::new(),
+            // MCP 工具的结果是文本块数组：拼成纯文本，不然卡片上看到的是 JSON，末尾的执行编号
+            // 标记（AI-SCOPE-3）也被转义进了字符串里，界面认不出来。
+            Value::Array(parts) => {
+                joined_text_blocks(parts).unwrap_or_else(|| block["content"].to_string())
+            }
             other => other.to_string(),
         };
         out.push(AgentEvent::ToolEnd {
@@ -165,6 +170,24 @@ fn user_events(message: &Value, state: &mut TranslateState) -> Vec<AgentEvent> {
         });
     }
     out
+}
+
+/// 全是文本块的内容数组拼成纯文本（块之间换行）；混有别的块或为空返回 `None`。
+fn joined_text_blocks(parts: &[Value]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut texts = Vec::with_capacity(parts.len());
+    for part in parts {
+        if part["type"].as_str() != Some("text") {
+            return None;
+        }
+        texts.push(part["text"].as_str()?);
+    }
+    Some(texts.join(
+        "
+",
+    ))
 }
 
 fn result_events(message: &Value, turn: &mut TurnStats) -> Vec<AgentEvent> {
@@ -339,6 +362,50 @@ mod tests {
             }
             other => panic!("应是 ToolEnd：{other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_text_block_results_become_plain_text_with_the_exec_marker_intact() {
+        // claude 把 MCP 工具结果当文本块数组给出来：输出要是纯文本，末尾的执行编号标记
+        // 才能被界面认出来并去掉（AI-SCOPE-3）。
+        let mut state = TranslateState::default();
+        let user = json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_7", "is_error": false,
+                  "content": [{ "type": "text", "text": "exit_code: 0
+ok
+[zssh exec ab12cd-3]" }] },
+                { "type": "tool_result", "tool_use_id": "toolu_8", "is_error": true,
+                  "content": [{ "type": "text", "text": "用户拒绝" },
+                              { "type": "text", "text": "[zssh exec ab12cd-4]" }] },
+                { "type": "tool_result", "tool_use_id": "toolu_9", "is_error": false,
+                  "content": [{ "type": "image", "source": {} }] }
+            ]}
+        });
+        let outputs: Vec<String> = user_events(&user, &mut state)
+            .into_iter()
+            .map(|event| match event {
+                AgentEvent::ToolEnd { output, .. } => output,
+                other => panic!("应是 ToolEnd：{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            outputs[0],
+            "exit_code: 0
+ok
+[zssh exec ab12cd-3]"
+        );
+        assert_eq!(
+            outputs[1],
+            "用户拒绝
+[zssh exec ab12cd-4]"
+        );
+        assert!(
+            outputs[2].starts_with("[{"),
+            "不认识的块仍按 JSON 原样给出：{}",
+            outputs[2]
+        );
     }
 
     #[test]

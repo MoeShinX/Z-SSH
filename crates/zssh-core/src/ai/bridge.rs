@@ -19,11 +19,11 @@ pub mod terminal_write;
 
 use crate::ai::files::{FileDiff, RemoteFs};
 use crate::ai::protocol::{
-    clamp_max_lines, clamp_timeout_secs, ErrorBody, ExecLocation, ReadTerminalParams,
-    RememberHostParams, RequestEnvelope, ResponseEnvelope, RunCommandParams, RunCommandResponse,
-    TargetSummary, TokenLine, CAPABILITY_BYTES, METHOD_LIST_DIR, METHOD_LIST_TARGETS,
-    METHOD_READ_FILE, METHOD_READ_TERMINAL, METHOD_REMEMBER_HOST, METHOD_RUN_COMMAND, METHOD_STAT,
-    METHOD_WRITE_FILE,
+    clamp_max_lines, clamp_timeout_secs, method_carries_exec_id, ErrorBody, ExecLocation,
+    ReadTerminalParams, RememberHostParams, RequestEnvelope, ResponseEnvelope, RunCommandParams,
+    RunCommandResponse, TargetSummary, TokenLine, CAPABILITY_BYTES, EXEC_ID_FIELD, METHOD_LIST_DIR,
+    METHOD_LIST_TARGETS, METHOD_READ_FILE, METHOD_READ_TERMINAL, METHOD_REMEMBER_HOST,
+    METHOD_RUN_COMMAND, METHOD_STAT, METHOD_WRITE_FILE,
 };
 use crate::ai::safety::{assess, DangerLevel};
 use crate::ssh::{BoxFuture, ExecCapture, EXEC_MAX_STREAM_BYTES};
@@ -108,6 +108,8 @@ pub enum ApprovalDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub scope: String,
+    /// 这次工具调用的执行编号（和 `ExecTargetReport.exec_id`、工具结果里的标记是同一个）。
+    pub exec_id: String,
     /// 实际执行的目标（逻辑目标 ID）和执行用的会话（还没有连上的会话为 `None`）：
     /// 审批卡片据此显示执行位置，和执行层的解析结果一致（AI-SCOPE-2 第 2 节）。
     pub target_id: String,
@@ -137,6 +139,10 @@ pub struct FileApproval {
 pub struct ExecTargetReport {
     /// 对话的工具桥 scope id（界面据此认出是不是自己这个对话的调用）。
     pub scope: String,
+    /// 这次工具调用的执行编号（AI-SCOPE-3）：桥每接到一个工具请求生成一个，随回报、审批事件
+    /// 发出，也写进返回给智能体的工具结果（末尾一行标记）。界面拿工具结果里的编号校正卡片
+    /// 和回报的配对，不再只靠「工具 + 命令 + 先后」的启发式。只是关联用，不是凭据。
+    pub exec_id: String,
     /// 工具名（不带前缀）：`run_command`、`read_terminal`、`list_dir`、`read_file`、
     /// `write_file`、`stat`。
     pub tool: String,
@@ -807,6 +813,10 @@ pub struct Bridge {
     approval_wait: Duration,
     /// 全局在途请求名额（[`MAX_IN_FLIGHT_TOTAL`]）。名额跟着请求任务走，连接断开也不提前归还。
     in_flight: Arc<Semaphore>,
+    /// 执行编号 = 本进程随机前缀 + 自增序号：同一个桥内唯一，重启之后也不会和旧对话里
+    /// 残留的编号撞上。
+    exec_prefix: String,
+    exec_counter: AtomicU64,
 }
 
 /// 审批等待的结果（比 [`ApprovalDecision`] 多区分"超时"和"scope 销毁"）。
@@ -834,7 +844,15 @@ impl Bridge {
             mode,
             approval_wait: DEFAULT_APPROVAL_WAIT,
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOTAL)),
+            exec_prefix: random_hex(3),
+            exec_counter: AtomicU64::new(1),
         }
+    }
+
+    /// 生成下一个执行编号（`3f2a1b-7`）。
+    fn next_exec_id(&self) -> String {
+        let n = self.exec_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{n}", self.exec_prefix)
     }
 
     /// 连接层令牌（注入 `zssh-mcp.exe` 的环境变量）。
@@ -949,6 +967,7 @@ impl Bridge {
                         result: None,
                         error: Some(ErrorBody {
                             message: "无法解析请求".into(),
+                            exec_id: None,
                         }),
                     };
                     let Ok(mut payload) = serde_json::to_string(&response) else {
@@ -968,6 +987,7 @@ impl Bridge {
                     result: None,
                     error: Some(ErrorBody {
                         message: "Z-SSH 工具桥正在处理的请求太多，请稍后再试".into(),
+                        exec_id: None,
                     }),
                 };
                 let Ok(mut payload) = serde_json::to_string(&response) else {
@@ -988,16 +1008,25 @@ impl Bridge {
                 let _permit = permit;
                 let _global_permit = global_permit;
                 let id = request.id;
-                let response = match bridge.dispatch(&request).await {
-                    Ok(result) => ResponseEnvelope {
-                        id,
-                        result: Some(result),
-                        error: None,
-                    },
+                // 需要解析目标的工具，每个请求一个执行编号：成功时放进结果对象，失败时放进错误体，
+                // zssh-mcp 再把它写成结果文本末尾的一行标记（AI-SCOPE-3）。
+                let exec_id =
+                    method_carries_exec_id(&request.method).then(|| bridge.next_exec_id());
+                let response = match bridge.dispatch_call(&request, exec_id.as_deref()).await {
+                    Ok(mut result) => {
+                        if let (Some(exec_id), Some(object)) = (&exec_id, result.as_object_mut()) {
+                            object.insert(EXEC_ID_FIELD.into(), serde_json::json!(exec_id));
+                        }
+                        ResponseEnvelope {
+                            id,
+                            result: Some(result),
+                            error: None,
+                        }
+                    }
                     Err(message) => ResponseEnvelope {
                         id,
                         result: None,
-                        error: Some(ErrorBody { message }),
+                        error: Some(ErrorBody { message, exec_id }),
                     },
                 };
                 let Ok(mut payload) = serde_json::to_string(&response) else {
@@ -1025,8 +1054,21 @@ impl Bridge {
         Ok(scope)
     }
 
+    /// 处理一条请求（自己生成执行编号；测试和不关心响应封装的调用方用）。
+    #[cfg(test)]
     async fn dispatch(&self, request: &RequestEnvelope) -> Result<serde_json::Value, String> {
+        let exec_id = method_carries_exec_id(&request.method).then(|| self.next_exec_id());
+        self.dispatch_call(request, exec_id.as_deref()).await
+    }
+
+    /// 处理一条请求。`exec_id` 是这次调用的执行编号（带目标的工具都有）。
+    async fn dispatch_call(
+        &self,
+        request: &RequestEnvelope,
+        exec_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         let scope = self.scope_for(request)?;
+        let call_id = exec_id.unwrap_or_default();
         match request.method.as_str() {
             METHOD_LIST_TARGETS => self.list_targets(&scope).await,
             METHOD_REMEMBER_HOST => {
@@ -1044,7 +1086,13 @@ impl Bridge {
                 let params: ReadTerminalParams = serde_json::from_value(request.params.clone())
                     .map_err(|err| format!("参数不正确：{err}"))?;
                 let resolved = self
-                    .resolve_exec_target(&scope, params.target_id.as_deref(), "read_terminal", "")
+                    .resolve_exec_target(
+                        &scope,
+                        params.target_id.as_deref(),
+                        "read_terminal",
+                        "",
+                        call_id,
+                    )
                     .await?;
                 let max_lines = clamp_max_lines(params.max_lines);
                 let lines = self
@@ -1057,10 +1105,18 @@ impl Bridge {
                 }
                 Ok(serde_json::json!({ "lines": lines, "max_lines": max_lines }))
             }
-            METHOD_RUN_COMMAND => self.run_command(&scope, request.params.clone()).await,
-            METHOD_LIST_DIR | METHOD_READ_FILE | METHOD_WRITE_FILE | METHOD_STAT => {
-                self.file_tool(&scope, request.method.as_str(), request.params.clone())
+            METHOD_RUN_COMMAND => {
+                self.run_command(&scope, request.params.clone(), call_id)
                     .await
+            }
+            METHOD_LIST_DIR | METHOD_READ_FILE | METHOD_WRITE_FILE | METHOD_STAT => {
+                self.file_tool(
+                    &scope,
+                    request.method.as_str(),
+                    request.params.clone(),
+                    call_id,
+                )
+                .await
             }
             other => Err(format!("未知方法：{other}")),
         }
@@ -1095,6 +1151,7 @@ impl Bridge {
         &self,
         scope: &Arc<Scope>,
         params: serde_json::Value,
+        call_id: &str,
     ) -> Result<serde_json::Value, String> {
         let params: RunCommandParams =
             serde_json::from_value(params).map_err(|err| format!("参数不正确：{err}"))?;
@@ -1106,12 +1163,14 @@ impl Bridge {
             ticket,
             session_id,
             exec_id,
+            ..
         } = self
             .resolve_exec_target(
                 scope,
                 params.target_id.as_deref(),
                 "run_command",
                 &params.command,
+                call_id,
             )
             .await?;
         // 票据、审计、闸都按逻辑目标记；交给宿主执行的是 exec_id（有绑定会话就是它）。
@@ -1125,6 +1184,7 @@ impl Bridge {
                 &ticket,
                 ApprovalRequest {
                     scope: scope.id.clone(),
+                    exec_id: call_id.to_owned(),
                     target_id: target_id.clone(),
                     session_id: session_id.clone(),
                     host_label: summary.host_label.clone(),
@@ -1509,6 +1569,7 @@ impl Bridge {
         target_id: Option<&str>,
         tool: &str,
         key: &str,
+        call_id: &str,
     ) -> Result<ResolvedTarget, String> {
         let target_id = resolve_target(scope, target_id)?;
         let summary = scope
@@ -1527,6 +1588,7 @@ impl Bridge {
         }
         self.host.report_target(ExecTargetReport {
             scope: scope.id.clone(),
+            exec_id: call_id.to_owned(),
             tool: tool.to_owned(),
             key: key.to_owned(),
             target_id: target_id.clone(),
@@ -3136,6 +3198,7 @@ root password: hunter2" }),
     fn approval(scope: &Scope) -> ApprovalRequest {
         ApprovalRequest {
             scope: scope.id.clone(),
+            exec_id: "t-1".into(),
             target_id: "s1".into(),
             session_id: Some("s1".into()),
             host_label: "web-1".into(),
@@ -3400,6 +3463,7 @@ root password: hunter2" }),
                 .run_command(
                     &scope,
                     json!({ "target_id": "s1", "command": "rm -f /tmp/x" }),
+                    "t-1",
                 )
                 .await
         })
@@ -3513,7 +3577,11 @@ root password: hunter2" }),
             let scope = Arc::clone(&scope);
             tokio::spawn(async move {
                 bridge
-                    .run_command(&scope, json!({ "target_id": "s1", "command": "sleep 600" }))
+                    .run_command(
+                        &scope,
+                        json!({ "target_id": "s1", "command": "sleep 600" }),
+                        "t-1",
+                    )
                     .await
             })
         };
@@ -3546,7 +3614,11 @@ root password: hunter2" }),
             let scope = Arc::clone(&scope);
             tokio::spawn(async move {
                 bridge
-                    .run_command(&scope, json!({ "target_id": "s1", "command": "sleep 600" }))
+                    .run_command(
+                        &scope,
+                        json!({ "target_id": "s1", "command": "sleep 600" }),
+                        "t-1",
+                    )
                     .await
             })
         };
@@ -4046,6 +4118,91 @@ root password: hunter2" }),
         assert_eq!(request.target_id, "host-7");
         assert_eq!(request.session_id.as_deref(), Some("sess-2"));
         assert_eq!(host.reports()[0].session_id.as_deref(), Some("sess-2"));
+    }
+
+    #[tokio::test]
+    async fn every_tool_call_gets_its_own_exec_id_in_the_report_and_the_result() {
+        let host = BindingHost::new(&["sess-1", "sess-2"], &[]);
+        let bridge = binding_bridge(
+            host.clone(),
+            ExecMode::Auto,
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+        );
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-1")));
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+
+        // 同一条命令（都省略 target_id）调两次，中间切换绑定会话：两次各有自己的编号。
+        let first = client
+            .request(1, METHOD_RUN_COMMAND, json!({ "command": "uptime" }))
+            .await;
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+        let second = client
+            .request(2, METHOD_RUN_COMMAND, json!({ "command": "uptime" }))
+            .await;
+        let terminal = client.request(3, METHOD_READ_TERMINAL, json!({})).await;
+
+        let reports = host.reports();
+        assert_eq!(reports.len(), 3);
+        let ids: Vec<&str> = [&first, &second, &terminal]
+            .iter()
+            .map(|response| {
+                result_of(response)["exec_id"]
+                    .as_str()
+                    .expect("结果里要有执行编号")
+            })
+            .collect();
+        for (report, id) in reports.iter().zip(&ids) {
+            assert_eq!(&report.exec_id, id, "回报和结果里的编号一致");
+        }
+        assert_eq!(reports[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(reports[1].session_id.as_deref(), Some("sess-2"));
+        assert_ne!(ids[0], ids[1], "同一条命令的两次调用编号不同");
+        assert_ne!(ids[1], ids[2]);
+        // 编号只含十六进制和连字符：能安全地放进一行标记。
+        assert!(ids
+            .iter()
+            .all(|id| id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')));
+
+        // 不带目标的方法没有编号。
+        let list = client.request(4, METHOD_LIST_TARGETS, json!({})).await;
+        assert!(result_of(&list).get("exec_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_still_returns_its_exec_id_and_the_approval_carries_it() {
+        let host = BindingHost::new(&["sess-2"], &[]);
+        let approver = Arc::new(MockApprover::new(ApproverBehavior::Deny));
+        let bridge = binding_bridge(host.clone(), ExecMode::Manual, approver.clone());
+        let scope = bridge.create_scope();
+        scope.add_target_summary(host_target("host-7", "web-1", true, Some("sess-2")));
+        let port = serve(&bridge).await;
+        let mut client =
+            Client::authenticated(port, bridge.connection_token(), scope.capability()).await;
+        let response = client
+            .request(1, METHOD_RUN_COMMAND, json!({ "command": "rm -rf /tmp/x" }))
+            .await;
+        let error = response.get("error").expect("被拒绝要报错");
+        let exec_id = error["exec_id"].as_str().expect("错误里也带执行编号");
+        assert_eq!(host.reports()[0].exec_id, exec_id);
+        assert_eq!(
+            approver.last().expect("手动模式要审批").exec_id,
+            exec_id,
+            "审批事件、回报、错误里的编号是同一个"
+        );
+
+        // 目标不在列表里：还没解析出目标，没有回报，但错误里仍带编号（界面对不上就不理）。
+        let response = client
+            .request(
+                2,
+                METHOD_RUN_COMMAND,
+                json!({ "target_id": "nope", "command": "ls" }),
+            )
+            .await;
+        assert!(response["error"]["exec_id"].is_string(), "{response}");
+        assert_eq!(host.reports().len(), 1);
     }
 
     #[tokio::test]

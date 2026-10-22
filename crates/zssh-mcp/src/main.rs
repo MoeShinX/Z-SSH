@@ -28,9 +28,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 
 use zssh_core::ai::protocol::{
-    RequestEnvelope, ResponseEnvelope, TokenLine, METHOD_LIST_DIR, METHOD_LIST_TARGETS,
-    METHOD_READ_FILE, METHOD_READ_TERMINAL, METHOD_REMEMBER_HOST, METHOD_RUN_COMMAND, METHOD_STAT,
-    METHOD_WRITE_FILE,
+    with_exec_marker, RequestEnvelope, ResponseEnvelope, TokenLine, EXEC_ID_FIELD, METHOD_LIST_DIR,
+    METHOD_LIST_TARGETS, METHOD_READ_FILE, METHOD_READ_TERMINAL, METHOD_REMEMBER_HOST,
+    METHOD_RUN_COMMAND, METHOD_STAT, METHOD_WRITE_FILE,
 };
 
 /// 解析启动环境变量（拆成纯函数方便测试）。
@@ -301,6 +301,15 @@ fn format_write_file(result: &Value) -> String {
     text
 }
 
+/// 工具结果文本末尾加上桥给这次调用的执行编号（一行固定格式的标记）。界面靠它把结果对回
+/// 执行层回报的那次执行（AI-SCOPE-3）；桥没给编号（`list_targets` 之类）就原样返回。
+fn with_call_marker(text: String, result: &Value) -> String {
+    match result.get(EXEC_ID_FIELD).and_then(Value::as_str) {
+        Some(exec_id) if !exec_id.is_empty() => with_exec_marker(&text, exec_id),
+        _ => text,
+    }
+}
+
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("?")
 }
@@ -471,7 +480,13 @@ impl BridgeClient {
 
         match receiver.await {
             Ok(Ok(response)) => match response.error {
-                Some(error) => Err(error.message),
+                // 失败也带编号：被拒绝 / 超时 / 作用范围销毁的调用，界面一样要对回正确的卡片。
+                Some(error) => Err(match error.exec_id.as_deref() {
+                    Some(exec_id) if !exec_id.is_empty() => {
+                        with_exec_marker(&error.message, exec_id)
+                    }
+                    _ => error.message,
+                }),
                 None => Ok(response.result.unwrap_or(Value::Null)),
             },
             Ok(Err(message)) => Err(message),
@@ -626,9 +641,10 @@ impl ZsshMcpServer {
             .call(&args.capability, METHOD_RUN_COMMAND, params)
             .await
         {
-            Ok(result) => {
-                CallToolResult::success(vec![ContentBlock::text(format_run_result(&result))])
-            }
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(with_call_marker(
+                format_run_result(&result),
+                &result,
+            ))]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
@@ -652,9 +668,10 @@ impl ZsshMcpServer {
             .call(&args.capability, METHOD_READ_TERMINAL, params)
             .await
         {
-            Ok(result) => {
-                CallToolResult::success(vec![ContentBlock::text(format_terminal_lines(&result))])
-            }
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(with_call_marker(
+                format_terminal_lines(&result),
+                &result,
+            ))]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
@@ -750,7 +767,10 @@ impl ZsshMcpServer {
         format: fn(&Value) -> String,
     ) -> CallToolResult {
         match self.client.call(capability, method, params).await {
-            Ok(result) => CallToolResult::success(vec![ContentBlock::text(format(&result))]),
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(with_call_marker(
+                format(&result),
+                &result,
+            ))]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
@@ -1006,6 +1026,94 @@ mod tests {
         let mut line = serde_json::to_string(&response).expect("序列化响应");
         line.push('\n');
         line
+    }
+
+    /// 起一个只回一条固定响应的假桥，返回端口。
+    async fn canned_bridge(response: Value) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("绑定端口");
+        let port = listener.local_addr().expect("端口").port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("接受连接");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("读握手");
+            line.clear();
+            reader.read_line(&mut line).await.expect("读请求");
+            let request: RequestEnvelope = serde_json::from_str(line.trim()).expect("解析请求");
+            let mut response = response;
+            response["id"] = json!(request.id);
+            write_half
+                .write_all(response_line(response).as_bytes())
+                .await
+                .expect("写响应");
+            // 保持连接直到客户端读完。
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+        port
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        let value = serde_json::to_value(result).expect("序列化结果");
+        value["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn run_args() -> RunCommandArgs {
+        RunCommandArgs {
+            capability: "cap".into(),
+            target_id: None,
+            command: "ls".into(),
+            timeout_sec: None,
+        }
+    }
+
+    #[test]
+    fn the_exec_id_becomes_one_trailing_marker_line() {
+        let text = with_call_marker("out".into(), &json!({ "exec_id": "ab12cd-7" }));
+        assert_eq!(text, "out\n[zssh exec ab12cd-7]");
+        // 桥没给编号（list_targets 之类）就不加。
+        assert_eq!(with_call_marker("out".into(), &json!({})), "out");
+        assert_eq!(
+            with_call_marker("out".into(), &json!({ "exec_id": "" })),
+            "out"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_results_and_errors_carry_the_bridge_exec_id() {
+        // 成功：run_command 的结果文本末尾有标记。
+        let port = canned_bridge(json!({
+            "result": {
+                "stdout": "hello\n", "stderr": "", "stdout_truncated_bytes": 0,
+                "stderr_truncated_bytes": 0, "exit_code": 0, "duration_ms": 3,
+                "danger": "safe", "location": "terminal", "exec_id": "ab12cd-7",
+            },
+        }))
+        .await;
+        let server = ZsshMcpServer::new(Arc::new(BridgeClient::new(port, "token".into())));
+        let result = server.run_command(Parameters(run_args())).await;
+        let text = text_of(&result);
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.ends_with("\n[zssh exec ab12cd-7]"), "{text}");
+
+        // 失败（被拒绝 / 超时之类）：错误文本末尾同样有标记。
+        let port = canned_bridge(json!({
+            "error": { "message": "用户拒绝", "exec_id": "ab12cd-8" },
+        }))
+        .await;
+        let server = ZsshMcpServer::new(Arc::new(BridgeClient::new(port, "token".into())));
+        let result = server.run_command(Parameters(run_args())).await;
+        let text = text_of(&result);
+        assert_eq!(text, "用户拒绝\n[zssh exec ab12cd-8]");
+
+        // 没有编号的错误（旧桥 / 方法不带编号）保持原样。
+        let port = canned_bridge(json!({ "error": { "message": "目标不存在" } })).await;
+        let server = ZsshMcpServer::new(Arc::new(BridgeClient::new(port, "token".into())));
+        let result = server.run_command(Parameters(run_args())).await;
+        assert_eq!(text_of(&result), "目标不存在");
     }
 
     /// 一条连接上并发调用：响应按 id 对应，可以乱序回来。

@@ -156,7 +156,6 @@ import {
   fileDangerReason,
   foldDiff,
   isFileTool,
-  matchApproval,
   ownerChangeOf,
   readableOutput,
   type DiffLineView,
@@ -204,54 +203,6 @@ describe("文件工具：差异折叠", () => {
     expect(diffSummary({ added: 3, removed: 0, is_new: true })).toBe("新建文件，共 3 行");
     expect(diffSummary({ added: 2, removed: 1, is_new: false })).toBe("+2 −1");
     expect(diffSummary({ added: 0, removed: 0, is_new: false })).toBe("内容没有变化");
-  });
-});
-
-describe("文件工具：确认请求对上工具卡片", () => {
-  const writeApproval = {
-    reqId: 1,
-    tool: "write_file",
-    command: "write_file /home/u/app.conf",
-    filePath: "/home/u/app.conf",
-  };
-  const runApproval = { reqId: 2, tool: "run_command", command: "uname -a" };
-
-  it("run_command 按命令全文对", () => {
-    expect(matchApproval([runApproval, writeApproval], "zssh_run_command", { command: "uname -a" }))
-      .toBe(runApproval);
-    expect(matchApproval([runApproval], "zssh_run_command", { command: "ls" })).toBeUndefined();
-  });
-
-  it("write_file 按路径对：绝对路径、相对路径、~/ 都行", () => {
-    for (const path of ["/home/u/app.conf", "app.conf", "~/app.conf", "./app.conf"]) {
-      expect(matchApproval([runApproval, writeApproval], "zssh_write_file", { path })).toBe(
-        writeApproval,
-      );
-    }
-  });
-
-  it("已经写完的卡片不能把别的文件的新确认抢走（截图里出现过的真 bug）", () => {
-    const newApproval = {
-      reqId: 9,
-      tool: "write_file",
-      command: "write_file /etc/x.conf",
-      filePath: "/etc/x.conf",
-    };
-    // 前一张卡片写的是 app.conf、已经完成；新确认是 /etc/x.conf：不能配给它。
-    expect(matchApproval([newApproval], "zssh_write_file", { path: "/tmp/a/app.conf" }, "done")).toBeUndefined();
-    // 还在等结果的卡片，路径对不上时（比如带了 ..）仍可以退回"只有一条在等"。
-    expect(matchApproval([newApproval], "zssh_write_file", { path: "../x/../etc/x.conf" }, "running")).toBe(newApproval);
-    // 路径对得上的永远对得上，不管卡片状态。
-    expect(matchApproval([newApproval], "zssh_write_file", { path: "/etc/x.conf" }, "done")).toBe(newApproval);
-  });
-
-  it("路径对不上又有好几条在等时不乱配", () => {
-    const other = { ...writeApproval, reqId: 3, filePath: "/srv/x.txt", command: "write_file /srv/x.txt" };
-    expect(matchApproval([writeApproval, other], "zssh_write_file", { path: "nope.txt" })).toBeUndefined();
-    // 只有一条在等：即使路径写法对不上（带 ..）也算它。
-    expect(matchApproval([writeApproval], "zssh_write_file", { path: "../u/app.conf" })).toBe(writeApproval);
-    // 读文件不会被配上确认。
-    expect(matchApproval([writeApproval], "zssh_read_file", { path: "app.conf" })).toBeUndefined();
   });
 });
 

@@ -45,6 +45,45 @@ pub const MAX_READ_LINES: usize = 2000;
 pub const CAPABILITY_BYTES: usize = 16;
 pub const CAPABILITY_HEX_LEN: usize = CAPABILITY_BYTES * 2;
 
+/// 响应结果里的执行编号字段名（成功时在 `result` 对象里，失败时在 `error` 里）。
+pub const EXEC_ID_FIELD: &str = "exec_id";
+
+/// 会带执行编号的方法：需要解析目标的工具（`list_targets` / `remember_host` 不带）。
+pub fn method_carries_exec_id(method: &str) -> bool {
+    matches!(
+        method,
+        METHOD_RUN_COMMAND
+            | METHOD_READ_TERMINAL
+            | METHOD_LIST_DIR
+            | METHOD_READ_FILE
+            | METHOD_WRITE_FILE
+            | METHOD_STAT
+    )
+}
+
+const EXEC_MARKER_PREFIX: &str = "[zssh exec ";
+
+/// 追加在工具结果文本末尾的一行固定格式标记，例如 `[zssh exec 3f2a1b-7]`。
+///
+/// 智能体的工具结束事件里只有这段文本，界面靠这一行把结果对回执行层回报的那一次执行
+/// （`ai_exec_target`）。编号只是关联用的，不是凭据：知道它不能做任何事。界面渲染卡片输出时
+/// 会把这行去掉。
+pub fn exec_marker(exec_id: &str) -> String {
+    format!("{EXEC_MARKER_PREFIX}{exec_id}]")
+}
+
+/// 给文本末尾加上执行编号标记（独占一行）。
+pub fn with_exec_marker(text: &str, exec_id: &str) -> String {
+    let marker = exec_marker(exec_id);
+    if text.is_empty() {
+        marker
+    } else if text.ends_with('\n') {
+        format!("{text}{marker}")
+    } else {
+        format!("{text}\n{marker}")
+    }
+}
+
 /// 第一条消息：连接令牌。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TokenLine {
@@ -74,6 +113,9 @@ pub struct RequestEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub message: String,
+    /// 这次工具调用的执行编号（见 [`exec_marker`]）；没有编号的方法为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_id: Option<String>,
 }
 
 /// 一条响应，`result` 和 `error` 二选一。
@@ -269,6 +311,34 @@ mod tests {
         assert_eq!(clamp_max_lines(Some(50)), 50);
         assert_eq!(clamp_max_lines(Some(2000)), 2000);
         assert_eq!(clamp_max_lines(Some(usize::MAX)), 2000);
+    }
+
+    #[test]
+    fn exec_marker_is_one_trailing_line() {
+        assert_eq!(exec_marker("ab12-3"), "[zssh exec ab12-3]");
+        assert_eq!(with_exec_marker("out", "ab12-3"), "out\n[zssh exec ab12-3]");
+        assert_eq!(
+            with_exec_marker("out\n", "ab12-3"),
+            "out\n[zssh exec ab12-3]"
+        );
+        assert_eq!(with_exec_marker("", "ab12-3"), "[zssh exec ab12-3]");
+    }
+
+    #[test]
+    fn only_target_tools_carry_an_exec_id() {
+        for method in [
+            METHOD_RUN_COMMAND,
+            METHOD_READ_TERMINAL,
+            METHOD_LIST_DIR,
+            METHOD_READ_FILE,
+            METHOD_WRITE_FILE,
+            METHOD_STAT,
+        ] {
+            assert!(method_carries_exec_id(method), "{method}");
+        }
+        assert!(!method_carries_exec_id(METHOD_LIST_TARGETS));
+        assert!(!method_carries_exec_id(METHOD_REMEMBER_HOST));
+        assert!(!method_carries_exec_id("nope"));
     }
 
     #[test]
