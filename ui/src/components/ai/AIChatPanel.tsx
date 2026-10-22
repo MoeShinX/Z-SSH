@@ -1329,7 +1329,9 @@ export default function AIChatPanel({
         )}
         {/* 输入框占满整行，发送 / 停止按钮放在框内右下角；右下留出按钮的位置，文字不被挡住 */}
         <div className="relative">
+          {/* data-ime="native"：输入法跟随你自己的中英文状态，其余地方默认英文（见 terminal/imeFocus.ts） */}
           <Textarea
+            data-ime="native"
             value={input}
             onChange={(event) => {
               const value = event.target.value;

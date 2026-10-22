@@ -178,6 +178,7 @@ import { emptyPane, type PaneOrigin, type PaneSession, type Tab } from "./state/
 import { keepSubscription, leasesToRelease, type StatsLease } from "./state/statsLease";
 import { startHostOs } from "./stores/hostOs";
 import { useResolvedMode, useSettings, useTerminalITheme, useTerminalMode } from "./stores/settings";
+import { useImeDefaultEnglish } from "./terminal/useImeDefaultEnglish";
 import { recordRecent } from "./state/hostTree";
 import { hostCopyText } from "./state/hostAddress";
 import {
@@ -352,6 +353,8 @@ function EditorTabSlot(props: {
 const queryTerminalCwd = (sessionId: string) => sessionCwd(sessionId);
 
 export default function App() {
+  // 默认英文输入（AI 对话框除外），设置里可关
+  useImeDefaultEnglish();
   const [ws, setWs] = useState<Workspace>(initialWorkspace);
   const wsRef = useRef(ws);
   wsRef.current = ws;

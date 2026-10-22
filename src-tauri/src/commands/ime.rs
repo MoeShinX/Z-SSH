@@ -1,4 +1,6 @@
-//! 终端获得焦点时把输入法切到英文模式，离开终端时恢复原来的中英文状态。
+//! 焦点进入「英文区」（终端、搜索框、表单等除 AI 对话输入框以外的可输入元素，由前端判断，
+//! 见 ui/src/terminal/imeFocus.ts）时把输入法切到英文模式，离开英文区时恢复原来的中英文状态。
+//! 命令和状态机里仍沿用 "terminal" 这个名字，只表示「英文区」。
 //!
 //! 不是禁止中文：效果等于替用户按了一下 Shift，要打中文照样按 Shift 切回去。
 //! 做法是给当前焦点窗口的默认输入法窗口发 `WM_IME_CONTROL`（读 / 设"转换模式"，
@@ -8,6 +10,10 @@
 //!
 //! 键盘焦点在 WebView2 的子窗口里（别的进程），所以按"前台线程的焦点窗口"找，
 //! 并且只在前台窗口属于本进程时才动手，绝不碰别的程序的输入法。
+//!
+//! 主窗口和文件窗口各有自己的前端控制器、共用这一份状态：`SharedIme` 按窗口记录
+//! 谁在英文区里，全部离开了才真正恢复。否则从一个窗口点到另一个窗口时，
+//! 后者的"进入"先到、前者延迟发出的"离开"后到，会在后者的输入框里把输入法恢复成中文。
 //!
 //! 状态机（`TerminalIme`）和 Win32 调用分开：进出终端的判断全在状态机里，
 //! 测试用替身代替 Win32。要点：
@@ -110,19 +116,53 @@ impl TerminalIme {
     }
 }
 
-/// 终端获得焦点（`focused = true`）：记下当前转换模式，切到英文；失去焦点：恢复记下的模式。
-/// 返回值是"后端现在是否仍认为处于终端焦点"（恢复没成功时为 `true`）。
+/// 多个窗口共用一份 [`TerminalIme`]：记下哪些窗口在英文区里，最后一个离开才恢复。
+/// 返回值对"调用的这个窗口"说话：它自己不再欠恢复就是 `false`，哪怕别的窗口还在英文区。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Default)]
+struct SharedIme {
+    state: TerminalIme,
+    owners: std::collections::HashSet<String>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl SharedIme {
+    fn apply(&mut self, window: &str, focused: bool, ime: &mut impl ImeControl) -> bool {
+        if focused {
+            // 进入没成功（读不到当前模式）：这个窗口不欠恢复
+            if self.state.apply(true, ime) {
+                self.owners.insert(window.to_owned());
+                return true;
+            }
+            return false;
+        }
+        if !self.owners.remove(window) || !self.owners.is_empty() {
+            return false;
+        }
+        if self.state.apply(false, ime) {
+            // 恢复没成功：留着记录，等这个窗口下一次补发离开
+            self.owners.insert(window.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// 进入英文区（`focused = true`）：记下当前转换模式，切到英文；离开：恢复记下的模式。
+/// 返回值是"后端现在是否仍认为这个窗口处于英文区"（恢复没成功时为 `true`）。
 #[tauri::command]
-pub async fn ime_terminal_focus(focused: bool) -> Result<bool, String> {
+pub async fn ime_terminal_focus(window: tauri::Window, focused: bool) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        tauri::async_runtime::spawn_blocking(move || imp::apply(focused))
+        let label = window.label().to_owned();
+        tauri::async_runtime::spawn_blocking(move || imp::apply(&label, focused))
             .await
             .map_err(|error| error.to_string())
     }
     #[cfg(not(windows))]
     {
-        let _ = focused;
+        let _ = (window, focused);
         Ok(false)
     }
 }
@@ -139,7 +179,7 @@ mod imp {
         GUITHREADINFO, SMTO_ABORTIFHUNG,
     };
 
-    use super::{ImeControl, TerminalIme};
+    use super::{ImeControl, SharedIme};
 
     const WM_IME_CONTROL: u32 = 0x0283;
     const IMC_GETCONVERSIONMODE: usize = 0x0001;
@@ -147,16 +187,15 @@ mod imp {
     /// 输入法窗口卡住时最多等这么久（毫秒），不让界面线程跟着卡。
     const TIMEOUT_MS: u32 = 200;
 
-    static STATE: Mutex<TerminalIme> = Mutex::new(TerminalIme {
-        saved: None,
-        switched: false,
-    });
+    static STATE: Mutex<Option<SharedIme>> = Mutex::new(None);
 
-    pub fn apply(focused: bool) -> bool {
+    pub fn apply(window: &str, focused: bool) -> bool {
         let mut state = STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.apply(focused, &mut Win32Ime)
+        state
+            .get_or_insert_with(SharedIme::default)
+            .apply(window, focused, &mut Win32Ime)
     }
 
     struct Win32Ime;
@@ -524,5 +563,58 @@ mod tests {
         assert!(state.switched);
         assert!(!state.apply(false, &mut ime));
         assert_eq!(state.saved, None);
+    }
+
+    #[test]
+    fn two_windows_share_one_saved_mode_and_the_last_leave_restores() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        assert!(shared.apply("main", true, &mut ime));
+        assert_eq!(ime.mode, ENGLISH);
+        // 主窗口失焦的延迟离开还没发，文件窗口已经进入：原模式不能被英文覆盖
+        assert!(shared.apply("files", true, &mut ime));
+        assert_eq!(shared.state.saved, Some(CHINESE));
+        // 主窗口的离开到了：文件窗口还在英文区，不恢复，主窗口不再欠恢复
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, ENGLISH);
+        // 文件窗口离开：最后一个，恢复原来的中文
+        assert!(!shared.apply("files", false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(shared.state.saved, None);
+    }
+
+    #[test]
+    fn leave_from_a_window_that_never_entered_is_ignored() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("main", true, &mut ime);
+        assert!(!shared.apply("files", false, &mut ime));
+        assert_eq!(ime.mode, ENGLISH);
+        assert!(shared.state.saved.is_some());
+    }
+
+    #[test]
+    fn failed_restore_stays_owed_by_the_same_window() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut shared = SharedIme::default();
+        shared.apply("main", true, &mut ime);
+        ime.reachable = false;
+        assert!(shared.apply("main", false, &mut ime));
+        // 补发时才成功
+        ime.reachable = true;
+        assert!(!shared.apply("main", false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+    }
+
+    #[test]
+    fn enter_that_cannot_read_the_mode_is_not_owned() {
+        let mut ime = FakeIme::new(CHINESE);
+        ime.reachable = false;
+        let mut shared = SharedIme::default();
+        assert!(!shared.apply("main", true, &mut ime));
+        assert!(shared.owners.is_empty());
+        ime.reachable = true;
+        assert!(!shared.apply("main", false, &mut ime));
+        assert!(ime.writes.is_empty());
     }
 }

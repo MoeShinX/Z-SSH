@@ -1,15 +1,24 @@
-// 终端焦点 ↔ 输入法中英文：把"进终端切英文、离开恢复"的请求排成一条队列发给后端。
+// 输入法默认英文：整个程序里焦点进可输入的地方一律切到英文，只有标了 data-ime="native"
+// 的输入框（AI 对话框）跟随用户自己的中英文状态。请求排成一条队列发给后端。
+//
+// 两个区：
+// - 英文区：所有可输入元素（终端、搜索框、路径框、表单、编辑器……），除了跟随区；
+// - 跟随区：自己或祖先带 `data-ime="native"` 的可输入元素。以后别处要跟随用户的输入法，
+//   只要加这个标记，不靠类名或层级去猜。
+// 不可输入的元素（按钮、空白处、标签……）不属于任何区：焦点落上去什么都不发，保持当前状态。
 //
 // 为什么要自己管：每次焦点变化各发一次 IPC，后端各自在线程池里跑，快速切换时
 // 先后顺序不保证（"恢复"先到、"切英文"后到，最后停在英文）。这里保证：
 // - 请求一个接一个发，上一个有结果才发下一个；
-// - 只在焦点进了终端以外的**可输入元素**（AI 输入框、表单、编辑器……）以后才恢复，
-//   而且稍等一下再发。离开终端时焦点若落在不可输入的地方（按钮、空白处、标签……），
-//   Chromium 会把窗口的输入法上下文解除关联，这时写转换模式没有作用对象；
-//   所以终端 blur 只是"待恢复"，什么都不发，等真正进了输入框、输入法重新关联好再恢复；
-// - 待恢复期间回到终端：取消，什么都不发（后端本来就还处于终端焦点）；
-// - 窗口失去焦点（切到别的程序）仍照旧发一次离开；后端说"还没恢复成功"
-//   （窗口不在前台、写进去没生效）就一直算待恢复，下一次焦点进输入框时再发。
+// - 焦点进英文区：立即发"进入"；已经在英文区（lastSent 为 true）就什么都不发，
+//   所以英文区之间来回切换（终端 → 搜索框 → 另一个终端）不会重复发；
+// - 焦点进跟随区：稍等一下再发"离开"（恢复用户原来的模式）。离开英文区时焦点若落在
+//   不可输入的地方，Chromium 会把窗口的输入法上下文解除关联，这时写转换模式没有作用对象；
+//   所以只有焦点真正落在跟随区的输入框、输入法重新关联好以后才恢复；
+// - 等待期间焦点回了英文区、或去了不可输入的元素：取消，不发；
+// - 窗口失去焦点（切到别的程序）时若焦点在英文区，仍照旧发一次离开，窗口回来再进入；
+//   后端说"还没恢复成功"（窗口不在前台、写进去没生效）就一直算待恢复，下一次焦点进
+//   跟随区时再发。窗口失焦不会把跟随区的输入框切成英文。
 
 import { imeTerminalFocus } from "../api/ime";
 
@@ -20,13 +29,18 @@ import { imeTerminalFocus } from "../api/ime";
 const LEAVE_DELAY_MS = 80;
 
 /**
- * 焦点进入输入元素后等多久再恢复（毫秒）。Chromium 在焦点落到可输入元素之后，
+ * 焦点进入跟随区后等多久再恢复（毫秒）。Chromium 在焦点落到可输入元素之后，
  * 要经过一次渲染进程到浏览器进程的往返才把输入法上下文重新关联到窗口；立刻写
  * 转换模式会落在还没关联好的上下文上。40ms 超过一次往返（通常几毫秒），
  * 远低于人的察觉（约 100ms），也比"点输入框后马上敲字"的间隔短。
- * 写入没生效时后端会报失败，下一次进输入框再补，所以这里不必留太大余量。
+ * 写入没生效时后端会报失败，下一次进跟随区再补，所以这里不必留太大余量。
  */
 const RESTORE_DELAY_MS = 40;
+
+/** 跟随区的标记：加在输入框（或包着输入框的容器）上。 */
+export const NATIVE_IME_ATTRIBUTE = "data-ime";
+export const NATIVE_IME_VALUE = "native";
+const NATIVE_SELECTOR = `[${NATIVE_IME_ATTRIBUTE}="${NATIVE_IME_VALUE}"]`;
 
 /** 能打字的元素：焦点进去以后会弹输入法。 */
 export function isEditableElement(element: Element | null): boolean {
@@ -53,13 +67,24 @@ export const NON_TEXT_INPUT_TYPES = new Set([
   "submit",
 ]);
 
+export type ImeZone = "english" | "native";
+
+/** 元素属于哪个区；不可输入的元素（按钮、空白处）返回 null。 */
+export function imeZoneOf(element: Element | null): ImeZone | null {
+  if (!element || !isEditableElement(element)) return null;
+  return element.closest(NATIVE_SELECTOR) ? "native" : "english";
+}
+
 export interface ImeFocusController {
-  /** 登记一个终端的输入框（xterm 的 textarea）；返回的函数用来取消登记。 */
-  attach(textarea: HTMLElement): () => void;
+  /**
+   * 开始按文档焦点管理输入法（设置打开时调用）；返回的函数用来停止（设置关闭 / 卸载时）。
+   * 停止时若还处在英文区的状态，立刻恢复用户原来的模式。
+   */
+  enable(): () => void;
 }
 
 /**
- * `send` 是真正发给后端的函数，返回后端处理完以后是否仍认为处于终端焦点；
+ * `send` 是真正发给后端的函数，返回后端处理完以后是否仍认为处于英文区；
  * 抛错（比如非 Windows、IPC 失败）当作没成功处理。
  */
 export function createImeFocusController(
@@ -67,20 +92,22 @@ export function createImeFocusController(
   restoreDelayMs = RESTORE_DELAY_MS,
   leaveDelayMs = LEAVE_DELAY_MS,
 ): ImeFocusController {
-  const terminals = new Set<HTMLElement>();
+  let enabledCount = 0;
   let chain: Promise<void> = Promise.resolve();
   /** 最近一次发出（或排队）的请求；null = 还没发过，或进入没被后端接受。 */
   let lastSent: boolean | null = null;
-  /** 后端上一次的回答：是否仍处于终端焦点（离开没恢复成功时为 true）。 */
-  let backendInTerminal = false;
+  /** 后端上一次的回答：是否仍处于英文区（离开没恢复成功时为 true）。 */
+  let backendInEnglish = false;
   let seq = 0;
   /** 已发出、还没有回答的请求数：回答之前不知道是否还欠着一次恢复。 */
   let inFlight = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let listening = false;
 
-  /** 输入法还停在终端设定的状态，需要恢复（"待恢复"）。 */
-  const needsRestore = () => lastSent === true || backendInTerminal;
+  const isEnabled = () => enabledCount > 0;
+
+  /** 输入法还停在英文区设定的状态，需要恢复（"待恢复"）。 */
+  const needsRestore = () => lastSent === true || backendInEnglish;
 
   const cancelTimer = () => {
     if (timer !== undefined) {
@@ -89,18 +116,20 @@ export function createImeFocusController(
     }
   };
 
-  const terminalHasFocus = () => {
-    const active = document.activeElement;
-    return active instanceof HTMLElement && terminals.has(active);
-  };
+  /** 这个区的焦点是否该处于英文：开关关着时没有英文区，所有可输入元素都只做补恢复。 */
+  const isEnglishZone = (zone: ImeZone | null) => zone === "english" && isEnabled();
 
   const onDocumentFocusIn = (event: FocusEvent) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
-    if (target instanceof HTMLElement && terminals.has(target)) return;
-    if (!isEditableElement(target)) {
+    const zone = imeZoneOf(target);
+    if (zone === null) {
       // 去了不可输入的地方：输入法上下文还没关联，之前排的恢复作废，等进输入框再说
       cancelTimer();
+      return;
+    }
+    if (isEnglishZone(zone)) {
+      enter();
       return;
     }
     if (needsRestore()) scheduleRestore();
@@ -108,8 +137,13 @@ export function createImeFocusController(
 
   // 只挂在冒泡阶段：元素的 blur 不冒泡，到这里的只有窗口自己的 blur
   const onWindowBlur = () => {
-    // 终端正拿着焦点时切走窗口：照旧发一次离开（前台不是本进程时后端会说"仍在终端"）
-    if (terminalHasFocus()) scheduleLeave();
+    // 英文区正拿着焦点时切走窗口：照旧发一次离开（前台不是本进程时后端会说"仍在英文区"）
+    if (isEnglishZone(imeZoneOf(document.activeElement))) scheduleLeave();
+  };
+
+  // 窗口回来：焦点还在英文区的话重新进入（不依赖浏览器是否补发 focusin）
+  const onWindowFocus = () => {
+    if (isEnglishZone(imeZoneOf(document.activeElement))) enter();
   };
 
   const startListening = () => {
@@ -117,16 +151,18 @@ export function createImeFocusController(
     listening = true;
     document.addEventListener("focusin", onDocumentFocusIn, true);
     window.addEventListener("blur", onWindowBlur);
+    window.addEventListener("focus", onWindowFocus);
   };
   const stopListening = () => {
     if (!listening) return;
     listening = false;
     document.removeEventListener("focusin", onDocumentFocusIn, true);
     window.removeEventListener("blur", onWindowBlur);
+    window.removeEventListener("focus", onWindowFocus);
   };
-  /** 没有终端、也没有待恢复的东西时才摘掉监听；还欠着一次恢复就留着，等下一个输入框。 */
+  /** 关着开关、也没有待恢复的东西时才摘掉监听；还欠着一次恢复就留着，等下一个跟随区输入框。 */
   const stopListeningIfIdle = () => {
-    if (terminals.size === 0 && inFlight === 0 && !needsRestore()) {
+    if (!isEnabled() && inFlight === 0 && !needsRestore()) {
       cancelTimer();
       stopListening();
     }
@@ -139,11 +175,11 @@ export function createImeFocusController(
     chain = chain
       .then(() => send(focused))
       .then(
-        (inTerminal) => {
+        (inEnglish) => {
           inFlight--;
-          backendInTerminal = inTerminal === true;
+          backendInEnglish = inEnglish === true;
           // 进入没被后端接受（比如窗口还没拿到前台）：下次进入要重发
-          if (focused && !backendInTerminal && mine === seq) lastSent = null;
+          if (focused && !backendInEnglish && mine === seq) lastSent = null;
           stopListeningIfIdle();
         },
         () => {
@@ -156,14 +192,14 @@ export function createImeFocusController(
 
   const enter = () => {
     cancelTimer();
-    // 已经是"进入"状态（分屏之间切换、待恢复期间回到终端）：什么都不发
+    // 已经是"进入"状态（英文区之间切换、待恢复期间回到英文区）：什么都不发
     if (lastSent === true) return;
     request(true);
   };
 
   const leaveNow = () => {
     cancelTimer();
-    // 没进过终端、后端也没有等着恢复的东西：不发
+    // 没进过英文区、后端也没有等着恢复的东西：不发
     if (!needsRestore()) return;
     request(false);
   };
@@ -181,31 +217,34 @@ export function createImeFocusController(
     cancelTimer();
     timer = setTimeout(() => {
       timer = undefined;
-      // 等的这段时间里焦点回了终端、或又离开了输入框：不恢复，由之后的焦点变化接手
-      if (terminalHasFocus() || !isEditableElement(document.activeElement)) return;
+      // 等的这段时间里焦点回了英文区、或又离开了输入框：不恢复，由之后的焦点变化接手
+      const zone = imeZoneOf(document.activeElement);
+      if (zone === null || isEnglishZone(zone)) return;
       leaveNow();
     }, restoreDelayMs);
   };
 
   return {
-    attach(textarea) {
-      const onFocus = () => enter();
-      terminals.add(textarea);
+    enable() {
+      enabledCount++;
       startListening();
-      textarea.addEventListener("focus", onFocus);
-      if (document.activeElement === textarea) enter();
+      // 开关刚打开时焦点已经在英文区（比如设置页里点开关后焦点回到输入框）：直接进入
+      if (isEnglishZone(imeZoneOf(document.activeElement))) enter();
+      let active = true;
       return () => {
-        textarea.removeEventListener("focus", onFocus);
-        terminals.delete(textarea);
-        // 最后一个终端没了（关掉设置开关 / 终端卸载）：不能再等输入框，立刻恢复。
+        if (!active) return;
+        active = false;
+        enabledCount--;
+        if (enabledCount > 0) return;
+        // 关掉开关（或界面卸载）：不能再等跟随区，立刻恢复。
         // 此时焦点常在不可输入的地方，写入可能没生效，后端会报失败；
         // 监听留着，等下一次焦点进输入框再补（见 stopListeningIfIdle）。
-        if (terminals.size === 0) leaveNow();
+        leaveNow();
         stopListeningIfIdle();
       };
     },
   };
 }
 
-/** 全局唯一的控制器：所有终端共用一条队列。 */
+/** 全局唯一的控制器：整个窗口共用一条队列。 */
 export const imeFocus = createImeFocusController((focused) => imeTerminalFocus(focused));

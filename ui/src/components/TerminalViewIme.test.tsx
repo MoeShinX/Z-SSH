@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-//! 焦点进终端：输入法切到英文；离开终端：恢复。设置里关掉就什么都不做。
-//! 请求排队、分屏不闪、补恢复等队列细节在 terminal/imeFocus.test.ts，这里验接线。
+//! 默认英文输入的接线：设置打开时，终端和别的输入框都按英文区处理，AI 输入框（带标记）跟随用户；
+//! 设置里关掉就什么都不做。请求排队、延迟、补恢复等细节在 terminal/imeFocus.test.ts。
 
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -51,6 +51,7 @@ vi.mock("../terminal/terminal", () => {
 });
 
 import { useSettings } from "../stores/settings";
+import { useImeDefaultEnglish } from "../terminal/useImeDefaultEnglish";
 import TerminalView from "./TerminalView";
 
 beforeEach(() => {
@@ -73,18 +74,34 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-/** 走完离开终端后的等待和 IPC 队列。 */
+/** 走完延迟和 IPC 队列。 */
 const settle = () => act(async () => { await vi.advanceTimersByTimeAsync(300); });
 
-const mount = () =>
-  render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} onReady={() => {}} />);
+function Probe() {
+  useImeDefaultEnglish();
+  return null;
+}
 
-describe("进终端自动切到英文输入", () => {
-  it("终端获得焦点切英文，焦点进了别的输入框才恢复", async () => {
-    useSettings.setState({ terminal_ime_english: true });
+const mount = () =>
+  render(
+    <>
+      <Probe />
+      <TerminalView theme={{}} onData={() => {}} onResize={() => {}} onReady={() => {}} />
+    </>,
+  );
+
+const makeAi = () => {
+  const ai = document.createElement("textarea");
+  ai.setAttribute("data-ime", "native");
+  document.body.appendChild(ai);
+  return ai;
+};
+
+describe("默认使用英文输入", () => {
+  it("终端获得焦点切英文，焦点进了 AI 输入框才恢复", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
     mount();
-    const ai = document.createElement("textarea");
-    document.body.appendChild(ai);
+    const ai = makeAi();
     act(() => ime.textarea?.focus());
     act(() => ime.textarea?.blur());
     await settle();
@@ -96,11 +113,11 @@ describe("进终端自动切到英文输入", () => {
   });
 
   it("终端 → 按钮 → AI 输入框：到了输入框才恢复", async () => {
-    useSettings.setState({ terminal_ime_english: true });
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
     mount();
     const button = document.createElement("button");
-    const ai = document.createElement("textarea");
-    document.body.append(button, ai);
+    const ai = makeAi();
+    document.body.append(button);
     act(() => ime.textarea?.focus());
     act(() => button.focus());
     await settle();
@@ -110,17 +127,46 @@ describe("进终端自动切到英文输入", () => {
     expect(ime.calls).toEqual([true, false]);
   });
 
+  it("终端以外的输入框（搜索框、表单）同样是英文区；从 AI 输入框回到它们再进入", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
+    mount();
+    const search = document.createElement("input");
+    document.body.appendChild(search);
+    const ai = makeAi();
+    act(() => search.focus());
+    await settle();
+    expect(ime.calls).toEqual([true]);
+    act(() => ime.textarea?.focus());
+    await settle();
+    expect(ime.calls).toEqual([true]); // 已在英文区
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([true, false]);
+    act(() => search.focus());
+    await settle();
+    expect(ime.calls).toEqual([true, false, true]);
+  });
+
   it("设置里关掉：不碰输入法", async () => {
-    useSettings.setState({ terminal_ime_english: false });
+    useSettings.setState({ terminal_ime_english: false, loaded: true });
+    mount();
+    const ai = makeAi();
+    act(() => ime.textarea?.focus());
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([]);
+  });
+
+  it("设置还没读出来：不碰输入法", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: false });
     mount();
     act(() => ime.textarea?.focus());
-    act(() => ime.textarea?.blur());
     await settle();
     expect(ime.calls).toEqual([]);
   });
 
   it("焦点在终端时关掉开关：立即恢复原来的模式（不等 blur）", async () => {
-    useSettings.setState({ terminal_ime_english: true });
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
     mount();
     act(() => ime.textarea?.focus());
     act(() => useSettings.setState({ terminal_ime_english: false }));
@@ -130,11 +176,10 @@ describe("进终端自动切到英文输入", () => {
     expect(ime.calls).toEqual([true, false]);
   });
 
-  it("终端 → AI 输入框 → 终端 → AI 输入框快速切换：中途回终端取消待发的恢复，最后停在恢复", async () => {
-    useSettings.setState({ terminal_ime_english: true });
+  it("终端 → AI → 终端 → AI 快速切换：中途回终端取消待发的恢复，最后停在恢复", async () => {
+    useSettings.setState({ terminal_ime_english: true, loaded: true });
     mount();
-    const ai = document.createElement("textarea");
-    document.body.appendChild(ai);
+    const ai = makeAi();
     const term = ime.textarea as HTMLTextAreaElement;
     act(() => term.focus());
     act(() => ai.focus());

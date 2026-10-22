@@ -1,10 +1,11 @@
 /** @vitest-environment jsdom */
-//! 终端焦点 ↔ 输入法的请求队列：串行、分屏不闪、只在进了可输入元素以后（稍等一下）才恢复、
-//! 恢复失败会在下一次进输入框时补发。
+//! 输入法"默认英文、只有 data-ime="native" 的输入框跟随用户"的控制器：
+//! 英文区 / 跟随区的判定、请求串行、只在进了跟随区的输入框以后（稍等一下）才恢复、
+//! 恢复失败会在下一次进跟随区时补发、开关关闭的收尾。
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createImeFocusController, isEditableElement } from "./imeFocus";
+import { createImeFocusController, imeZoneOf, isEditableElement } from "./imeFocus";
 
 /** 显式传给控制器的延迟，避免测试跟着实现里的常量漂。 */
 const RESTORE_MS = 40;
@@ -12,7 +13,7 @@ const LEAVE_MS = 80;
 
 interface Pending {
   focused: boolean;
-  resolve: (inTerminal: boolean) => void;
+  resolve: (inEnglish: boolean) => void;
 }
 
 /** 手动放行的 send：能看到"同一时刻最多一个在途请求"。 */
@@ -49,9 +50,24 @@ function autoSend(answer?: (focused: boolean) => boolean) {
 const makeController = (send: (focused: boolean) => Promise<boolean>) =>
   createImeFocusController(send, RESTORE_MS, LEAVE_MS);
 
+/** 英文区：终端的 textarea、搜索框、表单输入框…… */
 const makeTextarea = (): HTMLTextAreaElement => {
   const element = document.createElement("textarea");
   document.body.appendChild(element);
+  return element;
+};
+
+const makeInput = (type = "text"): HTMLInputElement => {
+  const element = document.createElement("input");
+  element.type = type;
+  document.body.appendChild(element);
+  return element;
+};
+
+/** 跟随区：AI 对话框。 */
+const makeNative = (): HTMLTextAreaElement => {
+  const element = makeTextarea();
+  element.setAttribute("data-ime", "native");
   return element;
 };
 
@@ -61,9 +77,11 @@ const makeButton = (): HTMLButtonElement => {
   return element;
 };
 
-const makeInput = (): HTMLInputElement => {
-  const element = document.createElement("input");
-  element.type = "text";
+/** CodeMirror 这类可编辑区域：jsdom 不实现 isContentEditable，手动补上。 */
+const makeEditor = (): HTMLElement => {
+  const element = document.createElement("div");
+  element.tabIndex = 0;
+  Object.defineProperty(element, "isContentEditable", { value: true });
   document.body.appendChild(element);
   return element;
 };
@@ -77,15 +95,287 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-describe("请求串行发出", () => {
+describe("英文区：所有可输入的地方（跟随区除外）", () => {
+  it.each([
+    ["终端的 textarea", () => makeTextarea()],
+    ["主机页搜索框 / 路径框（text input）", () => makeInput("text")],
+    ["搜索类输入框", () => makeInput("search")],
+    ["表单里的密码框", () => makeInput("password")],
+    ["数字框", () => makeInput("number")],
+    ["编辑器（可编辑区域）", () => makeEditor()],
+  ])("焦点进 %s：立即发进入", async (_name, make) => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    make().focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true]);
+  });
+
+  it("从终端到搜索框：已在英文区，不再发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const search = makeInput();
+    term.focus();
+    search.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+  });
+
+  it("英文区之间来回切换（终端、搜索框、编辑器、另一个终端）：一直只发一次进入", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const a = makeTextarea();
+    const b = makeTextarea();
+    const search = makeInput();
+    const editor = makeEditor();
+    a.focus();
+    search.focus();
+    editor.focus();
+    b.focus();
+    a.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+  });
+
+  it("英文区 → 按钮 / 空白处 → 英文区：什么都不多发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const a = makeTextarea();
+    const b = makeInput();
+    a.focus();
+    makeButton().focus();
+    await vi.advanceTimersByTimeAsync(300);
+    a.blur();
+    await vi.advanceTimersByTimeAsync(300);
+    b.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+  });
+
+  it("按钮、复选框、只读的输入框不算英文区：焦点进去不发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeButton().focus();
+    makeInput("checkbox").focus();
+    makeInput("radio").focus();
+    const readOnly = makeTextarea();
+    readOnly.readOnly = true;
+    readOnly.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("跟随区：data-ime=native", () => {
+  it("没进过英文区，直接进跟随区：不发任何请求", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeNative().focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([]);
+  });
+
+  it("英文区 → 跟随区：延迟 40ms 之后才发离开", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const ai = makeNative();
+    term.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 1);
+    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("跟随区 → 英文区：立即发进入", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const ai = makeNative();
+    term.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+    makeInput().focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true, false, true]);
+  });
+
+  it("标记加在容器上也算：容器里的输入框跟随", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-ime", "native");
+    const inner = document.createElement("input");
+    wrapper.appendChild(inner);
+    document.body.appendChild(wrapper);
+    makeTextarea().focus();
+    inner.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("只认标记，不看类名 / 位置：长得像 AI 的输入框没有标记就是英文区", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const lookalike = makeTextarea();
+    lookalike.className = "ai-chat-input native";
+    lookalike.setAttribute("data-ime", "english");
+    makeTextarea().focus();
+    lookalike.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+  });
+
+  it("跟随区 → 按钮 / 空白处：不发，保持当前状态", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const ai = makeNative();
+    makeTextarea().focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+    makeButton().focus();
+    ai.blur();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("恢复成功之后再进别的跟随区输入框：不重复发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeTextarea().focus();
+    makeNative().focus();
+    await vi.advanceTimersByTimeAsync(500);
+    makeNative().focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+  });
+});
+
+describe("经过不可输入的元素", () => {
+  it("英文区 → 按钮 → 跟随区：只在最后一步发恢复，并且有延迟", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const button = makeButton();
+    const ai = makeNative();
+    term.focus();
+    button.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]); // 等多久都不恢复，只是待恢复
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 1);
+    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("英文区 → 空白处（什么都没聚焦）→ 跟随区：同样等到进输入框才恢复", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const ai = makeNative();
+    term.focus();
+    term.blur();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("英文区 → 按钮 → 回英文区：什么都不发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const button = makeButton();
+    term.focus();
+    button.focus();
+    await vi.advanceTimersByTimeAsync(300);
+    term.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+  });
+
+  it("进跟随区后在延迟内又去了不可输入的元素：取消，等下一次进跟随区", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const ai = makeNative();
+    const button = makeButton();
+    term.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 10);
+    button.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("进跟随区后在延迟内回到英文区：取消，什么都不发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const ai = makeNative();
+    term.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 10);
+    term.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true]);
+  });
+
+  it("延迟内换到另一个跟随区输入框：从最后一次焦点变化重新等待", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    const term = makeTextarea();
+    const ai = makeNative();
+    const ai2 = makeNative();
+    term.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 5);
+    ai2.focus();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 11);
+    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual([true, false]);
+  });
+});
+
+describe("请求串行、快速切换不乱序", () => {
   it("上一个请求没返回，下一个不发", async () => {
     const m = manualSend();
     const controller = makeController(m.send);
+    controller.enable();
     const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
+    const ai = makeNative();
     term.focus();
-    ai.focus(); // 稍等一下后要求恢复
+    ai.focus();
     await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
     expect(m.sent).toEqual([true]);
     await m.release();
@@ -95,12 +385,12 @@ describe("请求串行发出", () => {
     expect(m.pending).toHaveLength(0);
   });
 
-  it("终端 → AI 输入框 → 终端 → AI 输入框：中途回终端取消待发的恢复，最后只发一次恢复", async () => {
+  it("英文区 → AI → 英文区 → AI 快速切换：中途回英文区取消待发的恢复，最后只发一次恢复", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
+    controller.enable();
     const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
+    const ai = makeNative();
     term.focus();
     ai.focus();
     term.focus();
@@ -109,235 +399,73 @@ describe("请求串行发出", () => {
     expect(sent).toEqual([true, false]);
   });
 
-  it("恢复发出后又回终端再进输入框：每一轮都是 进入、恢复 成对", async () => {
+  it("进入还没返回时恢复已经到点、又回英文区：请求按顺序排队发出", async () => {
+    const m = manualSend();
+    const controller = makeController(m.send);
+    controller.enable();
+    const search = makeInput();
+    const ai = makeNative();
+    search.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
+    // 进入还没返回：恢复排在后面，不能先发出去
+    expect(m.sent).toEqual([true]);
+    search.focus(); // 又回到英文区：要再发进入，排在恢复后面
+    await m.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(m.sent).toEqual([true, false]);
+    await m.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(m.sent).toEqual([true, false, true]);
+    await m.release();
+    expect(m.pending).toHaveLength(0);
+  });
+
+  it("在 AI 输入框和搜索框之间反复快速切换：待满 40ms 才恢复，最后停在最后一次焦点对应的状态", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
-    const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
-    term.focus();
+    controller.enable();
+    const search = makeInput();
+    const ai = makeNative();
+    for (let i = 0; i < 4; i++) {
+      search.focus();
+      await vi.advanceTimersByTimeAsync(10);
+      ai.focus();
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    search.focus();
+    await vi.advanceTimersByTimeAsync(500);
+    // 每次在 AI 里都没待满 40ms，恢复一次都没发；最后回英文区也不用重发
+    expect(sent).toEqual([true]);
     ai.focus();
     await vi.advanceTimersByTimeAsync(500);
-    term.focus();
+    expect(sent).toEqual([true, false]);
+    search.focus();
     ai.focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false, true, false]);
   });
 });
 
-describe("分屏之间切换", () => {
-  it("焦点从一个终端直接交给另一个：不发恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const a = makeTextarea();
-    const b = makeTextarea();
-    controller.attach(a);
-    controller.attach(b);
-    a.focus();
-    b.focus();
-    a.focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-
-  it("中间点到空白处再聚焦另一个终端：不恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const a = makeTextarea();
-    const b = makeTextarea();
-    controller.attach(a);
-    controller.attach(b);
-    a.focus();
-    a.blur();
-    await vi.advanceTimersByTimeAsync(20);
-    b.focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-});
-
-describe("离开终端后只在进了可输入元素时才恢复", () => {
-  it("终端 → 不可输入的元素 → 可输入元素：只在最后一步发恢复，并且有延迟", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const button = makeButton();
-    const ai = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    button.focus(); // 终端 blur，焦点落在不可输入的按钮上
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]); // 等多久都不恢复，只是待恢复
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS - 1);
-    expect(sent).toEqual([true]); // 还在延迟里
-    await vi.advanceTimersByTimeAsync(1);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("终端 → 空白处（什么都没聚焦）→ 可输入元素：同样等到进输入框才恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    term.blur();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("终端 → 不可输入的元素 → 回终端：什么都不发", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const button = makeButton();
-    controller.attach(term);
-    term.focus();
-    button.focus();
-    await vi.advanceTimersByTimeAsync(300);
-    term.focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-
-  it("终端 → 可输入元素：延迟之后才发恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS - 1);
-    expect(sent).toEqual([true]);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("延迟内换到另一个输入框：从最后一次焦点变化重新等待", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const ai = makeTextarea();
-    const search = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS - 5);
-    search.focus();
-    await vi.advanceTimersByTimeAsync(10);
-    expect(sent).toEqual([true]);
-    await vi.advanceTimersByTimeAsync(RESTORE_MS - 11);
-    expect(sent).toEqual([true]);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("进输入框后在延迟内回到终端：取消，什么都不发", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS - 10);
-    term.focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-
-  it("进输入框后在延迟内又去了不可输入的元素：取消，等下一次进输入框", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const ai = makeTextarea();
-    const button = makeButton();
-    controller.attach(term);
-    term.focus();
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS - 10);
-    button.focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-    ai.focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("焦点进按钮 / 复选框不算可输入：不会恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    document.body.appendChild(box);
-    box.focus();
-    makeButton().focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-
-  it("直接进别的文本输入框也一样（不经按钮）：延迟后恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    await vi.advanceTimersByTimeAsync(0);
-    makeInput().focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("从没进过终端：进输入框不发任何请求", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    controller.attach(makeTextarea());
-    makeTextarea().focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([]);
-  });
-
-  it("恢复成功后再进别的输入框：不重复发", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    controller.attach(term);
-    term.focus();
-    makeTextarea().focus();
-    await vi.advanceTimersByTimeAsync(500);
-    makeInput().focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true, false]);
-  });
-});
-
 describe("窗口失去焦点（切到别的程序）", () => {
-  it("终端有焦点时窗口失焦：照旧发离开；后端说没恢复成功，回来后进输入框再补", async () => {
+  it("英文区有焦点时窗口失焦：照旧发离开；后端说没恢复成功，回来后进跟随区再补", async () => {
     let leaves = 0;
     const { sent, send } = autoSend((focused) => (focused ? true : ++leaves < 2));
     const controller = makeController(send);
+    controller.enable();
     const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
+    const ai = makeNative();
     term.focus();
     window.dispatchEvent(new Event("blur"));
     await vi.advanceTimersByTimeAsync(LEAVE_MS - 1);
     expect(sent).toEqual([true]);
     await vi.advanceTimersByTimeAsync(1);
-    expect(sent).toEqual([true, false]); // 前台不是本进程，后端返回仍在终端
+    expect(sent).toEqual([true, false]); // 前台不是本进程，后端返回仍在英文区
     ai.focus(); // 窗口回来，焦点落在 AI 输入框
     await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
     expect(sent).toEqual([true, false, false]);
-    // 这次成功了：再进别的输入框不再发
-    makeTextarea().focus();
+    // 这次成功了：再进别的跟随区输入框不再发
+    makeNative().focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false, false]);
   });
@@ -345,22 +473,50 @@ describe("窗口失去焦点（切到别的程序）", () => {
   it("窗口失焦后马上回来：不发离开", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
+    controller.enable();
     const term = makeTextarea();
-    controller.attach(term);
     term.focus();
     window.dispatchEvent(new Event("blur"));
     await vi.advanceTimersByTimeAsync(LEAVE_MS - 20);
-    term.dispatchEvent(new FocusEvent("focus")); // 窗口重新激活，焦点回到终端
+    window.dispatchEvent(new Event("focus")); // 窗口重新激活，焦点还在终端
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true]);
   });
 
-  it("待恢复期间（焦点在按钮上）窗口失焦：不丢待恢复，回来进输入框照样恢复", async () => {
+  it("窗口失焦发出离开后回来，焦点还在英文区：重新进入", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
+    controller.enable();
+    makeInput().focus();
+    window.dispatchEvent(new Event("blur"));
+    await vi.advanceTimersByTimeAsync(LEAVE_MS + 10);
+    expect(sent).toEqual([true, false]);
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true, false, true]);
+  });
+
+  it("跟随区有焦点时窗口失焦、回来：不会把 AI 输入框切成英文", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeTextarea().focus();
+    makeNative().focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+    window.dispatchEvent(new Event("blur"));
+    await vi.advanceTimersByTimeAsync(500);
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("待恢复期间（焦点在按钮上）窗口失焦：不丢待恢复，回来进跟随区照样恢复", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
     const term = makeTextarea();
-    const ai = makeTextarea();
-    controller.attach(term);
+    const ai = makeNative();
     term.focus();
     makeButton().focus();
     window.dispatchEvent(new Event("blur"));
@@ -372,43 +528,41 @@ describe("窗口失去焦点（切到别的程序）", () => {
   });
 });
 
-describe("后端没恢复成功", () => {
-  it("恢复没生效（后端返回仍在终端）：下一次进输入框重发，直到成功", async () => {
+describe("后端没成功", () => {
+  it("恢复没生效（后端返回仍在英文区）：下一次进跟随区重发，直到成功；进按钮不重发", async () => {
     let leaves = 0;
     const { sent, send } = autoSend((focused) => (focused ? true : ++leaves < 3));
     const controller = makeController(send);
-    const term = makeTextarea();
-    controller.attach(term);
-    term.focus();
+    controller.enable();
     makeTextarea().focus();
+    makeNative().focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false]);
     makeButton().focus();
     await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true, false]); // 不可输入的地方不重发
-    makeInput().focus();
+    expect(sent).toEqual([true, false]);
+    makeNative().focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false, false]);
-    makeTextarea().focus();
+    makeNative().focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false, false, false]);
-    makeTextarea().focus(); // 第三次成功了，不再发
+    makeNative().focus(); // 第三次成功了，不再发
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false, false, false]);
   });
 
-  it("进入没被后端接受（窗口还没拿到前台）：下次焦点进终端重发", async () => {
+  it("进入没被后端接受（窗口还没拿到前台）：下次焦点进英文区重发", async () => {
     let accept = false;
     const { sent, send } = autoSend((focused) => (focused ? accept : false));
     const controller = makeController(send);
+    controller.enable();
     const term = makeTextarea();
-    controller.attach(term);
+    const search = makeInput();
     term.focus();
     await vi.advanceTimersByTimeAsync(0);
-    term.blur();
-    await vi.advanceTimersByTimeAsync(500);
     accept = true;
-    term.focus();
+    search.focus();
     await vi.advanceTimersByTimeAsync(0);
     expect(sent.filter((value) => value)).toHaveLength(2);
   });
@@ -424,122 +578,155 @@ describe("后端没恢复成功", () => {
       }
       return focused;
     });
-    const term = makeTextarea();
-    controller.attach(term);
-    term.focus();
+    controller.enable();
+    const a = makeTextarea();
+    const b = makeInput();
+    a.focus();
     await vi.advanceTimersByTimeAsync(0);
-    term.blur();
-    term.focus();
+    b.focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(calls).toEqual([true, true]);
   });
 });
 
-describe("取消登记", () => {
-  it("焦点正在终端时取消（关掉设置开关）：立即恢复", async () => {
+describe("设置开关", () => {
+  it("没打开（从没 enable）：任何焦点变化都不发", async () => {
     const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const detach = controller.attach(term);
-    term.focus();
-    detach();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("待恢复期间（焦点在按钮上）取消：立即恢复，不等输入框", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const detach = controller.attach(term);
-    term.focus();
-    makeButton().focus();
-    detach();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(sent).toEqual([true, false]);
-    // 恢复成功后监听已摘掉：之后进输入框什么都不发
+    makeController(send);
     makeTextarea().focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true, false]);
-  });
-
-  it("取消时恢复没生效：监听保留，下次进输入框补发", async () => {
-    let leaves = 0;
-    const { sent, send } = autoSend((focused) => (focused ? true : ++leaves < 2));
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const detach = controller.attach(term);
-    term.focus();
-    makeButton().focus();
-    detach();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(sent).toEqual([true, false]);
-    makeTextarea().focus();
-    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
-    expect(sent).toEqual([true, false, false]);
-    makeTextarea().focus();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true, false, false]);
-  });
-
-  it("取消的是没拿焦点的终端：不影响正在用的那个", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const a = makeTextarea();
-    const b = makeTextarea();
-    controller.attach(a);
-    const detachB = controller.attach(b);
-    a.focus();
-    detachB();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-
-  it("还有别的终端在：取消其中一个不触发恢复", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const a = makeTextarea();
-    const b = makeTextarea();
-    const detachA = controller.attach(a);
-    controller.attach(b);
-    a.focus();
-    makeButton().focus(); // 待恢复
-    detachA();
-    await vi.advanceTimersByTimeAsync(500);
-    expect(sent).toEqual([true]);
-  });
-
-  it("取消后终端不再响应焦点", async () => {
-    const { sent, send } = autoSend();
-    const controller = makeController(send);
-    const term = makeTextarea();
-    const detach = controller.attach(term);
-    detach();
-    term.focus();
+    makeNative().focus();
+    makeInput().focus();
+    window.dispatchEvent(new Event("blur"));
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([]);
   });
 
-  it("取消时有待发的恢复定时器：被清掉，不会重复发", async () => {
+  it("打开时焦点已经在英文区：立即进入", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
-    const term = makeTextarea();
-    const detach = controller.attach(term);
-    term.focus();
-    makeTextarea().focus(); // 排了延迟恢复
-    detach(); // 立即恢复，同时清掉定时器
+    makeInput().focus();
+    controller.enable();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true]);
+  });
+
+  it("打开时焦点在跟随区：不发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    makeNative().focus();
+    controller.enable();
     await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([]);
+  });
+
+  it("焦点在英文区时关掉：立即恢复", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    const disable = controller.enable();
+    makeTextarea().focus();
+    disable();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("待恢复期间（焦点在按钮上）关掉：立即恢复，不等跟随区；之后什么都不发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    const disable = controller.enable();
+    makeInput().focus();
+    makeButton().focus();
+    disable();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true, false]);
+    // 恢复成功后监听已摘掉：之后进哪里都不发
+    makeTextarea().focus();
+    makeNative().focus();
+    window.dispatchEvent(new Event("blur"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("关掉时恢复没生效：监听保留，下次进输入框补发；这期间英文区不再进入", async () => {
+    let leaves = 0;
+    const { sent, send } = autoSend((focused) => (focused ? true : ++leaves < 2));
+    const controller = makeController(send);
+    const disable = controller.enable();
+    makeTextarea().focus();
+    makeButton().focus();
+    disable();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true, false]);
+    // 开关关着：英文区的输入框也只负责补恢复，不会再切英文
+    makeInput().focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
+    expect(sent).toEqual([true, false, false]);
+    makeInput().focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false, false]);
+  });
+
+  it("关掉时有待发的恢复定时器：被清掉，不会重复发", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    const disable = controller.enable();
+    makeTextarea().focus();
+    makeNative().focus(); // 排了延迟恢复
+    disable(); // 立即恢复，同时清掉定时器
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([true, false]);
+  });
+
+  it("关掉后焦点变化不再响应；再次打开重新生效", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    const disable = controller.enable();
+    disable();
+    makeTextarea().focus();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([]);
+    controller.enable();
+    makeInput().focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true]);
+  });
+
+  it("重复调用关闭函数无害，多次 enable 要全部关掉才恢复", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    const disableA = controller.enable();
+    const disableB = controller.enable();
+    makeTextarea().focus();
+    disableA();
+    disableA();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true]);
+    disableB();
+    await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual([true, false]);
   });
 });
 
-describe("isEditableElement", () => {
+describe("imeZoneOf / isEditableElement", () => {
+  it("可输入元素分英文区和跟随区，不可输入的是 null", () => {
+    const input = makeInput();
+    const native = makeNative();
+    expect(imeZoneOf(input)).toBe("english");
+    expect(imeZoneOf(native)).toBe("native");
+    expect(imeZoneOf(makeButton())).toBeNull();
+    expect(imeZoneOf(null)).toBeNull();
+    // 标记在不可输入的元素自己身上：它不是输入框，仍是 null
+    const button = makeButton();
+    button.setAttribute("data-ime", "native");
+    expect(imeZoneOf(button)).toBeNull();
+  });
+
   it("文本框、textarea、contenteditable 算；按钮、复选框、只读不算", () => {
     const make = (tag: string, props: Record<string, unknown> = {}) =>
       Object.assign(document.createElement(tag), props);
     expect(isEditableElement(make("input", { type: "text" }))).toBe(true);
     expect(isEditableElement(make("input", { type: "password" }))).toBe(true);
     expect(isEditableElement(make("textarea"))).toBe(true);
+    expect(isEditableElement(makeEditor())).toBe(true);
     expect(isEditableElement(make("textarea", { readOnly: true }))).toBe(false);
     expect(isEditableElement(make("input", { type: "checkbox" }))).toBe(false);
     expect(isEditableElement(make("input", { type: "text", disabled: true }))).toBe(false);

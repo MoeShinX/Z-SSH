@@ -9,7 +9,6 @@ import type { ITheme, Terminal } from "@xterm/xterm";
 
 import { useSettings, useTerminalMode } from "../stores/settings";
 import { attachHighlighter, compileRules, parseRules } from "../terminal/highlight";
-import { imeFocus } from "../terminal/imeFocus";
 import {
   createLinkDoubleClickGate,
   isOpenableUrl,
@@ -114,7 +113,6 @@ export default function TerminalView({
   const rightClickPaste = useSettings((state) => state.terminal_right_click_paste);
   const confirmMultiline = useSettings((state) => state.terminal_confirm_multiline_paste);
   const highlightEnabled = useSettings((state) => state.terminal_highlight_enabled);
-  const imeEnglish = useSettings((state) => state.terminal_ime_english);
   const highlightRules = useSettings((state) => state.terminal_highlight_rules);
   const lightTerminal = useTerminalMode() === "light";
   const behaviorRef = useRef({ copyOnSelect, rightClickPaste, confirmMultiline });
@@ -396,14 +394,6 @@ export default function TerminalView({
     terminal.options.cursorBlink = cursorBlink;
     refitRef.current?.();
   }, [fontFamily, fontSize, lineHeight, scrollback, cursorStyle, cursorBlink]);
-
-  // 焦点进终端：输入法切到英文；离开终端（点到别的输入框、切到别的程序）恢复原来的模式。
-  // 请求排队串行发出，分屏之间切换不闪，细节见 terminal/imeFocus.ts
-  useEffect(() => {
-    const textarea = terminalRef.current?.textarea;
-    if (!textarea || !imeEnglish) return;
-    return imeFocus.attach(textarea);
-  }, [imeEnglish]);
 
   // 关键词高亮：关着（默认）时完全不挂，不多花一点功夫
   useEffect(() => {

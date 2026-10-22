@@ -32,6 +32,7 @@ import {
 } from "../../state/fileWindowTabs";
 import { shouldMergeOnClose } from "../../state/closeBehavior";
 import { useSettings } from "../../stores/settings";
+import { useImeDefaultEnglish } from "../../terminal/useImeDefaultEnglish";
 import SftpConflictHost from "../sftp/SftpConflictHost";
 import SftpTabView, { type SftpPaths } from "../sftp/SftpTabView";
 import { WindowControls } from "../titlebar/TopTabs";
@@ -58,6 +59,8 @@ function errorText(error: unknown): string {
 }
 
 export default function FileWindowApp() {
+  // 文件窗口没有 AI 输入框，输入焦点处全部默认英文
+  useImeDefaultEnglish();
   const [tabs, setTabsState] = useState<FileWindowTab[]>([]);
   const [activeId, setActiveId] = useState("");
   const [confirm, setConfirm] = useState<{
