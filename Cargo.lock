@@ -7310,7 +7310,7 @@ dependencies = [
 
 [[package]]
 name = "zssh"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "reqwest 0.13.5",
  "serde",
@@ -7335,7 +7335,7 @@ dependencies = [
 
 [[package]]
 name = "zssh-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "argon2 0.5.3",
  "base64 0.21.7",
@@ -7368,7 +7368,7 @@ dependencies = [
 
 [[package]]
 name = "zssh-mcp"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rmcp",
  "schemars 1.2.3",
