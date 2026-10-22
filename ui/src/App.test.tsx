@@ -9,7 +9,10 @@
 //! 这里直接盯住 `session_open` 的调用次数：修之前是 2，修之后是 1。
 
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import type { ComponentProps, Ref } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { TerminalHandle } from "./components/TerminalView";
 
 const mocks = vi.hoisted(() => ({
   sessionOpen: vi.fn<(hostId: number, cols: number, rows: number, out: unknown) => Promise<string>>(
@@ -34,6 +37,12 @@ const mocks = vi.hoisted(() => ({
   reconnect: new Map<string, () => void>(),
   /** 终端层收到的输出块（paneId + 字节数）。 */
   written: [] as { paneId: string; bytes: number }[],
+  /** true = 用真的 PaneView（带渲染 ACK 逻辑）+ 假的 TerminalView；默认用假 PaneView。 */
+  realPaneView: false,
+  /** 真 PaneView 路径下，假 TerminalView 收到的写入字节数。 */
+  termWrites: [] as number[],
+  /** 真 PaneView 路径下，xterm "写完"回调的队列：测试决定什么时候渲染完。 */
+  renderDone: [] as (() => void)[],
   onTargetConnect: vi.fn(async () => () => {}),
   aiTargetConnectResult: vi.fn(async () => {}),
   hostPanelMounts: 0,
@@ -115,32 +124,62 @@ vi.mock("./components/vault/VaultView", () => ({
 // 终端层：把每个 pane 的 onReady 回调交出来，测试手动触发
 vi.mock("./components/PaneView", async () => {
   const { useEffect } = await import("react");
+  const actual = await vi.importActual<typeof import("./components/PaneView")>(
+    "./components/PaneView",
+  );
+  const RealPaneView = actual.default;
+  type FakePaneProps = {
+    paneId: string;
+    onReady: (paneId: string, cols: number, rows: number) => void;
+    onResize: (paneId: string, cols: number, rows: number) => void;
+    onReconnect: (paneId: string) => void;
+    registerWriter: (paneId: string, writer: ((chunk: ArrayBuffer) => void) | null) => void;
+    session: { sessionId: string | null; phase: string };
+  };
+  const FakePaneView = (props: FakePaneProps) => {
+    const { paneId, registerWriter } = props;
+    mocks.ready.set(paneId, (cols, rows) => props.onReady(paneId, cols, rows));
+    mocks.reconnect.set(paneId, () => props.onReconnect(paneId));
+    mocks.paneRenders += 1;
+    // 和真的 PaneView 一样把写输出的函数交给 App；写进来的块记在 written 里
+    useEffect(() => {
+      registerWriter(paneId, (chunk) => mocks.written.push({ paneId, bytes: chunk.byteLength }));
+      return () => registerWriter(paneId, null);
+    }, [paneId, registerWriter]);
+    // 渲染一个带 pane id 的空 div：测试靠它判断窗格还在不在、会话认领没有
+    return (
+      <div
+        data-pane-id={paneId}
+        data-phase={props.session.phase}
+        data-session={props.session.sessionId ?? ""}
+      />
+    );
+  };
   return {
-    default: (props: {
-      paneId: string;
-      onReady: (paneId: string, cols: number, rows: number) => void;
-      onResize: (paneId: string, cols: number, rows: number) => void;
-      onReconnect: (paneId: string) => void;
-      registerWriter: (paneId: string, writer: ((chunk: ArrayBuffer) => void) | null) => void;
-      session: { sessionId: string | null; phase: string };
-    }) => {
-      const { paneId, registerWriter } = props;
-      mocks.ready.set(paneId, (cols, rows) => props.onReady(paneId, cols, rows));
-      mocks.reconnect.set(paneId, () => props.onReconnect(paneId));
-      mocks.paneRenders += 1;
-      // 和真的 PaneView 一样把写输出的函数交给 App；写进来的块记在 written 里
-      useEffect(() => {
-        registerWriter(paneId, (chunk) => mocks.written.push({ paneId, bytes: chunk.byteLength }));
-        return () => registerWriter(paneId, null);
-      }, [paneId, registerWriter]);
-      // 渲染一个带 pane id 的空 div：测试靠它判断窗格还在不在、会话认领没有
-      return (
-        <div
-          data-pane-id={paneId}
-          data-phase={props.session.phase}
-          data-session={props.session.sessionId ?? ""}
-        />
-      );
+    default: (props: FakePaneProps) => {
+      if (!mocks.realPaneView) return <FakePaneView {...props} />;
+      mocks.ready.set(props.paneId, (cols, rows) => props.onReady(props.paneId, cols, rows));
+      mocks.reconnect.set(props.paneId, () => props.onReconnect(props.paneId));
+      return <RealPaneView {...(props as unknown as ComponentProps<typeof RealPaneView>)} />;
+    },
+  };
+});
+// 真 PaneView 路径用的假终端：记录写入，写完回调由测试手动触发。
+vi.mock("./components/TerminalView", async () => {
+  const { useImperativeHandle } = await import("react");
+  return {
+    default: (props: { ref?: Ref<TerminalHandle> }) => {
+      useImperativeHandle(props.ref, () => ({
+        write: (bytes: Uint8Array, onRendered?: () => void) => {
+          mocks.termWrites.push(bytes.byteLength);
+          if (onRendered) mocks.renderDone.push(onRendered);
+        },
+        writeLine: () => {},
+        size: () => ({ cols: 100, rows: 30 }),
+        focus: () => {},
+        paste: () => {},
+      }));
+      return null;
     },
   };
 });
@@ -220,6 +259,10 @@ beforeEach(() => {
   mocks.ready.clear();
   mocks.reconnect.clear();
   mocks.written.length = 0;
+  mocks.realPaneView = false;
+  mocks.termWrites.length = 0;
+  mocks.renderDone.length = 0;
+  mocks.termAck.mockClear();
   // 终端层（App 里没被 mock）要它量 pane 矩形
   globalThis.ResizeObserver = class {
     observe() {}
@@ -483,6 +526,56 @@ describe("重连后旧会话通道上迟到的输出（TERM-1 T06）", () => {
       newChannel(new ArrayBuffer(30));
 
       expect(mocks.written.map((item) => item.bytes)).toEqual([10, 30]);
+    } finally {
+      mocks.onSessionState.mockImplementation(async () => () => {});
+    }
+  });
+});
+
+describe("断线后、重连前迟到的旧块不记到新会话（TERM-2 T06 遗留）", () => {
+  const BATCH = 64 * 1024;
+
+  it("旧通道的块照常写进终端，但重连成功后不会 ACK 给新会话；新会话自己的块照常 ACK", async () => {
+    mocks.realPaneView = true;
+    mocks.stateHandlers.length = 0;
+    mocks.onSessionState.mockImplementation((async (handler: (event: unknown) => void) => {
+      mocks.stateHandlers.push(handler);
+      return () => {};
+    }) as unknown as () => Promise<() => void>);
+    const push = (event: Record<string, unknown>) =>
+      act(async () => {
+        for (const handler of mocks.stateHandlers) handler(event);
+      });
+    const renderAll = () =>
+      act(() => {
+        for (const done of mocks.renderDone.splice(0)) done();
+      });
+    try {
+      const ready = await openHost();
+      await act(async () => ready(100, 30));
+      await waitFor(() => expect(mocks.sessionOpen).toHaveBeenCalledTimes(1));
+      await push({ session_id: "sess-1", state: "connected" });
+      const oldChannel = mocks.sessionOpen.mock.calls[0][3] as (chunk: ArrayBuffer) => void;
+
+      act(() => oldChannel(new ArrayBuffer(BATCH))); // 断线前的一块
+      await push({ session_id: "sess-1", state: "disconnected", reason: "网络中断" });
+      act(() => oldChannel(new ArrayBuffer(BATCH))); // 旧通道在断线事件之后才送到的一块
+      expect(mocks.termWrites).toEqual([BATCH, BATCH]); // 迟到的块照常显示
+
+      mocks.sessionOpen.mockResolvedValueOnce("sess-2");
+      const paneId = [...mocks.reconnect.keys()][0];
+      await act(async () => mocks.reconnect.get(paneId)?.());
+      await waitFor(() => expect(mocks.sessionOpen).toHaveBeenCalledTimes(2));
+      await push({ session_id: "sess-2", state: "connected" });
+      await renderAll(); // 旧的两块现在才渲染完
+
+      expect(mocks.termAck).not.toHaveBeenCalled();
+
+      // 对照：新会话自己的块照常 ACK 给新会话
+      const newChannel = mocks.sessionOpen.mock.calls[1][3] as (chunk: ArrayBuffer) => void;
+      act(() => newChannel(new ArrayBuffer(BATCH)));
+      await renderAll();
+      expect(mocks.termAck.mock.calls).toEqual([["sess-2", BATCH]]);
     } finally {
       mocks.onSessionState.mockImplementation(async () => () => {});
     }

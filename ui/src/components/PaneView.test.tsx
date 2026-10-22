@@ -391,6 +391,75 @@ describe("渲染 ACK 绑定产生输出的会话（TERM-1 T06）", () => {
   });
 });
 
+describe("断线后迟到的旧输出不记到重连后的新会话（TERM-2 T06 遗留）", () => {
+  const BATCH = 64 * 1024;
+
+  function mountWithWriter(session: PaneSession) {
+    let writer: ((chunk: ArrayBuffer) => void) | null = null;
+    const registerWriter = (_paneId: string, fn: ((chunk: ArrayBuffer) => void) | null) => {
+      writer = fn;
+    };
+    const mounted = renderPane(session, { registerWriter });
+    return { ...mounted, write: (bytes: number) => writer?.(new ArrayBuffer(bytes)) };
+  }
+  const connected = (id: string) => sessionOf({ phase: "connected", sessionId: id });
+  const flushAllRenders = () =>
+    act(() => {
+      for (const done of fake.renderDone.splice(0)) done();
+    });
+
+  it("断线之后、重连之前迟到的输出：照常写进终端，但不 ACK 给新会话", () => {
+    const { write, rerender, props } = mountWithWriter(connected("old"));
+    act(() => write(BATCH)); // 断线前的一块
+    rerender(<PaneView {...props} session={sessionOf({ phase: "disconnected", reason: "断了" })} />);
+    act(() => write(BATCH)); // 旧通道在断线事件之后才把这块送到
+    expect(fake.renderDone).toHaveLength(2); // 两块都真的写进了终端
+
+    rerender(<PaneView {...props} session={sessionOf({ phase: "connecting" })} />);
+    rerender(<PaneView {...props} session={connected("new")} />);
+    flushAllRenders();
+
+    expect(ackMock).not.toHaveBeenCalled();
+  });
+
+  it("两次事件合并成一次渲染（disconnected 直接变 connected）：同样不 ACK 给新会话", () => {
+    const { write, rerender, props } = mountWithWriter(connected("old"));
+    act(() => write(BATCH));
+    rerender(<PaneView {...props} session={sessionOf({ phase: "disconnected", reason: "断了" })} />);
+    act(() => write(BATCH));
+    rerender(<PaneView {...props} session={connected("new")} />);
+    flushAllRenders();
+
+    expect(ackMock).not.toHaveBeenCalled();
+  });
+
+  it("对照：新会话建立后才到的输出，照常 ACK 给新会话", () => {
+    const { write, rerender, props } = mountWithWriter(connected("old"));
+    act(() => write(BATCH));
+    rerender(<PaneView {...props} session={sessionOf({ phase: "disconnected", reason: "断了" })} />);
+    act(() => write(BATCH)); // 迟到的旧输出
+    rerender(<PaneView {...props} session={sessionOf({ phase: "connecting" })} />);
+    rerender(<PaneView {...props} session={connected("new")} />);
+    act(() => write(BATCH)); // 新会话自己的输出
+    flushAllRenders();
+
+    expect(ackMock).toHaveBeenCalledTimes(1);
+    expect(ackMock).toHaveBeenCalledWith("new", BATCH);
+  });
+
+  it("没满一批的迟到输出，不会给新会话已攒的计数凑数", () => {
+    const { write, rerender, props } = mountWithWriter(connected("old"));
+    rerender(<PaneView {...props} session={sessionOf({ phase: "disconnected", reason: "断了" })} />);
+    act(() => write(BATCH / 2)); // 迟到的半批
+    rerender(<PaneView {...props} session={sessionOf({ phase: "connecting" })} />);
+    rerender(<PaneView {...props} session={connected("new")} />);
+    act(() => write(BATCH / 2)); // 新会话的半批
+    flushAllRenders();
+
+    expect(ackMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("拖放插入路径（TERM-1 T04）", () => {
   const connected = () => sessionOf({ phase: "connected", sessionId: "s1" });
 

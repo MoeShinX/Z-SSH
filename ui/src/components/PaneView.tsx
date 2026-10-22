@@ -80,7 +80,14 @@ export default function PaneView({
    * xterm 的写完回调是异步排队的，断线重连后旧会话已经排进去的回调还会执行；
    * 回调里读"最新的 sessionId"就会把旧会话的字节记到新会话头上。所以写入时
    * 记下当时的代次，回调执行时代次变了就丢掉，不碰当前会话的计数。
-   * 代次在断线、或会话 ID 从一个有效值变成别的值时加一（见下面的 useLayoutEffect）。
+   * 代次在三种时机加一（见下面的 useLayoutEffect）：
+   * 1. 断线（phase 变成 disconnected）；
+   * 2. 会话 ID 从一个有效值直接换成别的值；
+   * 3. 开始一次新的连接尝试（phase 从非连接状态进入 connecting / authenticating，
+   *    或从 disconnected 直接跳走）。
+   * 第 3 条管的是断线之后、重连之前才从旧通道迟到的输出：它们照常显示在终端里，但
+   * 记在断线后那一代上，重连一开始就作废，不会被当成新会话的输出 ACK 给新会话。
+   * （不用"断线时删 openAttempts"的办法：那会连会话结束前最后几行输出也不显示。）
    */
   const ackGeneration = useRef(0);
   // 回调里要读会话的最新状态（sessionId 什么时候出现、什么时候没了）。
@@ -131,9 +138,10 @@ export default function PaneView({
     return () => registerWriter(paneId, null);
   }, [paneId, registerWriter, writeOutput]);
 
-  // 换代：断开之后攒着的 ack 没意义了（后端会话已经没了），已经排进 xterm 的旧回调也作废；
-  // 会话 ID 直接换成另一个（没经过断开的批量更新）同理。用 layout effect 是为了在 xterm 的
-  // 下一个回调之前生效。
+  // 换代（三种时机见 ackGeneration）：断开之后攒着的 ack 没意义了（后端会话已经没了），
+  // 已经排进 xterm 的旧回调也作废；会话 ID 直接换成另一个（没经过断开的批量更新）同理；
+  // 新一次连接尝试开始时，断线后迟到的旧输出攒下的字节也不能留给新会话。
+  // 用 layout effect 是为了在 xterm 的下一个回调之前生效。
   const previousScope = useRef<{ phase: PaneSession["phase"]; sessionId: string | null }>({
     phase: session.phase,
     sessionId: session.sessionId,
@@ -143,7 +151,12 @@ export default function PaneView({
     previousScope.current = { phase: session.phase, sessionId: session.sessionId };
     const justDisconnected = session.phase === "disconnected" && previous.phase !== "disconnected";
     const idReplaced = previous.sessionId !== null && previous.sessionId !== session.sessionId;
-    if (justDisconnected || idReplaced) {
+    const wasAttempting = previous.phase === "connecting" || previous.phase === "authenticating";
+    const attemptStarted =
+      (session.phase === "connecting" || session.phase === "authenticating") && !wasAttempting;
+    // 从 disconnected 直接跳到 connected（两次事件被合并成一次渲染）也算新尝试开始。
+    const leftDisconnected = previous.phase === "disconnected" && session.phase !== "disconnected";
+    if (justDisconnected || idReplaced || attemptStarted || leftDisconnected) {
       ackGeneration.current += 1;
       pendingAck.current = 0;
       return;

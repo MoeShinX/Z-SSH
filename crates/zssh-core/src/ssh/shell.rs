@@ -6,7 +6,7 @@ use russh::client::Msg;
 use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::ai::terminal::SharedTerminalRing;
 use crate::error::ZsshError;
@@ -49,6 +49,84 @@ pub enum ShellEvent {
     Closed,
 }
 
+/// 开终端时等服务器回复 PTY / shell 请求的超时（每一步各算一次）。
+pub const OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// PTY 被服务器拒绝时放在终端输出最前面的提示（学 OpenSSH：不判失败，以无终端模式继续）。
+/// 典型场景是 git 托管账号、`authorized_keys` 里写了 `no-pty` 的账号——服务器多半会回一句
+/// 说明再断开，用户得能看到这句，所以提示只是前置、不拦后面的输出。
+const PTY_DENIED_NOTICE: &str =
+    "\r\n\x1b[33m[Z-SSH] 服务器拒绝分配终端（PTY），以无终端模式继续\x1b[0m\r\n";
+
+/// 请求 PTY 和 shell，两步都等服务器的回复；返回等回复期间先到的输出（原顺序）。
+async fn request_pty_and_shell(
+    channel: &mut Channel<Msg>,
+    cols: u16,
+    rows: u16,
+    reply_timeout: Duration,
+) -> Result<Vec<Item>, ZsshError> {
+    // 有的服务器回复之前就先发数据，这些一个字节都不能丢。
+    let mut pending: Vec<Item> = Vec::new();
+
+    channel
+        .request_pty(true, TERM, u32::from(cols), u32::from(rows), 0, 0, &[])
+        .await
+        .map_err(|err| ZsshError::Shell(format!("请求 PTY 失败：{err}")))?;
+    if !wait_reply(channel, "PTY", reply_timeout, &mut pending).await? {
+        pending.insert(0, Item::Data(PTY_DENIED_NOTICE.as_bytes().to_vec()));
+    }
+
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|err| ZsshError::Shell(format!("请求 shell 失败：{err}")))?;
+    if !wait_reply(channel, "shell", reply_timeout, &mut pending).await? {
+        return Err(ZsshError::Shell("服务器拒绝打开 shell".into()));
+    }
+    Ok(pending)
+}
+
+/// 在通道上等一个请求的回复：`Ok(true)` = Success，`Ok(false)` = Failure。
+///
+/// 等的过程中到的数据和退出事件存进 `pending`；通道关了、EOF 了、没了都算打开失败。
+async fn wait_reply(
+    channel: &mut Channel<Msg>,
+    what: &str,
+    reply_timeout: Duration,
+    pending: &mut Vec<Item>,
+) -> Result<bool, ZsshError> {
+    let wait = async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(true),
+                Some(ChannelMsg::Failure) => return Ok(false),
+                // stderr 走扩展数据，和 read_channel 一样按普通输出处理。
+                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    pending.push(Item::Data(data.to_vec()));
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    pending.push(Item::Exit(Some(exit_status)));
+                }
+                Some(ChannelMsg::ExitSignal { .. }) => pending.push(Item::Exit(None)),
+                Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
+                    return Err(ZsshError::Shell(format!(
+                        "服务器在打开终端时关闭了连接（等待 {what} 请求的回复时）"
+                    )));
+                }
+                // 窗口调整等无关消息照常忽略。
+                Some(_) => {}
+            }
+        }
+    };
+    match timeout(reply_timeout, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(ZsshError::Shell(format!(
+            "等待服务器回复 {what} 请求超时（{} 秒）",
+            reply_timeout.as_secs_f32().ceil() as u64
+        ))),
+    }
+}
+
 /// 一个已打开的 shell 通道。
 ///
 /// 需要一边等事件一边写的时候用 [`ShellSession::split`] 把读写两半拆开，这样两个
@@ -65,6 +143,10 @@ impl ShellSession {
     /// 把缓冲顶满（不然得先灌 8MB），所以做成参数；生产路径用
     /// [`DEFAULT_BUFFER_LIMIT`]。`ring` 给 `Some` 时，转发路径上会旁路复制一份
     /// 最近输出（工具桥 `read_terminal` 用）。
+    ///
+    /// 两个请求都带 want_reply 并**等服务器的回复**（`CHANNEL_SUCCESS` / `CHANNEL_FAILURE`）：
+    /// russh 的 `request_*` 只管把请求发出去，不等回复，不等的话服务器拒绝了界面也会
+    /// 显示"已连接"（终端审查 T05）。
     pub(crate) async fn open_with_buffer_limit(
         channel: Channel<Msg>,
         cols: u16,
@@ -72,19 +154,37 @@ impl ShellSession {
         buffer_limit: usize,
         ring: Option<SharedTerminalRing>,
     ) -> Result<Self, ZsshError> {
-        channel
-            .request_pty(true, TERM, u32::from(cols), u32::from(rows), 0, 0, &[])
+        Self::open_with_reply_timeout(channel, cols, rows, buffer_limit, ring, OPEN_REPLY_TIMEOUT)
             .await
-            .map_err(|err| ZsshError::Shell(format!("请求 PTY 失败：{err}")))?;
-        channel
-            .request_shell(true)
-            .await
-            .map_err(|err| ZsshError::Shell(format!("请求 shell 失败：{err}")))?;
+    }
+
+    /// 同 [`ShellSession::open_with_buffer_limit`]，等每个回复的超时可调（测试用，不用真等 20 秒）。
+    pub(crate) async fn open_with_reply_timeout(
+        mut channel: Channel<Msg>,
+        cols: u16,
+        rows: u16,
+        buffer_limit: usize,
+        ring: Option<SharedTerminalRing>,
+        reply_timeout: Duration,
+    ) -> Result<Self, ZsshError> {
+        let pending = match request_pty_and_shell(&mut channel, cols, rows, reply_timeout).await {
+            Ok(pending) => pending,
+            Err(err) => {
+                // 通道已经开出来了：不关的话，复用的连接上会一直占着一个会话名额
+                // （服务器的 MaxSessions 有上限）。
+                let _ = timeout(Duration::from_secs(2), channel.close()).await;
+                return Err(err);
+            }
+        };
 
         let (read_half, write_half) = channel.split();
         let (events_tx, events) = mpsc::channel(EVENT_BUFFER);
         let gate = Arc::new(FlowGate::new());
         let buffer = Arc::new(SessionBuffer::new(buffer_limit));
+        // 等回复期间先到的数据（以及 PTY 被拒的提示）排在读任务读到的数据前面。
+        for item in pending {
+            buffer.push_item(item);
+        }
 
         // 两级缓冲（设计文档 4.1）：读任务只管把 russh 读进本地缓冲，转发任务把
         // 缓冲里的数据攒批发给调用方、受流控门控制。一个终端不 ack 只会顶满它
@@ -566,6 +666,9 @@ async fn send_data(
 
     events.send(ShellEvent::Data(bytes)).await.is_ok()
 }
+
+#[cfg(test)]
+mod open_tests;
 
 #[cfg(test)]
 mod tests {
