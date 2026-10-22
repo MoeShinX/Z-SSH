@@ -95,11 +95,30 @@ async fn request_pty_and_shell(
     Ok(items)
 }
 
+/// 等回复期间最多暂存多少条消息（数据块和退出事件合计）。
+///
+/// 字节上限只管数据；退出事件不带数据却也要存一条，服务器反复发退出事件同样能把内存
+/// 撑大，所以条数也要卡。正常服务器在回复前顶多发几条，碰不到这个数。
+const PENDING_MAX_ITEMS: usize = 4096;
+
 /// 等回复期间先到的输出，连同累计的数据字节数（用来卡上限）。
 #[derive(Default)]
 struct Pending {
     items: Vec<Item>,
     data_bytes: usize,
+}
+
+impl Pending {
+    /// 暂存一条；超过条数上限就判定打开失败。
+    fn push(&mut self, item: Item, what: &str) -> Result<(), ZsshError> {
+        if self.items.len() >= PENDING_MAX_ITEMS {
+            return Err(ZsshError::Shell(format!(
+                "服务器在回复前发送了过多消息（等待 {what} 请求的回复时，超过 {PENDING_MAX_ITEMS} 条）"
+            )));
+        }
+        self.items.push(item);
+        Ok(())
+    }
 }
 
 /// 在通道上等一个请求的回复：`Ok(true)` = Success，`Ok(false)` = Failure。
@@ -126,12 +145,12 @@ async fn wait_reply(
                             "服务器在回复前发送了过多数据（等待 {what} 请求的回复时，超过 {data_limit} 字节）"
                         )));
                     }
-                    pending.items.push(Item::Data(data.to_vec()));
+                    pending.push(Item::Data(data.to_vec()), what)?;
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    pending.items.push(Item::Exit(Some(exit_status)));
+                    pending.push(Item::Exit(Some(exit_status)), what)?;
                 }
-                Some(ChannelMsg::ExitSignal { .. }) => pending.items.push(Item::Exit(None)),
+                Some(ChannelMsg::ExitSignal { .. }) => pending.push(Item::Exit(None), what)?,
                 Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
                     return Err(ZsshError::Shell(format!(
                         "服务器在打开终端时关闭了连接（等待 {what} 请求的回复时）"

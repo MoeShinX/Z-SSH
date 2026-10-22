@@ -39,6 +39,8 @@ struct Script {
     /// 前几个 PTY 请求按 [`Reply::Silent`] 处理，之后才按 `pty` 的设置回复
     /// （同一条连接上第一个通道不回复、第二个通道正常的场景用）。
     silent_pty_requests: usize,
+    /// 回复 PTY 请求之前先连发多少个退出事件（exit-status）。
+    exits_before_pty_reply: usize,
 }
 
 impl Script {
@@ -50,6 +52,7 @@ impl Script {
             before_shell_reply_stderr: Vec::new(),
             after_shell: Vec::new(),
             silent_pty_requests: 0,
+            exits_before_pty_reply: 0,
         }
     }
 }
@@ -99,6 +102,9 @@ impl server::Handler for FakeServer {
     ) -> Result<(), Self::Error> {
         if !self.script.before_pty_reply.is_empty() {
             session.data(channel, self.script.before_pty_reply.clone())?;
+        }
+        for _ in 0..self.script.exits_before_pty_reply {
+            session.exit_status_request(channel, 0)?;
         }
         if self.script.silent_pty_requests > 0 {
             self.script.silent_pty_requests -= 1;
@@ -468,4 +474,34 @@ async fn data_exactly_at_the_cap_is_kept_in_full_and_in_order() {
     expected.extend_from_slice(b"END");
     let out = collect_output(&mut shell, expected.len()).await;
     assert_eq!(out, expected, "数据一个字节不丢、顺序不变");
+}
+
+// ---- 等回复期间的消息条数上限（退出事件不带数据，字节上限管不到它） ----
+
+#[tokio::test]
+async fn too_many_exit_events_before_the_reply_fail_and_close_the_channel() {
+    let mut script = Script::new(Reply::Success, Reply::Success);
+    script.exits_before_pty_reply = PENDING_MAX_ITEMS + 10;
+    let (addr, mut closed) = spawn_server(script).await;
+    let (_handle, channel) = connect_and_open_channel(addr).await;
+
+    let text = error_text(open(channel, Duration::from_secs(10)).await);
+    assert!(
+        text.contains("服务器在回复前发送了过多消息"),
+        "实际：{text}"
+    );
+    let seen = timeout(Duration::from_secs(5), closed.recv()).await;
+    assert!(matches!(seen, Ok(Some(()))), "超过条数上限后通道应当被关闭");
+}
+
+#[tokio::test]
+async fn a_few_exit_events_before_the_reply_are_fine() {
+    let mut script = Script::new(Reply::Success, Reply::Success);
+    script.exits_before_pty_reply = 3;
+    let (addr, _closed) = spawn_server(script).await;
+    let (_handle, channel) = connect_and_open_channel(addr).await;
+
+    open(channel, Duration::from_secs(5))
+        .await
+        .expect("回复前只有几个退出事件时照常打开");
 }
