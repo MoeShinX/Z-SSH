@@ -19,6 +19,10 @@ export const dataDirInfo = (): Promise<DataDirInfo> => invoke("data_dir_info");
 /** 用资源管理器打开数据目录。 */
 export const openDataDir = (): Promise<void> => invoke("open_data_dir");
 
+/** 用系统默认浏览器打开网址（后端只放行 http / https）。 */
+export const openExternalUrl = (url: string): Promise<void> =>
+  invoke("open_external_url", { url });
+
 /** 会话日志实际写到的目录（设置没填时是数据目录下的 session-logs）。 */
 export const sessionLogDirInfo = (): Promise<string> => invoke("session_log_dir_info");
 

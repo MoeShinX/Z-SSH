@@ -14,6 +14,7 @@ import { createRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSettings } from "../stores/settings";
+import type { TerminalLinkHandlers } from "../terminal/links";
 import TerminalView, { type TerminalHandle } from "./TerminalView";
 
 /** 单格像素尺寸（测试自定；行为只取决于宽高和它的比例）。 */
@@ -34,6 +35,19 @@ const fake = vi.hoisted(() => ({
   disposed: 0,
   /** xterm 的 paste 被调用时收到的文本（真正送进会话的内容）。 */
   pasted: [] as string[],
+  /** createTerminal 收到的链接回调（测试里手动触发悬停 / 点击）。 */
+  links: null as TerminalLinkHandlers | null,
+  /** terminal.select 收到的参数。 */
+  selected: [] as number[][],
+  /** 后端 open_external_url 收到的网址。 */
+  opened: [] as string[],
+}));
+
+vi.mock("../api/settings", () => ({
+  openExternalUrl: (url: string) => {
+    fake.opened.push(url);
+    return Promise.resolve();
+  },
 }));
 
 vi.mock("../terminal/terminal", () => {
@@ -67,6 +81,9 @@ vi.mock("../terminal/terminal", () => {
     paste(text: string) {
       fake.pasted.push(text);
     },
+    select(column: number, row: number, length: number) {
+      fake.selected.push([column, row, length]);
+    },
     focus() {},
     dispose() {
       fake.disposed += 1;
@@ -81,7 +98,10 @@ vi.mock("../terminal/terminal", () => {
     },
   };
   return {
-    createTerminal: () => ({ terminal, fitAddon }),
+    createTerminal: (_theme: unknown, links?: TerminalLinkHandlers) => {
+      fake.links = links ?? null;
+      return { terminal, fitAddon };
+    },
     loadWebglRenderer: () => {},
     applyTerminalTheme: () => {},
   };
@@ -110,6 +130,9 @@ beforeEach(() => {
   fake.openedEl = null;
   fake.disposed = 0;
   fake.pasted = [];
+  fake.links = null;
+  fake.selected = [];
+  fake.opened = [];
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   // jsdom 没有 ResizeObserver
   globalThis.ResizeObserver = class {
@@ -340,5 +363,138 @@ describe("粘贴入口的多行确认（TERM-1 T04）", () => {
     fireEvent.click(view.getByText("粘贴"));
 
     expect(fake.pasted).toEqual(["a\nb"]);
+  });
+});
+
+describe("终端里的链接", () => {
+  afterEach(cleanup);
+
+  const URI = "https://example.com/a/b?c=1";
+  // 第 5～30 列（1 起始、含右端），在缓冲区第 12 行
+  const RANGE = { start: { x: 5, y: 12 }, end: { x: 30, y: 12 } };
+  const clipboard = { writeText: vi.fn(() => Promise.resolve()), readText: vi.fn(() => Promise.resolve("pasted")) };
+
+  beforeEach(() => {
+    clipboard.writeText.mockClear();
+    clipboard.readText.mockClear();
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: clipboard });
+    useSettings.setState({ terminal_confirm_multiline_paste: false, terminal_right_click_paste: true });
+    fake.cols = 80;
+  });
+
+  function hover(uri: string | null = URI, range = RANGE) {
+    act(() => fake.links?.onHover(uri === null ? null : { uri, range }));
+  }
+
+  it("单击：选中整条链接，不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    act(() => fake.links?.onActivate(URI));
+
+    // 列从 0 起、行从 0 起，长度含两端：5..30 共 26 格
+    expect(fake.selected).toEqual([[4, 11, 26]]);
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("折行的链接：选区按整行宽度累加，跨行选中", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover(URI, { start: { x: 70, y: 5 }, end: { x: 15, y: 6 } });
+
+    act(() => fake.links?.onActivate(URI));
+
+    expect(fake.selected).toEqual([[69, 4, 26]]);
+  });
+
+  it("双击：才调用打开，第一下选中的链接保留", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    act(() => fake.links?.onActivate(URI));
+    act(() => fake.links?.onActivate(URI));
+
+    expect(fake.opened).toEqual([URI]);
+    expect(fake.selected).toEqual([[4, 11, 26]]);
+  });
+
+  it("隔了很久的两次单击不算双击", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    const now = vi.spyOn(Date, "now").mockReturnValueOnce(1000).mockReturnValueOnce(3000);
+    act(() => fake.links?.onActivate(URI));
+    act(() => fake.links?.onActivate(URI));
+    now.mockRestore();
+
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("链接上的第二下按下不传给 xterm（免得双击选词替换掉整条链接的选区）", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const inner = document.createElement("div");
+    (fake.openedEl as HTMLElement).appendChild(inner);
+    const seen: number[] = [];
+    inner.addEventListener("mousedown", (event) => seen.push(event.detail));
+
+    hover();
+    fireEvent.mouseDown(inner, { detail: 1 });
+    fireEvent.mouseDown(inner, { detail: 2 });
+    expect(seen).toEqual([1]);
+
+    // 不在链接上：双击照常选词
+    hover(null);
+    fireEvent.mouseDown(inner, { detail: 2 });
+    expect(seen).toEqual([1, 2]);
+  });
+
+  it("链接上右键：弹出「打开链接 / 复制链接」，不粘贴", async () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+
+    expect(view.getByText("打开链接")).not.toBeNull();
+    expect(view.getByText("复制链接")).not.toBeNull();
+    expect(clipboard.readText).not.toHaveBeenCalled();
+    expect(fake.pasted).toEqual([]);
+
+    fireEvent.click(view.getByText("复制链接"));
+    expect(clipboard.writeText).toHaveBeenCalledWith(URI);
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("右键菜单「打开链接」走后端打开命令", () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    fireEvent.click(view.getByText("打开链接"));
+
+    expect(fake.opened).toEqual([URI]);
+  });
+
+  it("不在链接上右键：维持原来的右键粘贴，不出链接菜单", async () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    hover(null);
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(view.queryByText("打开链接")).toBeNull();
+    expect(clipboard.readText).toHaveBeenCalledTimes(1);
+    expect(fake.pasted).toEqual(["pasted"]);
+  });
+
+  it("不在链接上右键且没开右键粘贴：什么都不做，也不出链接菜单", () => {
+    useSettings.setState({ terminal_right_click_paste: false });
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+
+    expect(view.queryByText("打开链接")).toBeNull();
+    expect(clipboard.readText).not.toHaveBeenCalled();
   });
 });

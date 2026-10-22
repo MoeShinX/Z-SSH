@@ -72,6 +72,13 @@ import { ScrollArea } from "../ui/scroll-area";
 import { ResizeHandle, useHostTreeWidth } from "../ui/resize-handle";
 import { guideAttrs, treeGuideStyle, type TreeGuide } from "./treeGuides";
 import { hostCopyText, type HostCopyKind } from "../../state/hostAddress";
+import {
+  cancelPendingCollapse,
+  clickHostInfo,
+  closeHostInfo,
+  useHostInfoId,
+} from "../../state/hostInfoPanel";
+import HostInfoPanel from "./HostInfoPanel";
 
 interface VaultViewProps {
   /** 双击主机 / 点"连接"：开一个新的终端标签 */
@@ -338,6 +345,7 @@ export function HostTreeAside({
   onEditGroup,
   onDeleteGroup,
   collapsedStyle,
+  infoPanel = false,
 }: {
   query: string;
   selectedGroup: number | null | "all";
@@ -349,9 +357,32 @@ export function HostTreeAside({
   onEditGroup: (group: Group) => void;
   onDeleteGroup: (group: Group) => void;
   collapsedStyle: "icons" | "hidden";
+  /**
+   * 终端界面用：单击主机在树底部展开 / 收起只读属性面板（UI-6）。主机页不传，
+   * 单击照旧是打开详情。
+   */
+  infoPanel?: boolean;
 }) {
   const groups = useVault((state) => state.groups);
   const hosts = useVault((state) => state.hosts);
+  const proxies = useVault((state) => state.proxies);
+  const infoHostId = useHostInfoId();
+  const infoHost = infoPanel && infoHostId !== null ? hosts.find((h) => h.id === infoHostId) : undefined;
+  // 属性面板的接线：单击切换面板（再照常走调用方的单击），双击连接时取消待执行的收起，
+  // 这样双击不会让面板来回闪（见 state/hostInfoPanel.ts）
+  const treeActions: HostActions = infoPanel
+    ? {
+        ...hostActions,
+        select: (host) => {
+          clickHostInfo(host.id);
+          hostActions.select(host);
+        },
+        connect: (host) => {
+          cancelPendingCollapse();
+          hostActions.connect(host);
+        },
+      }
+    : hostActions;
   // 树的展开状态（本机布局，记在设置里）；搜索时有匹配的分组自动展开
   const expandedRaw = useSettings((state) => state["layout.vault_expanded"]);
   const updateSetting = useSettings((state) => state.update);
@@ -442,7 +473,7 @@ export function HostTreeAside({
                   onNewGroup={onNewGroup}
                   onEditGroup={onEditGroup}
                   onDeleteGroup={onDeleteGroup}
-                  hostActions={hostActions}
+                  hostActions={treeActions}
                 />
               ))}
             <GroupRow
@@ -472,7 +503,7 @@ export function HostTreeAside({
                   depth={1}
                   guide={{ trail: [], last: index === list.length - 1, kind: "host" }}
                   selected={selectedHostId === host.id}
-                  actions={hostActions}
+                  actions={treeActions}
                 />
               ))}
           </div>
@@ -486,6 +517,15 @@ export function HostTreeAside({
             <FolderPlus size={14} /> 新分组
           </Button>
         </div>
+        {infoHost && (
+          <HostInfoPanel
+            host={infoHost}
+            hosts={hosts}
+            proxies={proxies}
+            onCopyAddress={() => hostActions.copy(infoHost, "address")}
+            onClose={closeHostInfo}
+          />
+        )}
       </aside>
       )}
       <HostDragGhost />
@@ -646,7 +686,7 @@ function GroupBranch({
             </ContextMenuItem>
             <ContextMenuSeparator />
             <ContextMenuItem
-              className="text-destructive focus:text-destructive-foreground"
+              destructive
               onSelect={() => onDeleteGroup(group)}
             >
               <Trash2 className="mr-2 h-3.5 w-3.5" /> 删除分组
@@ -995,7 +1035,7 @@ function HostMenu({
       )}
       <MoveToGroupMenu host={host} />
       <ContextMenuSeparator />
-      <ContextMenuItem className="text-destructive focus:text-destructive-foreground" onSelect={onDelete}>
+      <ContextMenuItem destructive onSelect={onDelete}>
         <Trash2 className="mr-2 h-3.5 w-3.5" /> 删除
       </ContextMenuItem>
     </ContextMenuContent>

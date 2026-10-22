@@ -162,3 +162,38 @@ describe("密码字段的位置", () => {
     expect(screen.getByText("留空表示不保存密码，连接时会提示")).not.toBeNull();
   });
 });
+
+describe("新建主机的代理默认值（UI-6）", () => {
+  async function fillAndSave() {
+    fireEvent.change(inputOf("名称"), { target: { value: "new-1" } });
+    fireEvent.change(inputOf("地址"), { target: { value: "10.0.0.12" } });
+    await act(async () => screen.getByText("保存").click());
+  }
+
+  it("新建：代理下拉默认是「不用代理」，保存出去的 proxy_mode 是 none", async () => {
+    mount(null);
+    expect(screen.getByText("不用代理")).not.toBeNull();
+    expect(screen.queryByText("跟随默认代理")).toBeNull();
+    await fillAndSave();
+    expect(mocks.saveHost).toHaveBeenCalledWith(
+      expect.objectContaining({ id: null, proxy_mode: "none", proxy_id: null }),
+    );
+  });
+
+  it("编辑已有主机：保持它保存的代理方式（跟随默认的仍是跟随默认）", async () => {
+    mount({ ...HOST, proxy_mode: "default" });
+    expect(screen.getByText("跟随默认代理")).not.toBeNull();
+    await act(async () => screen.getByText("保存").click());
+    expect(mocks.saveHost).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 3, proxy_mode: "default" }),
+    );
+  });
+
+  it("编辑已有主机：指定代理的主机原样保存", async () => {
+    mount({ ...HOST, proxy_mode: "custom", proxy_id: 5 });
+    await act(async () => screen.getByText("保存").click());
+    expect(mocks.saveHost).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 3, proxy_mode: "custom", proxy_id: 5 }),
+    );
+  });
+});

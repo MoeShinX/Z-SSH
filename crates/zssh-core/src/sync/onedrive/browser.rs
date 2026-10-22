@@ -60,7 +60,7 @@ impl BrowserOpener for SystemBrowser {
 }
 
 #[cfg(windows)]
-fn shell_open(url: &str) -> Result<(), String> {
+pub(crate) fn shell_open(url: &str) -> Result<(), String> {
     use windows::core::{w, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -87,7 +87,7 @@ fn shell_open(url: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn shell_open(_url: &str) -> Result<(), String> {
+pub(crate) fn shell_open(_url: &str) -> Result<(), String> {
     Err("只支持在 Windows 上打开系统浏览器".to_owned())
 }
 

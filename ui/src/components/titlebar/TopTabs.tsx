@@ -319,6 +319,8 @@ export default function TopTabs({
             }
             const phases = paneIds(tab.tree).map((paneId) => panes[paneId]?.phase ?? "idle");
             const dot = tabDot(phases);
+            // 双击标签和右键「复制标签页」是同一个函数
+            const duplicate = onDuplicateTab ? () => onDuplicateTab(tab.id) : undefined;
             return (
               <ContextMenu key={tab.id}>
                 <ContextMenuTrigger asChild>
@@ -328,6 +330,7 @@ export default function TopTabs({
                       tabKind="terminal"
                       active={view === "terminal" && tab.id === activeTabId}
                       onClick={() => onSelectTab(tab.id)}
+                      onDoubleClick={duplicate}
                       onClose={() => onCloseTab(tab.id)}
                       label={tab.title}
                       dotClass={dot.className}
@@ -347,7 +350,7 @@ export default function TopTabs({
                     </ContextMenuItem>
                   )}
                   {onDuplicateTab && (
-                    <ContextMenuItem onSelect={() => onDuplicateTab(tab.id)}>
+                    <ContextMenuItem onSelect={duplicate}>
                       <Copy className="mr-2 h-3.5 w-3.5" /> 复制标签页
                     </ContextMenuItem>
                   )}
@@ -471,6 +474,8 @@ interface TabShapeProps {
   label: string;
   active: boolean;
   onClick: () => void;
+  /** 双击标签（只有终端标签传：复制标签页）。 */
+  onDoubleClick?: () => void;
   onClose?: () => void;
   icon?: React.ReactNode;
   dotClass?: string;
@@ -492,6 +497,7 @@ function TabShape({
   label,
   active,
   onClick,
+  onDoubleClick,
   onClose,
   icon,
   dotClass,
@@ -519,6 +525,7 @@ function TabShape({
       data-tab-kind={tabKind}
       data-dock-target={dockTarget}
       onClick={onClick}
+      onDoubleClick={onDoubleClick}
       onPointerDown={onPointerDown}
       title={tooltip ?? label}
       className={cn(
@@ -545,6 +552,8 @@ function TabShape({
             event.stopPropagation();
             onClose();
           }}
+          // 连点关闭按钮不能冒泡成标签的双击
+          onDoubleClick={(event) => event.stopPropagation()}
           title="关闭标签"
           aria-label={`关闭 ${label}`}
           className={cn(
@@ -605,7 +614,7 @@ function CloseItems({
             <PanelRightClose className="mr-2 h-3.5 w-3.5" /> 关闭右侧标签页
           </ContextMenuItem>
           <ContextMenuItem
-            className="text-destructive focus:text-destructive-foreground"
+            destructive
             onSelect={() => onCloseTabs(tabId, "all")}
           >
             <Trash2 className="mr-2 h-3.5 w-3.5" /> 关闭所有标签页

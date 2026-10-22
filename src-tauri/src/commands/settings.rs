@@ -102,6 +102,17 @@ pub async fn open_data_dir(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 用系统默认浏览器打开终端里点开的网址。
+///
+/// 调用链：终端里双击链接 / 右键「打开链接」→ `openExternalUrl` → 这里 →
+/// `external_url::open_external_url`（只放行 http/https，拒绝空白和控制字符、超长）→ ShellExecuteW。
+#[tauri::command]
+pub async fn open_external_url(url: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || zssh_core::external_url::open_external_url(&url))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 /// 字符串设置：库里存的是 JSON（`"..."`），老数据可能是裸字符串，两种都认。
 fn string_setting(state: &AppState, key: &str) -> Option<String> {
     let raw = state.store.setting_get(key).ok().flatten()?;

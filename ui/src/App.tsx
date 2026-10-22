@@ -2710,7 +2710,7 @@ export default function App() {
     [removeGroup],
   );
 
-  /** 终端界面主机树的操作：单击只高亮，双击连接，右键「编辑」打开主机详情。 */
+  /** 终端界面主机树的操作：单击高亮并展开 / 收起树底部的属性面板，双击连接，右键「编辑」打开主机详情。 */
   const terminalTreeActions: HostActions = useMemo(
     () => ({
       select: (host) => setTreeHostId(host.id),
@@ -2831,6 +2831,7 @@ export default function App() {
                 onSelectGroup={setTreeGroup}
                 selectedHostId={treeHostId}
                 hostActions={terminalTreeActions}
+                infoPanel
                 onNewHost={(groupId) => {
                   setSidePanel("none");
                   setHostPanel({ host: null, groupId });

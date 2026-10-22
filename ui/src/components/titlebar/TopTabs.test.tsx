@@ -157,6 +157,72 @@ describe("标签右键菜单", () => {
   });
 });
 
+describe("双击标签复制标签页", () => {
+  const base = { tree: { kind: "pane" as const, id: "p" }, focus: "p" };
+  function renderTabs(extra: Record<string, unknown> = {}) {
+    const handlers = {
+      onDuplicateTab: vi.fn(),
+      onShowVault: vi.fn(),
+      onSelectTab: vi.fn(),
+      onCloseTab: vi.fn(),
+    };
+    render(
+      <TopTabs
+        tabs={[
+          { ...base, id: "t", title: "web-1" },
+          { ...base, id: "s", title: "文件 web-1", sftp: { hostId: "h" } } as never,
+          {
+            ...base,
+            id: "e",
+            title: "notes.txt",
+            editor: { editId: "x" },
+          } as never,
+        ]}
+        activeTabId="t"
+        panes={{ p: { phase: "connected" } as never }}
+        view="terminal"
+        onOpenSettings={() => {}}
+        onNewTab={() => {}}
+        aiOpen={false}
+        onToggleAI={() => {}}
+        sftpOpen={false}
+        onToggleSftp={() => {}}
+        {...handlers}
+        {...extra}
+      />,
+    );
+    return handlers;
+  }
+
+  it("双击终端标签：和右键「复制标签页」一样调 onDuplicateTab", () => {
+    const handlers = renderTabs();
+    fireEvent.doubleClick(screen.getByText("web-1"));
+    expect(handlers.onDuplicateTab).toHaveBeenCalledTimes(1);
+    expect(handlers.onDuplicateTab).toHaveBeenCalledWith("t");
+    expect(handlers.onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("SFTP 标签、编辑器标签、「主机」标签双击什么都不做", () => {
+    const handlers = renderTabs();
+    fireEvent.doubleClick(screen.getByText("文件 web-1"));
+    fireEvent.doubleClick(screen.getByText("notes.txt"));
+    fireEvent.doubleClick(screen.getByText("主机"));
+    expect(handlers.onDuplicateTab).not.toHaveBeenCalled();
+    expect(handlers.onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("双击关闭按钮：不冒泡成复制", () => {
+    const handlers = renderTabs();
+    fireEvent.doubleClick(screen.getByLabelText("关闭 web-1"));
+    expect(handlers.onDuplicateTab).not.toHaveBeenCalled();
+  });
+
+  it("没有提供复制能力时双击无效、不报错", () => {
+    renderTabs({ onDuplicateTab: undefined });
+    expect(() => fireEvent.doubleClick(screen.getByText("web-1"))).not.toThrow();
+  });
+});
+
 describe("当前终端标签和终端的衔接", () => {
   function renderActiveTerminal() {
     return render(

@@ -433,6 +433,7 @@ fn main() {
             commands::settings::default_proxy_set,
             commands::settings::data_dir_info,
             commands::settings::open_data_dir,
+            commands::settings::open_external_url,
             commands::settings::app_network_system_proxy,
             commands::settings::file_window_adopt,
             commands::settings::file_window_take,

@@ -74,7 +74,8 @@ export default function HostDetailsPanel({
   const [username, setUsername] = useState(host ? host.username : "root");
   const [authMethod, setAuthMethod] = useState<AuthMethod>(host?.auth_method ?? "password");
   const [identityId, setIdentityId] = useState(host?.identity_id == null ? "none" : String(host.identity_id));
-  const [proxyMode, setProxyMode] = useState<ProxyMode>(host?.proxy_mode ?? "default");
+  // 新建主机默认不使用代理（不跟随全局默认代理）；编辑已有主机显示它保存的值。
+  const [proxyMode, setProxyMode] = useState<ProxyMode>(host?.proxy_mode ?? "none");
   const [proxyId, setProxyId] = useState(host?.proxy_id == null ? "none" : String(host.proxy_id));
   const [jumpHostId, setJumpHostId] = useState(host?.jump_host_id == null ? "none" : String(host.jump_host_id));
   // 留空表示不改已存的密码

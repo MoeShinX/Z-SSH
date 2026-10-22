@@ -5,6 +5,7 @@
 
 pub mod ai;
 pub mod error;
+pub mod external_url;
 pub mod model;
 pub mod pathnorm;
 pub mod sftp;

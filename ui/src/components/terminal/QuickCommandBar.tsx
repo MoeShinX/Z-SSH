@@ -169,7 +169,7 @@ export default function QuickCommandBar({
                 <ContextMenuSeparator />
                 <ContextMenuItem onSelect={() => onEdit(command)}>编辑</ContextMenuItem>
                 <ContextMenuItem
-                  className="text-destructive focus:text-destructive-foreground"
+                  destructive
                   onSelect={() => onDelete(command)}
                 >
                   删除

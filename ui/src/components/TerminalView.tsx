@@ -1,13 +1,21 @@
 import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 
 import type { FitAddon } from "@xterm/addon-fit";
+import { Copy, ExternalLink } from "lucide-react";
 
+import { openExternalUrl } from "../api/settings";
 import { isPanelDragging, onPanelDragChange } from "../state/panelWidths";
 import type { ITheme, Terminal } from "@xterm/xterm";
 
 import { useSettings, useTerminalMode } from "../stores/settings";
 import { attachHighlighter, compileRules, parseRules } from "../terminal/highlight";
 import { imeFocus } from "../terminal/imeFocus";
+import {
+  createLinkDoubleClickGate,
+  linkSelection,
+  type HoveredLink,
+  type TerminalLinkHandlers,
+} from "../terminal/links";
 import { applyTerminalTheme, createTerminal, loadWebglRenderer } from "../terminal/terminal";
 import {
   multilinePaste,
@@ -15,6 +23,12 @@ import {
   terminalClipboardAction,
 } from "../state/terminalKeys";
 import { ConfirmDialog } from "./ui/confirm-dialog";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "./ui/context-menu";
 import { toast } from "./ui/toast";
 
 /** 容器大小稳定多久之后才通知后端，避免拖动窗口时刷屏。 */
@@ -128,6 +142,21 @@ export default function TerminalView({
     setPending(null);
     toast.info("会话已变化，已取消待确认的粘贴");
   }, [pasteTarget, pending]);
+  // 鼠标当前悬停的链接（xterm 的 hover / leave 回调维护）。右键只在悬停链接时弹链接菜单，
+  // 所以"有没有悬停"同时放一份 state 给菜单触发器用；链接本身放 ref，避免每次悬停都重建终端。
+  const hoveredLinkRef = useRef<HoveredLink | null>(null);
+  const [linkHovered, setLinkHovered] = useState(false);
+  // 菜单开着的时候冻结悬停状态：弹出后鼠标事件被菜单挡住，xterm 的 leave 不代表用户离开了链接。
+  const menuOpenRef = useRef(false);
+  // 右键那一刻的链接（菜单项用它，不受之后悬停变化影响）
+  const menuLinkRef = useRef<string | null>(null);
+  const openLink = (uri: string) => {
+    void openExternalUrl(uri).catch((error: unknown) => {
+      toast.error(typeof error === "string" ? error : "没能打开链接");
+    });
+  };
+  const openLinkRef = useRef(openLink);
+  openLinkRef.current = openLink;
   // mount effect 里存的 refit 函数，设置变了拿它重新量一次行列数
   const refitRef = useRef<(() => void) | null>(null);
 
@@ -135,7 +164,27 @@ export default function TerminalView({
     const container = containerRef.current;
     if (!container) return;
 
-    const { terminal, fitAddon } = createTerminal(themeRef.current);
+    // 链接：单击选中整条链接（之后可 Ctrl+C 复制；开了选中即复制就自动复制），双击用系统浏览器打开。
+    const isDoubleClick = createLinkDoubleClickGate();
+    const links: TerminalLinkHandlers = {
+      onHover: (link) => {
+        if (menuOpenRef.current) return;
+        hoveredLinkRef.current = link;
+        setLinkHovered(link !== null);
+      },
+      onActivate: (uri) => {
+        if (isDoubleClick(uri)) {
+          // 第一下单击已经把链接选中了，选区保留
+          openLinkRef.current(uri);
+          return;
+        }
+        const link = hoveredLinkRef.current;
+        if (!link || link.uri !== uri) return;
+        const { column, row, length } = linkSelection(link.range, terminal.cols);
+        terminal.select(column, row, length);
+      },
+    };
+    const { terminal, fitAddon } = createTerminal(themeRef.current, links);
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
     terminal.open(container);
@@ -153,6 +202,11 @@ export default function TerminalView({
 
     // 右键粘贴：把剪贴板内容按终端的粘贴语义送进去
     const onContextMenu = (event: MouseEvent) => {
+      // 在链接上右键：不粘贴，交给下面的链接菜单（Radix 的触发器接着处理这个事件）
+      if (hoveredLinkRef.current) {
+        menuLinkRef.current = hoveredLinkRef.current.uri;
+        return;
+      }
       if (!behaviorRef.current.rightClickPaste) return;
       event.preventDefault();
       void navigator.clipboard
@@ -163,6 +217,14 @@ export default function TerminalView({
         });
     };
     container.addEventListener("contextmenu", onContextMenu);
+    // 链接上的第二下按下：不让 xterm 做双击选词，否则会把刚选中的整条链接换成一个词
+    // （选中即复制时还会把这个词写进剪贴板）。抬起事件照常放行，链接的双击判定靠它。
+    const onMouseDownCapture = (event: MouseEvent) => {
+      if (event.button === 0 && event.detail >= 2 && hoveredLinkRef.current) {
+        event.stopPropagation();
+      }
+    };
+    container.addEventListener("mousedown", onMouseDownCapture, true);
     // 其他途径的粘贴（Shift+Insert、输入法菜单等）走浏览器的 paste 事件：截下来同样先确认。
     // 捕获阶段拦，xterm 自己的 paste 处理就收不到了，不会粘两遍。
     const onPaste = (event: ClipboardEvent) => {
@@ -279,6 +341,8 @@ export default function TerminalView({
       stopDragWatch();
       observer.disconnect();
       container.removeEventListener("contextmenu", onContextMenu);
+      container.removeEventListener("mousedown", onMouseDownCapture, true);
+      hoveredLinkRef.current = null;
       container.removeEventListener("paste", onPaste, true);
       selectionSubscription.dispose();
       dataSubscription.dispose();
@@ -358,7 +422,43 @@ export default function TerminalView({
   const pasteInfo = pendingPaste === null ? null : multilinePaste(pendingPaste);
   return (
     <>
-      <div ref={containerRef} className="h-full w-full overflow-hidden" />
+      <ContextMenu
+        onOpenChange={(open) => {
+          menuOpenRef.current = open;
+        }}
+      >
+        <ContextMenuTrigger asChild disabled={!linkHovered}>
+          <div ref={containerRef} className="h-full w-full overflow-hidden" />
+        </ContextMenuTrigger>
+        <ContextMenuContent
+          onCloseAutoFocus={(event) => {
+            // 菜单关了把焦点还给终端，而不是容器 div
+            event.preventDefault();
+            terminalRef.current?.focus();
+          }}
+        >
+          <ContextMenuItem
+            onSelect={() => {
+              if (menuLinkRef.current) openLinkRef.current(menuLinkRef.current);
+            }}
+          >
+            <ExternalLink className="mr-2 h-3.5 w-3.5" />
+            打开链接
+          </ContextMenuItem>
+          <ContextMenuItem
+            onSelect={() => {
+              const uri = menuLinkRef.current;
+              if (!uri) return;
+              void navigator.clipboard?.writeText(uri).catch((error: unknown) => {
+                console.warn("复制失败（剪贴板不可用）", error);
+              });
+            }}
+          >
+            <Copy className="mr-2 h-3.5 w-3.5" />
+            复制链接
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
       {pendingPaste !== null && (
         <ConfirmDialog
           open

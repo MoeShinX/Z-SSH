@@ -11,6 +11,8 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal, type ITheme } from "@xterm/xterm";
 
+import type { TerminalLinkHandlers } from "./links";
+
 import "@xterm/xterm/css/xterm.css";
 
 /** 默认字体：JetBrains Mono（打进产物），回退到 Win11 自带的 Cascadia Mono。 */
@@ -24,7 +26,11 @@ export interface TerminalBundle {
   fitAddon: FitAddon;
 }
 
-export function createTerminal(theme: ITheme): TerminalBundle {
+/**
+ * `links` 接管网址链接的点击和悬停：不传就不加载链接插件。xterm 默认的处理是单击
+ * `window.open`，在 WebView2 里既不是用户的默认浏览器又容易误触，所以一律由调用方决定。
+ */
+export function createTerminal(theme: ITheme, links?: TerminalLinkHandlers): TerminalBundle {
   const terminal = new Terminal({
     fontFamily: DEFAULT_FONT_FAMILY,
     fontSize: DEFAULT_FONT_SIZE,
@@ -37,7 +43,20 @@ export function createTerminal(theme: ITheme): TerminalBundle {
 
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
-  terminal.loadAddon(new WebLinksAddon());
+  if (links) {
+    terminal.loadAddon(
+      // xterm 在鼠标抬起时激活链接，右键抬起也会来；只认左键。
+      new WebLinksAddon(
+        (event, uri) => {
+          if (event.button === 0) links.onActivate(uri);
+        },
+        {
+          hover: (_event, uri, range) => links.onHover({ uri, range }),
+          leave: () => links.onHover(null),
+        },
+      ),
+    );
+  }
 
   const unicode11 = new Unicode11Addon();
   terminal.loadAddon(unicode11);
