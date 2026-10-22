@@ -14,6 +14,11 @@
 //! - "处于终端焦点"由后端自己记住，重复的进入 / 离开直接忽略（前端的调用到达顺序不可靠）；
 //! - 进终端时记下当时的模式再切英文；恢复**成功**才清掉记录——前台不是本进程、
 //!   消息超时这类失败保留记录和"处于终端焦点"状态，等前端下一次补一次恢复；
+//! - **写完要读回来核对**：Chromium 在焦点落到不可输入的元素上时会把窗口的输入法上下文
+//!   解除关联，这时 SendMessageTimeoutW 照样有返回，但没有作用对象，写进去等于没写。
+//!   所以写完再读一次，读回的（中英文相关的）位和要写的不一致、或读回失败，都按失败处理：
+//!   恢复失败就保留记录、仍算处于终端焦点，前端等焦点进了输入框再补一次；
+//!   切英文失败就不算改过，离开时不用恢复；
 //! - **只恢复自己改过的**：进终端时本来就是英文（或者切换没成功），离开时什么都不写。
 //!   否则会把读到的"英文"主动写回去——刚启动、输入法还没激活时读到的常常就是英文，
 //!   写回去以后 AI 输入框等别的地方也被强制成了英文（用户 2026-10-21 反馈的现象）。
@@ -32,6 +37,19 @@ trait ImeControl {
 const CMODE_NATIVE: usize = 0x0001;
 #[cfg_attr(not(windows), allow(dead_code))]
 const CMODE_FULLSHAPE: usize = 0x0008;
+/// 写入后核对时只比这两位：其余位（输入法自己维护的常驻位等）可能被它顺手调整，
+/// 全位比较会把写成功了的也判成失败，进而永远不恢复。
+#[cfg_attr(not(windows), allow(dead_code))]
+const CMODE_MANAGED: usize = CMODE_NATIVE | CMODE_FULLSHAPE;
+
+/// 写转换模式并读回核对：消息没送到、读回失败、读回的受管位和写的不一致都算失败。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_verified(ime: &mut impl ImeControl, mode: usize) -> bool {
+    ime.write_mode(mode)
+        && ime
+            .read_mode()
+            .is_some_and(|actual| actual & CMODE_MANAGED == mode & CMODE_MANAGED)
+}
 
 /// 终端输入法状态：`saved` 为 `Some` 就是"处于终端焦点"，里面是进终端前的模式；
 /// `switched` 是进终端时有没有真的把中文切成英文（没切过，离开时就不用恢复）。
@@ -64,9 +82,9 @@ impl TerminalIme {
             return false;
         };
         self.saved = Some(mode);
-        let english = mode & !(CMODE_NATIVE | CMODE_FULLSHAPE);
-        // 本来就是英文就不写；切换失败也不算改过，离开时同样不用恢复
-        self.switched = english != mode && ime.write_mode(english);
+        let english = mode & !CMODE_MANAGED;
+        // 本来就是英文就不写；切换没生效（含读回核对不过）也不算改过，离开时同样不用恢复
+        self.switched = english != mode && write_verified(ime, english);
         true
     }
 
@@ -75,7 +93,7 @@ impl TerminalIme {
             return false;
         };
         // 进终端时没动过输入法：离开时也不动，保持它自然的状态
-        if !self.switched || ime.write_mode(mode) {
+        if !self.switched || write_verified(ime, mode) {
             self.saved = None;
             self.switched = false;
             false
@@ -199,9 +217,14 @@ mod tests {
     use super::*;
 
     /// 替身：`mode` 是"当前输入法状态"，`reachable` 为假时模拟前台不是本进程（读写都失败）。
+    /// `apply_writes` 为假时模拟输入法上下文没关联：写消息有返回，但模式没变。
+    /// `readback_fails` 为真时，写完紧接着的那次读取失败（模拟读回超时）。
     struct FakeIme {
         mode: usize,
         reachable: bool,
+        apply_writes: bool,
+        readback_fails: bool,
+        just_wrote: bool,
         writes: Vec<usize>,
     }
 
@@ -210,6 +233,9 @@ mod tests {
             Self {
                 mode,
                 reachable: true,
+                apply_writes: true,
+                readback_fails: false,
+                just_wrote: false,
                 writes: Vec::new(),
             }
         }
@@ -217,6 +243,9 @@ mod tests {
 
     impl ImeControl for FakeIme {
         fn read_mode(&mut self) -> Option<usize> {
+            if std::mem::take(&mut self.just_wrote) && self.readback_fails {
+                return None;
+            }
             self.reachable.then_some(self.mode)
         }
 
@@ -224,7 +253,10 @@ mod tests {
             if !self.reachable {
                 return false;
             }
-            self.mode = mode;
+            if self.apply_writes {
+                self.mode = mode;
+            }
+            self.just_wrote = true;
             self.writes.push(mode);
             true
         }
@@ -375,6 +407,91 @@ mod tests {
         assert!(state.apply(true, &mut ime));
         assert!(!state.switched);
         // 写一律失败，但因为没改过，离开照样算成功、清掉状态
+        assert!(!state.apply(false, &mut ime));
+        assert_eq!(state.saved, None);
+    }
+
+    #[test]
+    fn leave_that_does_not_take_effect_keeps_the_saved_mode_and_retries() {
+        // 离开时焦点在不可输入的元素上，输入法上下文没关联：写消息有返回但没生效。
+        // 不能当成恢复成功清掉记录，否则之后再也没人去恢复
+        let mut ime = FakeIme::new(CHINESE);
+        let mut state = TerminalIme::default();
+        state.apply(true, &mut ime);
+        assert_eq!(ime.mode, ENGLISH);
+        ime.apply_writes = false;
+        assert!(state.apply(false, &mut ime), "没生效要报仍在终端");
+        assert_eq!(state.saved, Some(CHINESE));
+        assert!(state.switched);
+        assert_eq!(ime.mode, ENGLISH);
+        // 焦点进了输入框、上下文关联好以后前端再发一次离开：这次生效
+        ime.apply_writes = true;
+        assert!(!state.apply(false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(state.saved, None);
+        assert!(!state.switched);
+    }
+
+    #[test]
+    fn leave_with_failed_readback_counts_as_failure() {
+        let mut ime = FakeIme::new(CHINESE);
+        let mut state = TerminalIme::default();
+        state.apply(true, &mut ime);
+        ime.readback_fails = true;
+        // 写进去了，但读不回来：无法确认，按失败处理，记录保留
+        assert!(state.apply(false, &mut ime));
+        assert_eq!(state.saved, Some(CHINESE));
+        assert!(state.switched);
+        ime.readback_fails = false;
+        assert!(!state.apply(false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(state.saved, None);
+    }
+
+    #[test]
+    fn enter_whose_switch_does_not_take_effect_is_not_marked_switched() {
+        let mut ime = FakeIme::new(CHINESE);
+        ime.apply_writes = false;
+        let mut state = TerminalIme::default();
+        // 进入本身算成功（已记下原模式、处于终端焦点），但没切成，离开时什么都不写
+        assert!(state.apply(true, &mut ime));
+        assert_eq!(state.saved, Some(CHINESE));
+        assert!(!state.switched);
+        ime.writes.clear();
+        assert!(!state.apply(false, &mut ime));
+        assert!(ime.writes.is_empty(), "没切过就不该写：{:?}", ime.writes);
+        assert_eq!(state.saved, None);
+    }
+
+    #[test]
+    fn enter_with_failed_readback_is_not_marked_switched() {
+        let mut ime = FakeIme::new(CHINESE);
+        ime.readback_fails = true;
+        let mut state = TerminalIme::default();
+        assert!(state.apply(true, &mut ime));
+        assert!(!state.switched);
+        ime.writes.clear();
+        assert!(!state.apply(false, &mut ime));
+        assert!(ime.writes.is_empty());
+    }
+
+    #[test]
+    fn readback_only_compares_the_managed_bits() {
+        // 输入法顺手改了别的位（比如常驻位）：受管位对得上就算写成功，不能因此永远不恢复
+        struct Tweaking(usize);
+        impl ImeControl for Tweaking {
+            fn read_mode(&mut self) -> Option<usize> {
+                Some(self.0)
+            }
+            fn write_mode(&mut self, mode: usize) -> bool {
+                self.0 = mode | 0x100;
+                true
+            }
+        }
+        let mut ime = Tweaking(CHINESE);
+        let mut state = TerminalIme::default();
+        assert!(state.apply(true, &mut ime));
+        assert!(state.switched);
         assert!(!state.apply(false, &mut ime));
         assert_eq!(state.saved, None);
     }

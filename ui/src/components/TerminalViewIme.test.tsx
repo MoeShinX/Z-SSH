@@ -80,11 +80,32 @@ const mount = () =>
   render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} onReady={() => {}} />);
 
 describe("进终端自动切到英文输入", () => {
-  it("终端获得焦点切英文，失去焦点恢复", async () => {
+  it("终端获得焦点切英文，焦点进了别的输入框才恢复", async () => {
     useSettings.setState({ terminal_ime_english: true });
     mount();
+    const ai = document.createElement("textarea");
+    document.body.appendChild(ai);
     act(() => ime.textarea?.focus());
     act(() => ime.textarea?.blur());
+    await settle();
+    // 只是失去焦点（焦点不在任何输入框里）：待恢复，不发
+    expect(ime.calls).toEqual([true]);
+    act(() => ai.focus());
+    await settle();
+    expect(ime.calls).toEqual([true, false]);
+  });
+
+  it("终端 → 按钮 → AI 输入框：到了输入框才恢复", async () => {
+    useSettings.setState({ terminal_ime_english: true });
+    mount();
+    const button = document.createElement("button");
+    const ai = document.createElement("textarea");
+    document.body.append(button, ai);
+    act(() => ime.textarea?.focus());
+    act(() => button.focus());
+    await settle();
+    expect(ime.calls).toEqual([true]);
+    act(() => ai.focus());
     await settle();
     expect(ime.calls).toEqual([true, false]);
   });
@@ -109,7 +130,7 @@ describe("进终端自动切到英文输入", () => {
     expect(ime.calls).toEqual([true, false]);
   });
 
-  it("终端 → AI 输入框 → 终端 → AI 输入框快速切换：最后发出的是恢复", async () => {
+  it("终端 → AI 输入框 → 终端 → AI 输入框快速切换：中途回终端取消待发的恢复，最后停在恢复", async () => {
     useSettings.setState({ terminal_ime_english: true });
     mount();
     const ai = document.createElement("textarea");
@@ -120,6 +141,6 @@ describe("进终端自动切到英文输入", () => {
     act(() => term.focus());
     act(() => ai.focus());
     await settle();
-    expect(ime.calls).toEqual([true, false, true, false]);
+    expect(ime.calls).toEqual([true, false]);
   });
 });
