@@ -23,12 +23,10 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 
 import {
-  onSftpConflict,
   onSftpDelete,
   onSftpEdit,
   onSftpPasteProgress,
   onSftpTransfer,
-  sftpConflictAnswer,
   sftpCreateFile,
   sftpDelete,
   sftpDeleteCancel,
@@ -50,7 +48,6 @@ import {
   sftpTransfers,
   sftpTransfersClear,
   type PasteRequest,
-  type SftpConflictPrompt,
   type SftpDeleteEvent,
   type SftpEntry,
   type SftpTransfer,
@@ -86,17 +83,24 @@ import {
 import { sftpPaste, sftpPasteCancel } from "../../api/sftp";
 import { Button } from "../ui/button";
 import {
-  SftpConflictDialog,
   SftpDeleteConfirm,
   SftpDeleteProgressDialog,
   SftpDownloadToDialog,
   SftpNameDialog,
   SftpPermissionsDialog,
-  type ConflictAnswer,
 } from "./SftpDialogs";
 import SftpContextMenu from "./SftpContextMenu";
 import SftpFilePane, { type PaneMenuRequest } from "./SftpFilePane";
-import { buildMenu, pasteReason, type MenuActionId, type MenuFeatures } from "../../state/sftpMenu";
+import {
+  buildMenu,
+  buildTransferMenu,
+  pasteReason,
+  transferCanPause,
+  transferCanRetry,
+  type MenuActionId,
+  type MenuFeatures,
+} from "../../state/sftpMenu";
+import { useSftpConflicts } from "../../state/sftpConflicts";
 import {
   canBack,
   canForward,
@@ -251,7 +255,11 @@ export default function SftpTabView({
   const toggleQueue = useCallback(() => setQueueOpen((open) => !open), []);
 
   // ---------- 对话框 ----------
-  const [conflict, setConflict] = useState<SftpConflictPrompt | null>(null);
+  // 同名文件对话框不在这里弹：窗口里唯一的 `SftpConflictHost` 统一收提问、排队弹（这个视图在
+  // 停靠面板里会被卸载，提问不能跟着丢）。这里只关心「本会话有没有提问在等」。
+  const conflictPending = useSftpConflicts((state) =>
+    state.queue.some((item) => item.sftpId === sftpId),
+  );
   const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
   const [deleteProgress, setDeleteProgress] = useState<{
     id: number;
@@ -289,11 +297,6 @@ export default function SftpTabView({
       });
     };
 
-    track(onSftpConflict((id, prompt) => {
-      if (id !== sftpId) return;
-      // 一次只显示一个（后端是按文件串行问的）。
-      setConflict(prompt);
-    }));
     track(onSftpPasteProgress((id, pasteId, doneFiles) => {
       if (id !== sftpId) return;
       if (pasteBusyRef.current?.pasteId !== pasteId) return;
@@ -489,6 +492,10 @@ export default function SftpTabView({
   // dock 的上下比例（远端占的份额）：拖动中本地覆盖，松手写回设置表。
   const storedRatio = useSettings((state) => state["layout.sftp_split_ratio"]);
   const updateSetting = useSettings((state) => state.update);
+  // 停靠面板的本地栏可以收起（所有主机共用一个开关）；独立标签页和文件窗口的双栏不受影响。
+  // 收起只是不画这一栏：本地目录、下载目标目录这些状态仍在这里，下载 / 上传照常用。
+  const dockLocalHidden = useSettings((state) => state["layout.sftp_dock_local_hidden"]) === true;
+  const showLocalPane = !(isDock && dockLocalHidden);
   const [dragRatio, setDragRatio] = useState<number | null>(null);
   const ratio = dragRatio ?? sanitizeSplitRatio(storedRatio);
   const splitRef = useRef<HTMLDivElement | null>(null);
@@ -606,22 +613,6 @@ export default function SftpTabView({
         .catch((error) => toast.error(String(error)));
     }
   }, [deleteRequest, sftpId, loadLocal, localPath]);
-
-  // ---------- 冲突的回答 ----------
-  const answerConflict = useCallback(
-    (answer: ConflictAnswer) => {
-      const prompt = conflict;
-      setConflict(null);
-      if (!prompt) return;
-      void sftpConflictAnswer(
-        prompt.conflict_id,
-        answer.action,
-        answer.applyToAll,
-        answer.renameTo,
-      ).catch((error) => toast.error(String(error)));
-    },
-    [conflict],
-  );
 
   // ---------- 内置编辑器（M3-5） ----------
   /** 被内置编辑器拒绝（不是 UTF-8、二进制、太大、换行混用）时提示原因。 */
@@ -957,6 +948,12 @@ export default function SftpTabView({
       canForward={canForward(localHistory)}
       onBack={() => stepLocal(-1)}
       onForward={() => stepLocal(1)}
+      onClosePane={
+        isDock
+          ? () => void updateSetting("layout.sftp_dock_local_hidden", true)
+          : undefined
+      }
+      closePaneTitle="关闭本地栏"
     />
   );
 
@@ -1016,11 +1013,17 @@ export default function SftpTabView({
       className={cn("flex min-h-0 flex-1 flex-col p-2", isDock ? "gap-1.5 p-1.5" : "gap-2")}
     >
       {isDock ? (
-        /* 面板：远端在上、本地在下，中间的分隔线可以拖（双击恢复平分，比例记住） */
+        /* 面板：远端在上、本地在下，中间的分隔线可以拖（双击恢复平分，比例记住）；
+           本地栏收起时只剩远端栏，占满整个高度 */
         <div ref={splitRef} className="flex min-h-0 flex-1 flex-col">
-          <div className="flex min-h-0 min-w-0" style={{ flex: `${ratio} 1 0%` }}>
+          <div
+            className="flex min-h-0 min-w-0"
+            style={{ flex: showLocalPane ? `${ratio} 1 0%` : "1 1 0%" }}
+          >
             {remoteSide}
           </div>
+          {showLocalPane && (
+          <>
           <div
             role="separator"
             aria-orientation="horizontal"
@@ -1059,6 +1062,8 @@ export default function SftpTabView({
           <div className="flex min-h-0 min-w-0" style={{ flex: `${1 - ratio} 1 0%` }}>
             {localSide}
           </div>
+          </>
+          )}
         </div>
       ) : (
         /* 双栏 */
@@ -1092,15 +1097,6 @@ export default function SftpTabView({
       )}
 
       {/* 对话框们 */}
-      {conflict && (
-        <SftpConflictDialog
-          prompt={conflict}
-          onAnswer={answerConflict}
-          onDismissAsSkip={() =>
-            answerConflict({ action: "skip", applyToAll: false })
-          }
-        />
-      )}
       {deleteRequest && (
         <SftpDeleteConfirm
           count={deleteRequest.entries.length}
@@ -1121,7 +1117,7 @@ export default function SftpTabView({
           onClose={() => setPropertiesRequest(null)}
         />
       )}
-      {pasteBusy && !conflict && (
+      {pasteBusy && !conflictPending && (
         <div
           role="status"
           data-testid="paste-busy"
@@ -1523,6 +1519,26 @@ const TransferRow = memo(function TransferRow({
         : 0;
   const active = transferIsActive(transfer);
   const [notesOpen, setNotesOpen] = useState(false);
+  // 右键菜单：项和右边的图标按钮一一对应（重试 / 暂停 / 继续 / 取消）
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
+  const menuNodes = useMemo(() => buildTransferMenu(transfer.state), [transfer.state]);
+  const runTransferAction = (id: MenuActionId) => {
+    setMenuAt(null);
+    switch (id) {
+      case "transfer-retry":
+        void sftpTransferRetry(sftpId, transfer.id);
+        break;
+      case "transfer-pause":
+        void sftpTransferPause(sftpId, transfer.id);
+        break;
+      case "transfer-resume":
+        void sftpTransferResume(sftpId, transfer.id);
+        break;
+      case "transfer-cancel":
+        void sftpTransferCancel(sftpId, transfer.id);
+        break;
+    }
+  };
 
   const stateLabel: Record<SftpTransfer["state"], string> = {
     queued: "排队中",
@@ -1530,6 +1546,7 @@ const TransferRow = memo(function TransferRow({
     running: "传输中",
     paused: "已暂停",
     waiting_reconnect: "等待重连",
+    waiting_conflict: "等待处理同名文件",
     done: "已完成",
     failed: "失败",
     cancelled: "已取消",
@@ -1537,7 +1554,25 @@ const TransferRow = memo(function TransferRow({
   };
 
   return (
-    <div className="border-b border-border/40 px-2 py-1.5 last:border-b-0">
+    <>
+    {menuAt && (
+      <SftpContextMenu
+        nodes={menuNodes}
+        x={menuAt.x}
+        y={menuAt.y}
+        onSelect={runTransferAction}
+        onClose={() => setMenuAt(null)}
+      />
+    )}
+    <div
+      className="border-b border-border/40 px-2 py-1.5 last:border-b-0"
+      data-transfer-id={transfer.id}
+      onContextMenu={(event) => {
+        // 不弹浏览器自带的菜单；已完成的行没有可做的操作，什么也不弹
+        event.preventDefault();
+        if (menuNodes.length > 0) setMenuAt({ x: event.clientX, y: event.clientY });
+      }}
+    >
       <div className="flex items-center gap-2 text-[13px]">
         <span title={DIRECTION_LABELS[transfer.direction]}>
           {transfer.direction === "upload" ? (
@@ -1584,7 +1619,7 @@ const TransferRow = memo(function TransferRow({
         )}
         <span
           className={cn(
-            "w-20 shrink-0 text-right text-xs",
+            "w-[6.75rem] shrink-0 text-right text-xs",
             transfer.state === "failed" && "text-destructive",
             transfer.state === "done" && "text-emerald-500",
           )}
@@ -1592,9 +1627,7 @@ const TransferRow = memo(function TransferRow({
           {stateLabel[transfer.state]}
         </span>
         <span className="flex w-28 shrink-0 items-center justify-end gap-1">
-          {(transfer.state === "running" ||
-            transfer.state === "queued" ||
-            transfer.state === "planning") && (
+          {transferCanPause(transfer.state) && (
             <IconBtn title="暂停" onClick={() => void sftpTransferPause(sftpId, transfer.id)}>
               <Pause size={13} />
             </IconBtn>
@@ -1604,7 +1637,7 @@ const TransferRow = memo(function TransferRow({
               <Play size={13} />
             </IconBtn>
           )}
-          {(transfer.state === "failed" || transfer.state === "cancelled") && (
+          {transferCanRetry(transfer.state) && (
             <IconBtn title="重试" onClick={() => void sftpTransferRetry(sftpId, transfer.id)}>
               <RotateCcw size={13} />
             </IconBtn>
@@ -1652,6 +1685,7 @@ const TransferRow = memo(function TransferRow({
         <p className="mt-1 break-all text-xs text-destructive">{transfer.reason}</p>
       )}
     </div>
+    </>
   );
 });
 

@@ -71,7 +71,7 @@ import {
 } from "./state/editorModel";
 import { useHostTreeWidth, useWindowWidth } from "./components/ui/resize-handle";
 import { computeDockLayout } from "./state/dockLayout";
-import { canDockOnto, carryPaths, OTHER_HOST_NOTICE } from "./state/dock";
+import { canDockOnto, carryPaths, newDockSessionDefaults, OTHER_HOST_NOTICE } from "./state/dock";
 import { useTerminalCwd } from "./state/followCwd";
 import { sessionCwd, termWrite } from "./api/session";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -149,6 +149,7 @@ import {
 } from "./api/sftp";
 import { SftpEditConflictDialog } from "./components/sftp/SftpDialogs";
 import { EditRecoveryHost } from "./components/sftp/EditRecoveryHost";
+import SftpConflictHost from "./components/sftp/SftpConflictHost";
 import { SftpEditOwnerDialog } from "./components/sftp/SftpEditOwnerDialog";
 import type { RecoveryAction } from "./components/sftp/EditRecoveryDialog";
 import { pickFolder } from "./api/dialog";
@@ -374,6 +375,7 @@ export default function App() {
   const quickGroup = useSettings((state) => state.quick_commands_group);
   const confirmMultilinePaste = useSettings((state) => state.terminal_confirm_multiline_paste);
   const updateSettingValue = useSettings((state) => state.update);
+  const sftpDockLocalHidden = useSettings((state) => state["layout.sftp_dock_local_hidden"]) === true;
   const quickCommands = useMemo(() => parseQuickCommands(quickRaw), [quickRaw]);
   const quickGroups = useMemo(() => groupsOf(quickCommands), [quickCommands]);
   const shownQuickCommands = useMemo(
@@ -1801,6 +1803,10 @@ export default function App() {
   docksRef.current = docks;
   /** 现在在用的 SFTP 会话（独立标签 + 终端旁边的文件侧栏）：恢复没上传的修改时重新上传要用。 */
   const sftpSessions = useMemo(() => collectSftpSessions(ws.tabs, docks), [ws.tabs, docks]);
+  const conflictSessionIds = useMemo(
+    () => sftpSessions.map((session) => session.sftpId).filter(Boolean),
+    [sftpSessions],
+  );
 
   // 当前是远端文件的编辑器标签：文件面板接着显示这个文件所在的主机（双击面板里的文件打开
   // 编辑器后，面板不该变成"没有主机"）。本地文件的编辑器没有主机。
@@ -1831,8 +1837,7 @@ export default function App() {
         sftpId: "",
         phase: "connecting",
         status: "连接中…",
-        paths: { local: "", remote: "" },
-        follow: true,
+        ...newDockSessionDefaults(),
       };
       docksRef.current = { ...docksRef.current, [hostId]: entry };
       setDocks(docksRef.current);
@@ -3045,6 +3050,11 @@ export default function App() {
             widthOverride={dockLayout.sftpWidth}
             reservedWidth={aiVisible ? dockLayout.aiWidth : 0}
             onClose={() => setSftpDockOpen(false)}
+            onShowLocal={
+              sftpDockLocalHidden && focusedHostId !== null && focusedDock?.phase === "ready"
+                ? () => void updateSettingValue("layout.sftp_dock_local_hidden", false)
+                : undefined
+            }
             toolbar={
               // 编辑器标签没有终端可跟，不显示这个开关
               focusedHostId !== null && focusedDock?.phase === "ready" && !activeTab?.editor ? (
@@ -3256,6 +3266,8 @@ export default function App() {
           }}
         />
       )}
+      {/* 同名文件对话框：不管文件面板在不在屏幕上，本窗口所有 SFTP 会话的提问都在这里排队弹 */}
+      <SftpConflictHost sessionIds={conflictSessionIds} />
       <EditRecoveryHost
         sessions={sftpSessions}
         load={sftpEditLeftovers}

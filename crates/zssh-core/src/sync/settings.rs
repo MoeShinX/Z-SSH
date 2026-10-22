@@ -86,6 +86,8 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("layout.aside_panel_width", SyncMode::LocalOnly),
     ("layout.sftp_panel_width", SyncMode::LocalOnly),
     ("layout.sftp_split_ratio", SyncMode::LocalOnly),
+    // 停靠文件面板里本地栏收起了没有（收起后只剩远端栏）：本机的使用习惯，不同步
+    ("layout.sftp_dock_local_hidden", SyncMode::LocalOnly),
     ("layout.host_tree_width", SyncMode::LocalOnly),
     ("layout.ai_input_height", SyncMode::LocalOnly),
     ("layout.quick_bar_height", SyncMode::LocalOnly),
@@ -1106,6 +1108,7 @@ mod tests {
             "layout.aside_panel_width",
             "layout.sftp_panel_width",
             "layout.sftp_split_ratio",
+            "layout.sftp_dock_local_hidden",
             "layout.host_tree_width",
             "layout.ai_input_height",
             "layout.quick_bar_height",

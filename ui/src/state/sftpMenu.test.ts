@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import type { SftpEntry } from "../api/sftp";
+import type { SftpEntry, SftpTransfer } from "../api/sftp";
 import {
   buildMenu,
+  buildTransferMenu,
   EDIT_MAX_BYTES,
   nextEnabledIndex,
   NOT_UTF8_REASON,
@@ -554,5 +555,37 @@ describe("键盘移动", () => {
       }),
     ).filter((node) => node.kind === "separator" || node.disabled);
     expect(nextEnabledIndex(none, -1, 1)).toBe(-1);
+  });
+});
+
+describe("传输队列一行的右键菜单", () => {
+  const labels = (state: SftpTransfer["state"]) =>
+    buildTransferMenu(state).map((node) => (node.kind === "item" ? node.label : node.kind));
+
+  it("按状态显示，和右边图标按钮出现的条件一一对应", () => {
+    expect(labels("queued")).toEqual(["暂停", "取消"]);
+    expect(labels("planning")).toEqual(["暂停", "取消"]);
+    expect(labels("running")).toEqual(["暂停", "取消"]);
+    expect(labels("paused")).toEqual(["继续", "取消"]);
+    expect(labels("waiting_reconnect")).toEqual(["取消"]);
+    // 等同名文件的回答时暂停没有意义，只能取消
+    expect(labels("waiting_conflict")).toEqual(["取消"]);
+    expect(labels("failed")).toEqual(["重试"]);
+    expect(labels("cancelled")).toEqual(["重试"]);
+    // 已跳过也能重试（重新问一次同名文件怎么处理）
+    expect(labels("skipped")).toEqual(["重试"]);
+    // 已完成什么都没有：不弹菜单
+    expect(labels("done")).toEqual([]);
+  });
+
+  it("每一项的动作名对得上，且都可用", () => {
+    const ids = (state: SftpTransfer["state"]) =>
+      buildTransferMenu(state).map((node) => (node.kind === "item" ? node.id : null));
+    expect(ids("skipped")).toEqual(["transfer-retry"]);
+    expect(ids("paused")).toEqual(["transfer-resume", "transfer-cancel"]);
+    expect(ids("running")).toEqual(["transfer-pause", "transfer-cancel"]);
+    for (const node of buildTransferMenu("failed")) {
+      expect(node.kind === "item" && node.disabled).toBe(false);
+    }
   });
 });

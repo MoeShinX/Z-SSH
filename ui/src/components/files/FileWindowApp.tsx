@@ -32,6 +32,7 @@ import {
 } from "../../state/fileWindowTabs";
 import { shouldMergeOnClose } from "../../state/closeBehavior";
 import { useSettings } from "../../stores/settings";
+import SftpConflictHost from "../sftp/SftpConflictHost";
 import SftpTabView, { type SftpPaths } from "../sftp/SftpTabView";
 import { WindowControls } from "../titlebar/TopTabs";
 import { ConfirmDialog } from "../ui/confirm-dialog";
@@ -468,6 +469,9 @@ export default function FileWindowApp() {
           </div>
         ))}
       </div>
+
+      {/* 同名文件对话框：这个窗口里所有标签的提问都在这里排队弹 */}
+      <SftpConflictHost sessionIds={tabs.map((tab) => tab.sftpId).filter(Boolean)} />
 
       {confirm && (
         <ConfirmDialog

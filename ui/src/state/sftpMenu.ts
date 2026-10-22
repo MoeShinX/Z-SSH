@@ -3,7 +3,7 @@
 //! 菜单长什么样由一个纯函数按「哪一栏、点在文件 / 文件夹 / 空白处、选了几项、剪贴板里有什么」算出来，
 //! 组件（`SftpContextMenu`）只负责画和键盘导航；每种情形都可以直接单元测试。
 
-import type { SftpEntry } from "../api/sftp";
+import type { SftpEntry, SftpTransfer } from "../api/sftp";
 
 export type MenuSide = "local" | "remote";
 
@@ -25,7 +25,12 @@ export type MenuActionId =
   | "create"
   | "permissions"
   | "refresh"
-  | "properties";
+  | "properties"
+  // 传输队列里一行的右键菜单（和这一行右边的图标按钮一一对应）
+  | "transfer-retry"
+  | "transfer-pause"
+  | "transfer-resume"
+  | "transfer-cancel";
 
 export type MenuNode =
   | {
@@ -169,6 +174,37 @@ function dirReason(
 }
 
 /** 按上下文算出完整菜单。 */
+/**
+ * 传输队列里一行的右键菜单：按任务状态显示，和这一行右边的图标按钮出现的条件一致——
+ * 重试（失败 / 已取消 / 已跳过）、暂停（排队 / 准备 / 传输中）、继续（已暂停）、取消（没结束的）。
+ * 没有可做的操作（已完成）返回空数组，界面就不弹菜单。
+ */
+export function buildTransferMenu(state: SftpTransfer["state"]): MenuNode[] {
+  const nodes: MenuNode[] = [];
+  const add = (id: MenuActionId, label: string) =>
+    nodes.push({ kind: "item", id, label, disabled: false });
+  if (transferCanRetry(state)) add("transfer-retry", "重试");
+  if (transferCanPause(state)) add("transfer-pause", "暂停");
+  if (state === "paused") add("transfer-resume", "继续");
+  if (transferIsLive(state)) add("transfer-cancel", "取消");
+  return nodes;
+}
+
+/** 能重试：失败、已取消、已跳过（跳过的会重新问一次同名文件怎么处理）。 */
+export function transferCanRetry(state: SftpTransfer["state"]): boolean {
+  return state === "failed" || state === "cancelled" || state === "skipped";
+}
+
+/** 能暂停：排队、准备、传输中（等同名文件的回答、等重连时暂停没有意义）。 */
+export function transferCanPause(state: SftpTransfer["state"]): boolean {
+  return state === "running" || state === "queued" || state === "planning";
+}
+
+/** 没结束（能取消）。 */
+export function transferIsLive(state: SftpTransfer["state"]): boolean {
+  return !["done", "failed", "cancelled", "skipped"].includes(state);
+}
+
 export function buildMenu(context: MenuContext): MenuNode[] {
   const { side, entries, features } = context;
   const blank = context.target === "blank";

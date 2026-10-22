@@ -76,6 +76,9 @@ pub enum TransferState {
     Paused,
     /// 断线了，等重连之后自动接着传。
     WaitingReconnect,
+    /// 目标已存在，正在等用户回答怎么处理（界面上显示「等待处理同名文件」，而不是一直
+    /// 「准备中」让人以为卡住了）。回答之后回到 `Running`；超时 / 关掉按跳过。
+    WaitingConflict,
     /// 传完了。
     Done,
     /// 失败（带原因）。
@@ -382,14 +385,15 @@ impl TransferEngine {
     /// 重试一个失败的任务（M3-2 第 1 节的"重试"命令）。
     ///
     /// 同一个任务号重跑：进度归零、重新展开；上次失败留下的 `.zssh-part` 先做尾部
-    /// 对账，对得上的接着传，对不上的从头传。只有失败 / 取消的任务能重试。
+    /// 对账，对得上的接着传，对不上的从头传。失败 / 取消 / 跳过的任务能重试；
+    /// 跳过的任务重试时会重新问一次同名文件怎么处理（上次记住的选择已清掉）。
     pub fn retry(&self, id: TransferId) -> bool {
         let Some(state) = self.job(id) else {
             return false;
         };
         if !matches!(
             self.state_of(&state),
-            TransferState::Failed(_) | TransferState::Cancelled
+            TransferState::Failed(_) | TransferState::Cancelled | TransferState::Skipped
         ) {
             return false;
         }
@@ -507,6 +511,9 @@ impl TransferEngine {
         }
 
         self.set_state(&state, TransferState::Running);
+        // 状态变成传输中要马上告诉界面：不然在第一条进度到来之前（含等同名文件的回答）
+        // 界面一直停在「准备中」。
+        self.emit(&state, true);
         let mut failed: Option<SftpError> = None;
         let mut completed_files = 0u64;
         let mut skipped_files = 0u64;
@@ -960,7 +967,11 @@ impl TransferEngine {
                 rename_to: None,
             },
             None => {
-                self.resolver
+                // 等用户回答期间让界面看得出是在等人（回答最长等 2 分钟，不能显示成「准备中」）。
+                self.set_state(state, TransferState::WaitingConflict);
+                self.emit(state, true);
+                let decision = self
+                    .resolver
                     .decide(ConflictInfo {
                         job: state.id,
                         direction: state.job.direction,
@@ -972,7 +983,10 @@ impl TransferEngine {
                         target_mtime,
                         can_resume,
                     })
-                    .await
+                    .await;
+                self.set_state(state, TransferState::Running);
+                self.emit(state, true);
+                decision
             }
         };
         if decision.apply_to_all {

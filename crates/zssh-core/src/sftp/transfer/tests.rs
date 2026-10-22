@@ -1599,3 +1599,203 @@ async fn pause_after_choosing_rename_keeps_writing_to_the_new_name() {
         vec![3u8; 64 * 1024]
     );
 }
+
+/// 可以随时改答案的冲突回答者：记下被问过几次。
+struct ScriptedResolver {
+    action: Mutex<ConflictAction>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedResolver {
+    fn new(action: ConflictAction) -> Arc<Self> {
+        Arc::new(Self {
+            action: Mutex::new(action),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn answer_with(&self, action: ConflictAction) {
+        *self.action.lock().unwrap() = action;
+    }
+
+    fn times_asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ConflictResolver for ScriptedResolver {
+    fn decide<'a>(&'a self, _info: ConflictInfo) -> BoxFuture<'a, ConflictDecision> {
+        Box::pin(async move {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ConflictDecision {
+                action: *self.action.lock().unwrap(),
+                apply_to_all: false,
+                rename_to: None,
+            }
+        })
+    }
+}
+
+/// 提问时停住、等测试放行的冲突回答者。
+#[derive(Default)]
+struct GatedResolver {
+    asked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    action: Mutex<Option<ConflictAction>>,
+}
+
+impl ConflictResolver for GatedResolver {
+    fn decide<'a>(&'a self, _info: ConflictInfo) -> BoxFuture<'a, ConflictDecision> {
+        Box::pin(async move {
+            self.asked.notify_waiters();
+            self.release.notified().await;
+            ConflictDecision {
+                action: self.action.lock().unwrap().unwrap_or(ConflictAction::Skip),
+                apply_to_all: false,
+                rename_to: None,
+            }
+        })
+    }
+}
+
+/// SFTP-6：「已跳过」的任务也能重试，重试时重新问一次同名文件怎么处理，这次选覆盖就传过去。
+#[tokio::test]
+async fn a_skipped_job_can_be_retried_and_asks_about_the_conflict_again() {
+    let root = temp_root("retry-skipped");
+    let source = root.join("again.txt");
+    std::fs::write(&source, b"new contents").unwrap();
+
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/again.txt", b"old".to_vec());
+    let resolver = ScriptedResolver::new(ConflictAction::Skip);
+    let (engine, mut events) = TransferEngine::new(
+        endpoints.clone(),
+        Arc::clone(&resolver) as Arc<dyn ConflictResolver>,
+        local_options(),
+    );
+    let id = engine.submit(TransferJob {
+        direction: Direction::Upload,
+        source: source.display().to_string(),
+        target: "/remote/again.txt".to_owned(),
+        recursive: false,
+        peer: None,
+    });
+    let report = drain_until_finished(&mut events, id, Duration::from_secs(20)).await;
+    assert_eq!(report.state, TransferState::Skipped, "{report:?}");
+    assert_eq!(endpoints.remote_contents("/remote/again.txt"), b"old");
+    assert_eq!(resolver.times_asked(), 1);
+
+    resolver.answer_with(ConflictAction::Overwrite);
+    assert!(engine.retry(id), "已跳过的任务要能重试");
+    let report = drain_until_finished(&mut events, id, Duration::from_secs(20)).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(
+        resolver.times_asked(),
+        2,
+        "重试要重新问，不能沿用上次跳过的选择"
+    );
+    assert_eq!(
+        endpoints.remote_contents("/remote/again.txt"),
+        b"new contents"
+    );
+    // 做完的任务照旧不能重试。
+    assert!(!engine.retry(id));
+}
+
+/// 等用户回答同名文件期间：任务状态是「等待处理同名文件」（不是一直「准备中」），
+/// 回答之后回到传输中并正常结束；状态要发事件，界面才看得到。
+#[tokio::test]
+async fn waiting_for_the_conflict_answer_is_a_visible_state() {
+    let root = temp_root("waiting-conflict");
+    let source = root.join("w.txt");
+    std::fs::write(&source, b"fresh").unwrap();
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/w.txt", b"stale data".to_vec());
+    let resolver = Arc::new(GatedResolver::default());
+    *resolver.action.lock().unwrap() = Some(ConflictAction::Overwrite);
+    let (engine, mut events) = TransferEngine::new(
+        endpoints.clone(),
+        Arc::clone(&resolver) as Arc<dyn ConflictResolver>,
+        local_options(),
+    );
+    let asked = resolver.asked.notified();
+    tokio::pin!(asked);
+    asked.as_mut().enable();
+    let id = engine.submit(TransferJob {
+        direction: Direction::Upload,
+        source: source.display().to_string(),
+        target: "/remote/w.txt".to_owned(),
+        recursive: false,
+        peer: None,
+    });
+    tokio::time::timeout(Duration::from_secs(20), asked)
+        .await
+        .expect("没等到冲突提问");
+
+    // 提问期间：快照和事件里都是「等待处理同名文件」，最后一条事件不能还是「准备中」。
+    assert_eq!(engine.state(id), Some(TransferState::WaitingConflict));
+    let mut states = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let TransferEvent::Progress(report) = event {
+            states.push(report.state);
+        }
+    }
+    assert_eq!(
+        states.last(),
+        Some(&TransferState::WaitingConflict),
+        "最后一条事件要说明在等回答：{states:?}"
+    );
+
+    resolver.release.notify_waiters();
+    let report = drain_until_finished(&mut events, id, Duration::from_secs(20)).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(endpoints.remote_contents("/remote/w.txt"), b"fresh");
+}
+
+/// SFTP-6 排查：一个任务停在「等同名文件的回答」时，目标的写锁一直被它占着（回答最长等
+/// 2 分钟）。这时对同一个目标再传一次会立刻失败（另一个任务正在写）——用户看到的
+/// 「有时是失败」就是这样来的，根因是前面那条提问没人回答。
+#[tokio::test]
+async fn a_second_upload_fails_while_the_first_still_waits_for_the_conflict_answer() {
+    let root = temp_root("busy-while-asking");
+    let source = root.join("busy.txt");
+    std::fs::write(&source, b"data").unwrap();
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/busy.txt", b"old".to_vec());
+    let resolver = Arc::new(GatedResolver::default());
+    let (engine, mut events) = TransferEngine::new(
+        endpoints.clone(),
+        Arc::clone(&resolver) as Arc<dyn ConflictResolver>,
+        local_options(),
+    );
+    let asked = resolver.asked.notified();
+    tokio::pin!(asked);
+    asked.as_mut().enable();
+    let first = engine.submit(TransferJob {
+        direction: Direction::Upload,
+        source: source.display().to_string(),
+        target: "/remote/busy.txt".to_owned(),
+        recursive: false,
+        peer: None,
+    });
+    tokio::time::timeout(Duration::from_secs(20), asked)
+        .await
+        .expect("没等到冲突提问");
+
+    let second = engine.submit(TransferJob {
+        direction: Direction::Upload,
+        source: source.display().to_string(),
+        target: "/remote/busy.txt".to_owned(),
+        recursive: false,
+        peer: None,
+    });
+    let report = drain_until_finished(&mut events, second, Duration::from_secs(20)).await;
+    let TransferState::Failed(message) = &report.state else {
+        panic!("第二次上传应该因为目标被占用而失败：{report:?}");
+    };
+    assert!(message.contains("正在写"), "{message}");
+
+    resolver.release.notify_waiters();
+    let report = drain_until_finished(&mut events, first, Duration::from_secs(20)).await;
+    assert_eq!(report.state, TransferState::Skipped, "{report:?}");
+}

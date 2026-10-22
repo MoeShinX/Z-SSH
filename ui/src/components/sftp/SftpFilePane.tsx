@@ -19,6 +19,7 @@ import {
   HardDrive,
   RefreshCw,
   Search,
+  X,
 } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
@@ -111,6 +112,9 @@ export interface SftpFilePaneProps {
   canForward?: boolean;
   onBack?: () => void;
   onForward?: () => void;
+  /** 工具条最右边的 ×（收起这一栏）。只有停靠面板的本地栏会传。 */
+  onClosePane?: () => void;
+  closePaneTitle?: string;
 }
 
 export type ColumnId = "name" | "size" | "mtime" | "kind" | "perms" | "owner";
@@ -207,6 +211,8 @@ export default function SftpFilePane({
   canForward = false,
   onBack,
   onForward,
+  onClosePane,
+  closePaneTitle,
 }: SftpFilePaneProps) {
   const isRemote = side === "remote";
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -684,6 +690,16 @@ export default function SftpFilePane({
             )}
           />
         </div>
+        {onClosePane && (
+          <button
+            title={closePaneTitle ?? "关闭"}
+            data-action="close-pane"
+            onClick={onClosePane}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          >
+            <X size={13} />
+          </button>
+        )}
       </div>
 
       {/* 列头（排序按钮）：和数据行用同一份列宽，左右边界一一对齐 */}

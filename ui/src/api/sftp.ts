@@ -44,6 +44,8 @@ export interface SftpTransfer {
     | "running"
     | "paused"
     | "waiting_reconnect"
+    /** 目标已存在，在等用户回答怎么处理（冲突对话框还没回答）。 */
+    | "waiting_conflict"
     | "done"
     | "failed"
     | "cancelled"

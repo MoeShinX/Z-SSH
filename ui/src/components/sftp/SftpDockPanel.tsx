@@ -4,7 +4,7 @@
 //! 内容是 `SftpTabView` 的 dock 模式（远端在上、本地在下）。这一层只管宽度和标题栏，
 //! 会话（sftpId）由 App 按"当前焦点 pane 的主机"准备好再传进来。
 
-import { ExternalLink, FolderTree, X } from "lucide-react";
+import { ExternalLink, FolderTree, Monitor, X } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { cn } from "../../lib/utils";
@@ -21,6 +21,8 @@ interface SftpDockPanelProps {
   /** "在新标签中打开"：变回独立的双栏标签（保留两栏目录）。没有会话时不给。 */
   onOpenInTab?: () => void;
   onClose: () => void;
+  /** 本地栏收起时给：标题栏多一个「本地」按钮，点了把本地栏请回来。 */
+  onShowLocal?: () => void;
   /** 标题栏下面的一行额外控件（跟随终端目录的开关）。 */
   toolbar?: ReactNode;
   children: ReactNode;
@@ -32,6 +34,7 @@ export default function SftpDockPanel({
   reservedWidth,
   onOpenInTab,
   onClose,
+  onShowLocal,
   toolbar,
   children,
 }: SftpDockPanelProps) {
@@ -68,6 +71,17 @@ export default function SftpDockPanel({
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
+          {onShowLocal && (
+            <button
+              onClick={onShowLocal}
+              title="显示本地栏"
+              data-action="sftp-show-local"
+              className="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <Monitor size={14} />
+              本地
+            </button>
+          )}
           {onOpenInTab && (
             <button
               onClick={onOpenInTab}

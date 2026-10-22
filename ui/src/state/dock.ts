@@ -42,6 +42,14 @@ export function canDockOnto(
 
 export const OTHER_HOST_NOTICE = "这个 SFTP 连的是另一台主机";
 
+/**
+ * 新开一台主机的停靠会话时的初始状态。「跟随终端目录」默认**关**：开着的话终端里一 cd，
+ * 远端栏就被拉走，用户在面板里正看着的目录会突然换掉；要跟随由用户自己勾上。
+ */
+export function newDockSessionDefaults(): { paths: SftpPaths; follow: boolean } {
+  return { paths: { local: "", remote: "" }, follow: false };
+}
+
 /** 停靠时两栏目录原样带走；没记过的用空串（面板按默认目录开）。 */
 export function carryPaths(known: SftpPaths | undefined): SftpPaths {
   return { local: known?.local ?? "", remote: known?.remote ?? "" };

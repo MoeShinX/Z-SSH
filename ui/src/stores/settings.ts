@@ -89,6 +89,8 @@ export const SETTING_DEFAULTS = {
   // SFTP 停靠面板（M3-3）：宽度和上下两栏的比例，同样是本机布局、不同步
   "layout.sftp_panel_width": 420,
   "layout.sftp_split_ratio": 0.5,
+  // 停靠面板里的本地栏收起了没有（收起后只剩远端栏，所有主机的面板共用），同样不同步
+  "layout.sftp_dock_local_hidden": false,
   // 主机树侧栏的宽度（UI-5，拖右边缘调，默认 224），同样是本机布局、不同步
   "layout.host_tree_width": 224,
   // AI 面板输入框的高度（拖输入框上沿调），同样是本机布局、不同步
@@ -161,6 +163,7 @@ export interface SettingValues {
   "layout.aside_panel_width": number;
   "layout.sftp_panel_width": number;
   "layout.sftp_split_ratio": number;
+  "layout.sftp_dock_local_hidden": boolean;
   "layout.host_tree_width": number;
   "layout.ai_input_height": number;
   "layout.quick_bar_height": number;

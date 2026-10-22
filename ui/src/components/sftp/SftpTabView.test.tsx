@@ -21,7 +21,7 @@ const base: SftpTransfer = {
 
 describe("队列各状态的显示", () => {
   it("活跃（未完成）：排队、准备、传输中、暂停、等待重连都算", () => {
-    for (const state of ["queued", "planning", "running", "paused", "waiting_reconnect"] as const) {
+    for (const state of ["queued", "planning", "running", "paused", "waiting_reconnect", "waiting_conflict"] as const) {
       expect(transferIsActive({ ...base, state })).toBe(true);
     }
   });

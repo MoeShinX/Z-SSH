@@ -2,7 +2,7 @@
 //! SFTP 的四个对话框：冲突、修改权限、新建/重命名、删除确认（M3-2 第 4 节）。
 
 import { pickFolder } from "../../api/dialog";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { SftpConflictPrompt, SftpEditEvent } from "../../api/sftp";
 import {
@@ -46,13 +46,14 @@ export function isCopyConflict(prompt: Pick<SftpConflictPrompt, "direction">): b
   return prompt.direction === "remote_copy" || prompt.direction === "local_copy";
 }
 
-/** 默认选中的动作：复制粘贴默认「重命名」（建议名「名字 - 副本」，不会弄丢任何一份）；
- *  传输能续传先建议续传（最省流量），不然覆盖。 */
+/** 默认选中的动作：复制粘贴默认「重命名」（建议名「名字 - 副本」，不会弄丢任何一份——
+ *  默认覆盖会把源文件自己盖掉）；上传 / 下载一律默认「覆盖」，不管能不能续传（直接按回车
+ *  就是覆盖）。「续传」仍可手动选，能不能选由 `conflictResumeEnabled` 决定。 */
 export function conflictDefaultAction(
   prompt: Pick<SftpConflictPrompt, "can_resume"> & Partial<Pick<SftpConflictPrompt, "direction">>,
 ): ConflictAnswer["action"] {
   if (prompt.direction && isCopyConflict({ direction: prompt.direction })) return "rename";
-  return prompt.can_resume ? "resume" : "overwrite";
+  return "overwrite";
 }
 
 interface ConflictDialogProps {
@@ -68,6 +69,7 @@ export function SftpConflictDialog({ prompt, onAnswer, onDismissAsSkip }: Confli
   const [action, setAction] = useState<ConflictAnswer["action"]>(conflictDefaultAction(prompt));
   const [applyToAll, setApplyToAll] = useState(false);
   const [renameTo, setRenameTo] = useState(prompt.suggested_name);
+  const confirmRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     setAction(conflictDefaultAction(prompt));
@@ -95,7 +97,14 @@ export function SftpConflictDialog({ prompt, onAnswer, onDismissAsSkip }: Confli
         if (!open) onDismissAsSkip();
       }}
     >
-      <DialogContent className="sm:max-w-[560px]">
+      <DialogContent
+        className="sm:max-w-[560px]"
+        // 打开时焦点落在「确定」上：直接按回车就是接受当前选中的动作（默认覆盖）
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          confirmRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle>目标已存在</DialogTitle>
           <DialogDescription className="break-all">
@@ -190,7 +199,11 @@ export function SftpConflictDialog({ prompt, onAnswer, onDismissAsSkip }: Confli
           <Button variant="outline" onClick={onDismissAsSkip}>
             取消（按跳过）
           </Button>
-          <Button onClick={confirm} disabled={action === "rename" && !nameCheck.ok}>
+          <Button
+            ref={confirmRef}
+            onClick={confirm}
+            disabled={action === "rename" && !nameCheck.ok}
+          >
             确定
           </Button>
         </DialogFooter>

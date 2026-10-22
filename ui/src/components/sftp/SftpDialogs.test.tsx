@@ -32,15 +32,18 @@ describe("冲突对话框的选项逻辑", () => {
     expect(conflictResumeEnabled({ can_resume: false })).toBe(false);
   });
 
-  it("默认动作：能续传建议续传，不然覆盖", () => {
-    expect(conflictDefaultAction({ can_resume: true })).toBe("resume");
+  it("默认动作：上传 / 下载一律覆盖，能续传也一样（续传仍可手动选）", () => {
+    expect(conflictDefaultAction({ can_resume: true })).toBe("overwrite");
     expect(conflictDefaultAction({ can_resume: false })).toBe("overwrite");
+    expect(conflictDefaultAction({ can_resume: true, direction: "upload" })).toBe("overwrite");
+    expect(conflictDefaultAction({ can_resume: true, direction: "download" })).toBe("overwrite");
   });
 
   it("复制粘贴的冲突：默认「重命名」，没有续传，文案说复制不说传", async () => {
     expect(conflictDefaultAction({ can_resume: false, direction: "remote_copy" })).toBe("rename");
     expect(conflictDefaultAction({ can_resume: false, direction: "local_copy" })).toBe("rename");
     expect(conflictDefaultAction({ can_resume: false, direction: "upload" })).toBe("overwrite");
+    expect(conflictDefaultAction({ can_resume: true, direction: "remote_copy" })).toBe("rename");
     expect(isCopyConflict({ direction: "remote_copy" })).toBe(true);
     expect(isCopyConflict({ direction: "download" })).toBe(false);
 

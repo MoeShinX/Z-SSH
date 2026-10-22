@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { canDockOnto, carryPaths, hostsInTab } from "./dock";
+import { canDockOnto, carryPaths, hostsInTab, newDockSessionDefaults } from "./dock";
 import { emptyPane, type PaneSession, type Tab } from "./sessions";
 import { splitPane } from "./splitTree";
 
@@ -67,5 +67,20 @@ describe("carryPaths", () => {
       remote: "/srv/app",
     });
     expect(carryPaths(undefined)).toEqual({ local: "", remote: "" });
+  });
+});
+
+describe("newDockSessionDefaults", () => {
+  it("新开的停靠会话默认不跟随终端目录（要用户自己勾上），两栏目录用默认", () => {
+    expect(newDockSessionDefaults()).toEqual({
+      paths: { local: "", remote: "" },
+      follow: false,
+    });
+  });
+
+  it("每次给的是新对象，改一个不影响别的会话", () => {
+    const first = newDockSessionDefaults();
+    first.paths.remote = "/srv";
+    expect(newDockSessionDefaults().paths.remote).toBe("");
   });
 });

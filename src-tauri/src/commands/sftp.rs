@@ -128,7 +128,7 @@ pub struct TransferDto {
     pub id: u64,
     /// upload / download
     pub direction: &'static str,
-    /// queued / planning / running / paused / waiting_reconnect / done / failed / cancelled / skipped
+    /// queued / planning / running / paused / waiting_reconnect / waiting_conflict / done / failed / cancelled / skipped
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -180,6 +180,7 @@ fn state_str(state: &TransferState) -> (&'static str, Option<String>) {
         TransferState::Running => ("running", None),
         TransferState::Paused => ("paused", None),
         TransferState::WaitingReconnect => ("waiting_reconnect", None),
+        TransferState::WaitingConflict => ("waiting_conflict", None),
         TransferState::Done => ("done", None),
         TransferState::Failed(reason) => ("failed", Some(reason.clone())),
         TransferState::Cancelled => ("cancelled", None),
@@ -1247,7 +1248,9 @@ pub async fn sftp_transfer_retry(sftp_id: String, id: u64, app: AppHandle) -> Re
     if tab.engine.retry(id) {
         Ok(())
     } else {
-        Err(format!("重试失败：任务 {id} 不存在或者没失败"))
+        Err(format!(
+            "重试失败：任务 {id} 不存在，或者不是失败 / 已取消 / 已跳过"
+        ))
     }
 }
 
