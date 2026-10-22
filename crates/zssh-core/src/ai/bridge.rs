@@ -2056,6 +2056,82 @@ root password: hunter2" }),
         assert_eq!(entries[1].decision, ExecDecision::Denied);
     }
 
+    /// AUDIT-2 A01：完整执行链。ReadOnly 模式 + 一律拒绝的审批替身：写操作的写法
+    /// （长选项缩写、短选项带值、子命令缩写……）一条都不能走到执行宿主，只读写法照常执行。
+    #[tokio::test]
+    async fn readonly_mode_never_executes_write_forms_without_approval() {
+        let h = harness(ExecMode::ReadOnly, ApproverBehavior::Deny, short_wait()).await;
+        let scope = h.bridge.create_scope();
+        scope.add_target("s1", "web-1", "root", "connected", true, false);
+        let mut client =
+            Client::authenticated(h.port, h.bridge.connection_token(), scope.capability()).await;
+
+        let mut id = 0;
+        let write_forms = [
+            "sort --output=out.txt input.txt",
+            "sort --out=out.txt input.txt",
+            "date -s2020-01-01",
+            "hostname --file=/tmp/name",
+            "ip l s dev eth0 down",
+            "dmesg --read-clear",
+            "journalctl --rot",
+            "systemctl -p show restart nginx",
+            "docker --config ps rm -f web",
+            "echo x >/dev/null.audit",
+        ];
+        for command in write_forms {
+            id += 1;
+            let response = client
+                .request(
+                    id,
+                    METHOD_RUN_COMMAND,
+                    json!({ "target_id": "s1", "command": command }),
+                )
+                .await;
+            assert!(
+                error_of(&response).contains("用户拒绝"),
+                "{command}: {response}"
+            );
+            assert_eq!(
+                h.host.last_exec(),
+                None,
+                "写操作不该走到执行宿主：{command}"
+            );
+        }
+        assert_eq!(
+            h.approver.calls(),
+            write_forms.len(),
+            "每条写操作都要问审批"
+        );
+
+        let read_forms = [
+            "sort -k2 file",
+            "sort -t, -k2 file",
+            "date",
+            "date +%F",
+            "date -u",
+            "hostname",
+            "hostname -I",
+            "ip a",
+            "ip addr show",
+            "ip route",
+            "ip -br link",
+        ];
+        for command in read_forms {
+            id += 1;
+            let response = client
+                .request(
+                    id,
+                    METHOD_RUN_COMMAND,
+                    json!({ "target_id": "s1", "command": command }),
+                )
+                .await;
+            assert_eq!(result_of(&response)["exit_code"], 0, "{command}");
+            assert_eq!(h.host.last_exec().unwrap().1, command, "只读命令照常执行");
+        }
+        assert_eq!(h.approver.calls(), write_forms.len(), "只读命令不问审批");
+    }
+
     #[tokio::test]
     async fn auto_mode_runs_dangerous_commands_without_approval() {
         let h = harness(ExecMode::Auto, ApproverBehavior::Deny, short_wait()).await;

@@ -2,7 +2,7 @@
 //! 保存走后端共享的编辑流程（冲突检测、临时文件加改名、属主、恢复记录），这里只管界面。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Compartment, EditorState, type Extension } from "@codemirror/state";
+import { Annotation, Compartment, EditorState, type Extension } from "@codemirror/state";
 import {
   EditorView,
   drawSelection,
@@ -38,6 +38,12 @@ import { loadLanguage } from "./loadLanguage";
 /** 草稿写盘的间隔：有未保存修改时每隔几秒写一次，崩溃后下次启动能找回。 */
 export const DRAFT_INTERVAL_MS = 4000;
 
+/**
+ * 标记"重新载入把整份文本换掉"这类程序化改动：它不是用户输入，不算未保存修改、不动内容版本
+ * （版本和未保存标记由 store 在同一次状态变化里定好），重新载入期间的只读也不拦它。
+ */
+const programmaticReplace = Annotation.define<boolean>();
+
 interface Props {
   editId: number;
   active: boolean;
@@ -55,6 +61,7 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
   const languageCompartment = useRef(new Compartment());
   const themeCompartment = useRef(new Compartment());
   const fontCompartment = useRef(new Compartment());
+  const lockCompartment = useRef(new Compartment());
   const [wrap, setWrap] = useState(false);
   const [cursor, setCursor] = useState({ line: 1, column: 1, selected: 0 });
   /** 本地文件保存冲突：弹对话框（重新载入 / 覆盖 / 另存为 / 取消）。 */
@@ -86,7 +93,8 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
     const current = useEditors.getState().docs[editId];
     if (!current || !hostRef.current) return;
     const updateListener = EditorView.updateListener.of((update) => {
-      if (update.docChanged) {
+      const programmatic = update.transactions.some((tr) => tr.annotation(programmaticReplace));
+      if (update.docChanged && !programmatic) {
         // 内容版本单调递增：草稿和保存请求都带着它，保存成功后只删版本不晚于它的草稿。
         const current = useEditors.getState().docs[editId];
         useEditors.getState().patch(editId, {
@@ -132,6 +140,16 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
           indentWithTab,
           ...defaultKeymap,
         ]),
+        // 重新载入期间挡住所有用户改动（输入、粘贴、拖放、输入法、撤销重做）：直接看 store，
+        // 不等界面刷新，所以点下"重新载入"的同一刻就生效。
+        EditorState.transactionFilter.of((tr) =>
+          tr.docChanged &&
+          !tr.annotation(programmaticReplace) &&
+          useEditors.getState().docs[editId]?.reloading
+            ? []
+            : tr,
+        ),
+        lockCompartment.current.of([]),
         updateListener,
         wrapCompartment.current.of([]),
         languageCompartment.current.of([]),
@@ -158,11 +176,22 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
     const current = useEditors.getState().docs[editId];
     if (!view || !current || revision === lastRevision.current) return;
     lastRevision.current = revision;
+    // 版本和未保存标记已经在 store 里随结果一起定好了，这里只换文本，不再单独改它们。
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: current.initialText },
+      annotations: programmaticReplace.of(true),
     });
-    useEditors.getState().patch(editId, { dirty: false });
   }, [editId, revision]);
+
+  // 重新载入期间编辑器只读（光标、选择、复制仍可用），载入完成或失败后恢复。
+  const reloading = doc?.reloading ?? false;
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: lockCompartment.current.reconfigure(
+        reloading ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : [],
+      ),
+    });
+  }, [reloading, editId]);
 
   // 语言：按文件名，认不出再看第一行的 shebang。
   useEffect(() => {
@@ -321,7 +350,7 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
           <button
             type="button"
             data-action="editor-save"
-            disabled={doc.saving}
+            disabled={doc.saving || doc.reloading}
             onClick={() => saveRef.current()}
             className="rounded bg-primary px-2 py-0.5 text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
@@ -346,7 +375,14 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
         {segments.map((segment, index) => (
           <span key={index}>{segment}</span>
         ))}
-        {doc.dirty && <span className="ml-auto text-amber-400">未保存</span>}
+        {doc.reloading && (
+          <span data-testid="editor-reloading" className="ml-auto text-muted-foreground">
+            正在重新载入…
+          </span>
+        )}
+        {doc.dirty && (
+          <span className={cn("text-amber-400", !doc.reloading && "ml-auto")}>未保存</span>
+        )}
       </div>
       {localConflict && (
         <LocalConflictDialog

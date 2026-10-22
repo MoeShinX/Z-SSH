@@ -23,6 +23,7 @@ import {
   markReloadFailed,
   openLocalInEditor,
   openRemoteInEditor,
+  RELOAD_KEPT_MESSAGE,
   reloadDoc,
   saveDoc,
   saveLocalAsDoc,
@@ -412,5 +413,106 @@ describe("草稿去重（同一版本成功写过就不再写）", () => {
     useEditors.getState().patch(1, { dirty: true });
     expect(await flushDraft(1)).toBe("skipped");
     expect(api.editorDraft).not.toHaveBeenCalled();
+  });
+});
+
+describe("重新载入的并发与版本保险（AUDIT-2 A04）", () => {
+  const reloaded = { text: "disk\n", bom: false, eol: "LF" as const };
+
+  async function openWithEdit() {
+    vi.mocked(api.editorOpen).mockResolvedValue(info());
+    await openRemoteInEditor("s1", "/etc/a.conf", 7);
+    useEditors.getState().patch(1, { dirty: true, version: 3, getText: () => "mine\n" });
+  }
+
+  it("载入期间标成 reloading，成功后一次状态变化：新文本、版本 +1、dirty=false、reloading=false", async () => {
+    await openWithEdit();
+    let resolve!: (value: typeof reloaded) => void;
+    vi.mocked(api.editorReload).mockImplementation(
+      () => new Promise((res) => (resolve = res)),
+    );
+    const pending = reloadDoc(1);
+    expect(useEditors.getState().docs[1].reloading).toBe(true);
+    resolve(reloaded);
+    await expect(pending).resolves.toBe("reloaded");
+    expect(useEditors.getState().docs[1]).toMatchObject({
+      initialText: "disk\n",
+      revision: 1,
+      version: 4,
+      dirty: false,
+      reloading: false,
+    });
+  });
+
+  it("发起时记下版本：回来时版本变了就不覆盖，保留 dirty 并挂上提示", async () => {
+    await openWithEdit();
+    let resolve!: (value: typeof reloaded) => void;
+    vi.mocked(api.editorReload).mockImplementation(
+      () => new Promise((res) => (resolve = res)),
+    );
+    const pending = reloadDoc(1);
+    useEditors.getState().patch(1, { version: 4 });
+    resolve(reloaded);
+    await expect(pending).resolves.toBe("kept");
+    expect(useEditors.getState().docs[1]).toMatchObject({
+      initialText: "hello\n",
+      revision: 0,
+      version: 4,
+      dirty: true,
+      reloading: false,
+      error: RELOAD_KEPT_MESSAGE,
+    });
+  });
+
+  it("载入失败：错误抛出，原文和 dirty 保留，reloading 恢复", async () => {
+    await openWithEdit();
+    vi.mocked(api.editorReload).mockRejectedValue({ code: "io", message: "读不了" });
+    await expect(reloadDoc(1)).rejects.toMatchObject({ message: "读不了" });
+    expect(useEditors.getState().docs[1]).toMatchObject({
+      initialText: "hello\n",
+      dirty: true,
+      version: 3,
+      reloading: false,
+    });
+  });
+
+  it("载入期间保存被拒绝，不调后端", async () => {
+    await openWithEdit();
+    let resolve!: (value: typeof reloaded) => void;
+    vi.mocked(api.editorReload).mockImplementation(
+      () => new Promise((res) => (resolve = res)),
+    );
+    const pending = reloadDoc(1);
+    const result = await saveDoc(1, "s1");
+    expect(result.state).toBe("failed");
+    expect(api.editorSave).not.toHaveBeenCalled();
+    resolve(reloaded);
+    await pending;
+  });
+
+  it("同一个文档同时只发一次重新载入，后来的调用共用结果", async () => {
+    await openWithEdit();
+    let resolve!: (value: typeof reloaded) => void;
+    vi.mocked(api.editorReload).mockImplementation(
+      () => new Promise((res) => (resolve = res)),
+    );
+    const first = reloadDoc(1);
+    const second = reloadDoc(1);
+    expect(api.editorReload).toHaveBeenCalledTimes(1);
+    resolve(reloaded);
+    await expect(Promise.all([first, second])).resolves.toEqual(["reloaded", "reloaded"]);
+  });
+
+  it("载入期间文档被关掉：结果是 gone，不会为它重建文档", async () => {
+    await openWithEdit();
+    let resolve!: (value: typeof reloaded) => void;
+    vi.mocked(api.editorReload).mockImplementation(
+      () => new Promise((res) => (resolve = res)),
+    );
+    const pending = reloadDoc(1);
+    useEditors.getState().remove(1);
+    resolve(reloaded);
+    await expect(pending).resolves.toBe("gone");
+    expect(useEditors.getState().docs[1]).toBeUndefined();
   });
 });

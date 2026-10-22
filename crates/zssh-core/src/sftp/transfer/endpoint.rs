@@ -365,8 +365,12 @@ impl WriteAt for RemoteWriter {
     fn finish<'a>(&'a self) -> EndpointFuture<'a, Result<(), SftpError>> {
         Box::pin(async move {
             // fsync 有就用（服务器声明了才刷）；刷失败按失败处理——可能没落盘。
-            self.channel.fsync(&self.handle).await?;
-            self.channel.close_handle(&self.handle).await
+            // 但刷失败也要关句柄：Rust 对象释放不会发 SSH_FXP_CLOSE，漏关的句柄会一直占在
+            // 复用的 SFTP 通道上。返回的是 fsync 的错误（先发生的），关闭失败不覆盖它。
+            let flushed = self.channel.fsync(&self.handle).await;
+            let closed = self.channel.close_handle(&self.handle).await;
+            flushed?;
+            closed
         })
     }
 }

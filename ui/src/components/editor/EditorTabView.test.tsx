@@ -18,7 +18,7 @@ vi.mock("../../api/editor", async () => {
 
 import { EditorView } from "@codemirror/view";
 import * as api from "../../api/editor";
-import { useEditors } from "../../stores/editors";
+import { applyEditEvent, useEditors } from "../../stores/editors";
 import EditorTabView, { DRAFT_INTERVAL_MS } from "./EditorTabView";
 
 // CodeMirror 量字符尺寸要用到这两个，jsdom 没有。
@@ -272,5 +272,168 @@ describe("本地文件保存冲突（第 7 节）", () => {
     expect(api.localEditorSave).toHaveBeenCalledTimes(1);
     expect(api.localEditorSaveAs).not.toHaveBeenCalled();
     expect(api.editorReload).not.toHaveBeenCalled();
+  });
+});
+
+// ---- AUDIT-2 A04：重新载入期间输入的字不能被吞掉 ----
+
+type ReloadPayload = { text: string; bom: boolean; eol: "LF" | "CRLF" };
+
+/** 把 editorReload 换成"手动放行"的：测试决定什么时候返回、返回什么、或者失败。 */
+function deferReload() {
+  let resolve!: (value: ReloadPayload) => void;
+  let reject!: (reason: unknown) => void;
+  vi.mocked(api.editorReload).mockImplementation(
+    () =>
+      new Promise<ReloadPayload>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      }),
+  );
+  return {
+    resolve: (text: string) => resolve({ text, bom: false, eol: "LF" }),
+    reject: (message: string) => reject({ code: "io", message }),
+  };
+}
+
+function editorText(): string {
+  return useEditors.getState().docs[LOCAL_ID].getText?.() ?? "";
+}
+
+/** 用户的输入：直接往 CodeMirror 派发改动（jsdom 里没有真实键盘，和其他用例一样）。 */
+function userTypes(text: string) {
+  const view = EditorView.findFromDOM(document.querySelector(".cm-editor") as HTMLElement);
+  view?.dispatch({ changes: { from: 0, insert: text } });
+}
+
+/** 打开本地文档、先打一行字、触发保存冲突、点「重新载入」，对话框收起后返回（reload 还没放行）。 */
+async function startLocalReload() {
+  seedLocalDoc();
+  vi.mocked(api.localEditorSave).mockResolvedValue({
+    state: "conflict",
+    message: "这个文件在你打开之后被别的程序改过，没有保存",
+  });
+  const reload = deferReload();
+  render(<EditorTabView editId={LOCAL_ID} active sftpId={null} />);
+  await act(async () => userTypes("my edit\n"));
+  await clickSaveLocal();
+  fireEvent.click(await screen.findByText("重新载入（丢掉我的修改）"));
+  await waitFor(() => expect(screen.queryByText("重新载入（丢掉我的修改）")).toBeNull());
+  await waitFor(() => expect(api.editorReload).toHaveBeenCalledWith(LOCAL_ID));
+  return reload;
+}
+
+describe("重新载入期间的输入（AUDIT-2 A04）", () => {
+  it("对照：载入期间不输入，载入完成显示磁盘内容并清掉未保存标记", async () => {
+    const reload = await startLocalReload();
+    await act(async () => reload.resolve("disk now\n"));
+    expect(editorText()).toBe("disk now\n");
+    const doc = useEditors.getState().docs[LOCAL_ID];
+    expect(doc).toMatchObject({ dirty: false, reloading: false, error: null });
+  });
+
+  it("载入期间编辑器只读：输入被挡住，保存按钮不可用，载入完成后恢复可编辑", async () => {
+    const reload = await startLocalReload();
+    expect(useEditors.getState().docs[LOCAL_ID].reloading).toBe(true);
+    expect(screen.getByTestId("editor-reloading")).toBeTruthy();
+    expect(
+      (document.querySelector('[data-action="editor-save"]') as HTMLButtonElement).disabled,
+    ).toBe(true);
+    const before = useEditors.getState().docs[LOCAL_ID].version;
+
+    await act(async () => userTypes("NEW_INPUT_WHILE_LOADING:"));
+    expect(editorText()).not.toContain("NEW_INPUT_WHILE_LOADING:");
+    expect(useEditors.getState().docs[LOCAL_ID].version).toBe(before);
+
+    await act(async () => reload.resolve("disk now\n"));
+    expect(editorText()).toBe("disk now\n");
+    expect(useEditors.getState().docs[LOCAL_ID]).toMatchObject({ dirty: false, reloading: false });
+    expect(screen.queryByTestId("editor-reloading")).toBeNull();
+
+    // 载入结束后又能正常输入，而且算未保存修改。
+    await act(async () => userTypes("after:"));
+    expect(editorText()).toBe("after:disk now\n");
+    expect(useEditors.getState().docs[LOCAL_ID].dirty).toBe(true);
+  });
+
+  it("载入完成后内容版本往前走一格，草稿 / 保存不会把新内容当成旧内容", async () => {
+    const reload = await startLocalReload();
+    const before = useEditors.getState().docs[LOCAL_ID].version;
+    await act(async () => reload.resolve("disk now\n"));
+    expect(useEditors.getState().docs[LOCAL_ID].version).toBe(before + 1);
+  });
+
+  it("版本在载入期间变了（还是有改动漏进来）：不覆盖，保留文本和未保存标记，并给出提示", async () => {
+    const reload = await startLocalReload();
+    // 模拟只读之外漏进来的一次改动：内容版本往前走了。
+    await act(async () => {
+      const doc = useEditors.getState().docs[LOCAL_ID];
+      useEditors.getState().patch(LOCAL_ID, { version: doc.version + 1, dirty: true });
+    });
+    await act(async () => reload.resolve("disk now\n"));
+    expect(editorText()).toContain("my edit");
+    expect(editorText()).not.toContain("disk now");
+    const doc = useEditors.getState().docs[LOCAL_ID];
+    expect(doc).toMatchObject({ dirty: true, reloading: false, revision: 0 });
+    expect(doc.error).toContain("重新载入期间内容有改动，没有覆盖");
+    expect(screen.getByTestId("editor-error").textContent).toContain("没有覆盖");
+  });
+
+  it("载入失败：保留原文和未保存标记，恢复可编辑", async () => {
+    const reload = await startLocalReload();
+    await act(async () => reload.reject("读不了"));
+    expect(editorText()).toContain("my edit");
+    await waitFor(() =>
+      expect(useEditors.getState().docs[LOCAL_ID]).toMatchObject({
+        dirty: true,
+        reloading: false,
+        error: "读不了",
+      }),
+    );
+    await act(async () => userTypes("again:"));
+    expect(editorText()).toContain("again:");
+  });
+
+  it("远端冲突事件（discarded）那条路径同样：期间只读，载入后显示服务器内容", async () => {
+    const reload = deferReload();
+    render(<EditorTabView editId={5} active sftpId="s1" />);
+    await act(async () => typeInto("mine:"));
+    const pending = applyEditEvent({
+      edit_id: 5,
+      state: "discarded",
+      remote_path: "/etc/nginx/conf.d/site.conf",
+    });
+    await waitFor(() => expect(useEditors.getState().docs[5].reloading).toBe(true));
+    await act(async () => typeInto("LATE:"));
+    expect(useEditors.getState().docs[5].getText?.()).not.toContain("LATE:");
+    await act(async () => {
+      reload.resolve("from server\n");
+      await expect(pending).resolves.toBe("reloaded");
+    });
+    expect(useEditors.getState().docs[5].getText?.()).toBe("from server\n");
+    expect(useEditors.getState().docs[5]).toMatchObject({ dirty: false, reloading: false });
+  });
+
+  it("远端冲突事件那条路径：版本变了不覆盖，结果是 kept", async () => {
+    const reload = deferReload();
+    render(<EditorTabView editId={5} active sftpId="s1" />);
+    await act(async () => typeInto("mine:"));
+    const pending = applyEditEvent({
+      edit_id: 5,
+      state: "discarded",
+      remote_path: "/etc/nginx/conf.d/site.conf",
+    });
+    await waitFor(() => expect(useEditors.getState().docs[5].reloading).toBe(true));
+    await act(async () => {
+      const doc = useEditors.getState().docs[5];
+      useEditors.getState().patch(5, { version: doc.version + 1 });
+    });
+    await act(async () => {
+      reload.resolve("from server\n");
+      await expect(pending).resolves.toBe("kept");
+    });
+    expect(useEditors.getState().docs[5].getText?.()).toContain("mine:");
+    expect(useEditors.getState().docs[5]).toMatchObject({ dirty: true, reloading: false });
+    expect(useEditors.getState().docs[5].error).toContain("没有覆盖");
   });
 });

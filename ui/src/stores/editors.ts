@@ -37,6 +37,8 @@ export interface EditorDoc {
   version: number;
   dirty: boolean;
   saving: boolean;
+  /** 正在重新载入（放弃本地修改、重读磁盘 / 服务器上的内容）：编辑器临时只读，保存也先不收。 */
+  reloading: boolean;
   /** 最近一次保存失败的原因（保存成功后清掉）。 */
   error: string | null;
   /** 最近一次交给后端的文本（保存请求里的那份）。冲突 / 属主处理完成后用它判断
@@ -90,6 +92,7 @@ export const useEditors = create<EditorsState>((set, get) => ({
       version: 0,
       dirty: false,
       saving: false,
+      reloading: false,
       error: null,
       lastSentText: null,
       getText: null,
@@ -177,6 +180,7 @@ export async function saveDoc(
   const doc = store.docs[editId];
   if (!doc?.getText) return { state: "failed", message: "编辑器还没有准备好" };
   if (doc.saving) return { state: "failed", message: "正在保存" };
+  if (doc.reloading) return { state: "failed", message: "正在重新载入，稍后再保存" };
   if (doc.side === "remote" && !sftpId) {
     const message = "这台主机的连接已经断开，内容还留在编辑器里；重新连接后再保存";
     store.patch(editId, { error: message });
@@ -215,6 +219,7 @@ export async function saveLocalAsDoc(
   if (!doc?.getText) return { state: "failed", message: "编辑器还没有准备好" };
   if (doc.side !== "local") return { state: "failed", message: "只有本地文件能这样另存为" };
   if (doc.saving) return { state: "failed", message: "正在保存" };
+  if (doc.reloading) return { state: "failed", message: "正在重新载入，稍后再保存" };
   const text = doc.getText();
   store.patch(editId, { saving: true, lastSentText: text });
   try {
@@ -275,21 +280,70 @@ export async function flushDraft(editId: number): Promise<"written" | "skipped" 
   return "written";
 }
 
-/** 放弃本地修改，重新读回磁盘 / 服务器上的内容。 */
-export async function reloadDoc(editId: number): Promise<void> {
-  const text = await editorReload(editId);
+/** 重新载入期间内容变了，没有覆盖时挂在文档上的提示。 */
+export const RELOAD_KEPT_MESSAGE =
+  "重新载入期间内容有改动，没有覆盖；你输入的内容和未保存标记都保留着";
+
+/**
+ * 重新载入的结果：
+ * - `reloaded`：已经换成磁盘 / 服务器上的内容；
+ * - `kept`：载入期间用户又改了字（版本变了），保留用户的文本和未保存标记，没有覆盖；
+ * - `gone`：载入期间文档已经关了。
+ */
+export type ReloadResult = "reloaded" | "kept" | "gone";
+
+/** 正在进行的重新载入（同一个文档同时只发一次，后来的调用共用结果）。 */
+const inflightReloads = new Map<number, Promise<ReloadResult>>();
+
+/**
+ * 放弃本地修改，重新读回磁盘 / 服务器上的内容。
+ *
+ * 载入期间文档标成 `reloading`，编辑器据此临时只读（保存也先不收）。再加一道保险：发起时记下文档的
+ * 内容版本，结果回来时版本已经变了就不覆盖——后端结果、文本替换、未保存标记是**同一次**状态变化
+ * （这里一次 patch，编辑器据 `revision` 换文本，换文本不再单独动版本和未保存标记）。
+ * 失败时抛错，文档保持原文和未保存标记，`reloading` 照样恢复。
+ */
+export function reloadDoc(editId: number): Promise<ReloadResult> {
+  const running = inflightReloads.get(editId);
+  if (running) return running;
+  const task = runReload(editId).finally(() => {
+    inflightReloads.delete(editId);
+  });
+  inflightReloads.set(editId, task);
+  return task;
+}
+
+async function runReload(editId: number): Promise<ReloadResult> {
+  const started = useEditors.getState().docs[editId];
+  const startedVersion = started?.version;
+  if (started) useEditors.getState().patch(editId, { reloading: true });
+  let text: Awaited<ReturnType<typeof editorReload>>;
+  try {
+    text = await editorReload(editId);
+  } catch (error) {
+    useEditors.getState().patch(editId, { reloading: false });
+    throw error;
+  }
   const doc = useEditors.getState().docs[editId];
-  if (!doc) return;
+  if (!doc) return "gone";
+  if (startedVersion !== undefined && doc.version !== startedVersion) {
+    useEditors.getState().patch(editId, { reloading: false, error: RELOAD_KEPT_MESSAGE });
+    return "kept";
+  }
   useEditors.getState().patch(editId, {
     initialText: text.text,
     bom: text.bom,
     eol: text.eol,
     revision: doc.revision + 1,
+    // 文本被整份换掉：内容版本也往前走，草稿 / 保存请求不会把它当成旧内容。
+    version: doc.version + 1,
     dirty: false,
     saving: false,
+    reloading: false,
     error: null,
     lastSentText: null,
   });
+  return "reloaded";
 }
 
 /** 放弃本地修改后没能重新载入：编辑器里的文本已经过时（后端会拒绝保存它），把原因挂到文档上。 */
@@ -306,21 +360,21 @@ export function markReloadFailed(editId: number, message: string): void {
  *
  * - `uploaded`：另存为换了路径就把文档的路径 / 文件名改过去；有没有未保存修改按**实际交给后端的
  *   那份文本**判断——处理期间用户又打了字，那些字还没传上去，仍然算未保存。
- * - `discarded`：后端已经把内容换回服务器上的版本，重新载入（内容和编码 / 换行一起）。
+ * - `discarded`：后端已经把内容换回服务器上的版本，重新载入（内容和编码 / 换行一起）；
+ *   返回载入结果，载入期间用户又改了字时是 `kept`（没有覆盖）。
  */
 export async function applyEditEvent(event: {
   edit_id: number;
   state: string;
   remote_path: string;
-}): Promise<void> {
+}): Promise<ReloadResult | undefined> {
   const store = useEditors.getState();
   const doc = store.docs[event.edit_id];
-  if (!doc) return;
+  if (!doc) return undefined;
   if (event.state === "discarded") {
-    await reloadDoc(event.edit_id);
-    return;
+    return reloadDoc(event.edit_id);
   }
-  if (event.state !== "uploaded") return;
+  if (event.state !== "uploaded") return undefined;
   const patch: Partial<EditorDoc> = { error: null, saving: false };
   if (doc.side === "remote" && event.remote_path && event.remote_path !== doc.path) {
     patch.path = event.remote_path;
@@ -334,6 +388,7 @@ export async function applyEditEvent(event: {
   }
   store.patch(event.edit_id, patch);
   if (patch.fileName) store.hooks?.renamed?.(event.edit_id, patch.fileName);
+  return undefined;
 }
 
 /** 关掉一个文件；`discard` 是用户选了"不保存"。 */

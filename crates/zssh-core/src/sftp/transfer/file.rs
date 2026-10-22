@@ -187,7 +187,7 @@ async fn read_full(
 ///
 /// - `on_progress(done_total, total)`：每批写完之后调一次（调用方自己限流）；
 /// - `control`：每一批之间检查一次，暂停/取消都从这里返回；
-/// - 出错直接返回错误（重试由队列层决定）。
+/// - 出错返回错误（重试由队列层决定）；拿到第一个句柄之后的所有退出路径都会关掉已经打开的句柄。
 pub async fn copy_file(
     source: Arc<dyn FileEndpoint>,
     target: Arc<dyn FileEndpoint>,
@@ -201,7 +201,14 @@ pub async fn copy_file(
     on_progress(done, total);
 
     let reader = source.open_read().await?;
-    let writer = target.open_write(resume_len).await?;
+    let writer = match target.open_write(resume_len).await {
+        Ok(writer) => writer,
+        Err(err) => {
+            // 源句柄已经开了：目标打不开也要关掉它，否则会一直占在复用的 SFTP 通道上。
+            let _ = reader.close().await;
+            return Err(err);
+        }
+    };
 
     let mut result: Result<CopyOutcome, SftpError> = Ok(CopyOutcome::Completed { bytes: 0 });
     let chunk = tuning.chunk_len.max(1) as u64;
@@ -245,11 +252,27 @@ pub async fn copy_file(
         }
 
         // 收齐这一批（按完成顺序收，但**按偏移顺序检查**）：每一块都必须正好读满。
+        // 读出错不能直接 `?` 返回：要记下最先发生的错误，跳到底部统一关掉两边的句柄。
         let mut pieces: Vec<(u64, Vec<u8>)> = Vec::with_capacity(requests.len());
+        let mut read_error: Option<SftpError> = None;
         while let Some(joined) = set.join_next().await {
-            let piece =
-                joined.map_err(|err| SftpError::Internal(format!("读任务崩了：{err}")))??;
-            pieces.push(piece);
+            match joined {
+                Ok(Ok(piece)) => pieces.push(piece),
+                Ok(Err(err)) => {
+                    read_error = Some(err);
+                    break;
+                }
+                Err(err) => {
+                    read_error = Some(SftpError::Internal(format!("读任务崩了：{err}")));
+                    break;
+                }
+            }
+        }
+        if let Some(err) = read_error {
+            // 这一批剩下的读请求不要了（等它们收掉再关句柄）。
+            set.shutdown().await;
+            result = Err(err);
+            break 'outer;
         }
         pieces.sort_by_key(|(offset, _)| *offset);
         for ((req_offset, req_len), (piece_offset, data)) in requests.iter().zip(pieces.iter()) {
@@ -287,17 +310,12 @@ pub async fn copy_file(
         on_progress(done, total);
     }
 
-    // 收尾：正常结束才 fsync + 关；出错也尽量关掉句柄。
-    match &result {
-        Ok(CopyOutcome::Completed { .. }) => {
-            if let Err(err) = writer.finish().await {
-                result = Err(err);
-            }
-        }
-        _ => {
-            // 暂停/取消/出错：把句柄关掉（临时文件留着，数据已经落盘）。
-            let _ = writer.finish().await;
-        }
+    // 统一收尾：不管怎么走到这里（完成、暂停、取消、读错、写错），两边已经打开的句柄都要关。
+    // `finish` 自己保证 fsync 失败也会继续关句柄；错误以最先发生的为准，
+    // 所以只有"本来是成功完成"时 fsync 的错才会变成结果，其余路径上的关闭错误一律丢掉。
+    let finished = writer.finish().await;
+    if let (Ok(CopyOutcome::Completed { .. }), Err(err)) = (&result, finished) {
+        result = Err(err);
     }
     let _ = reader.close().await;
 
@@ -618,5 +636,353 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, CopyOutcome::Completed { bytes: 20_000 });
         assert_eq!(partial_bytes(&target, 20_000).await, data);
+    }
+
+    // ---- AUDIT-2 A03：出错的每条路径都要关掉已经打开的句柄 ----
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use super::super::endpoint::{EndpointFuture, FileAttributesPair, ReadAt};
+
+    /// 句柄的开 / 关次数和要注入的故障。
+    #[derive(Default)]
+    struct Handles {
+        reads_opened: AtomicUsize,
+        reads_closed: AtomicUsize,
+        writes_opened: AtomicUsize,
+        /// `finish`（刷盘 + 关闭）被调用的次数；故障时也算，因为真实实现保证失败也会关。
+        writes_finished: AtomicUsize,
+        fail_open_write: AtomicBool,
+        fail_reads: AtomicBool,
+        fail_finish: AtomicBool,
+    }
+
+    impl Handles {
+        fn count(counter: &AtomicUsize) -> usize {
+            counter.load(Ordering::SeqCst)
+        }
+    }
+
+    /// 包一层别的端点，记录句柄开关并按需注入故障。
+    struct Tracked {
+        inner: Arc<dyn FileEndpoint>,
+        handles: Arc<Handles>,
+    }
+
+    impl Tracked {
+        fn wrap(inner: Arc<dyn FileEndpoint>, handles: &Arc<Handles>) -> Arc<dyn FileEndpoint> {
+            Arc::new(Tracked {
+                inner,
+                handles: Arc::clone(handles),
+            })
+        }
+    }
+
+    struct TrackedReader {
+        inner: Arc<dyn ReadAt>,
+        handles: Arc<Handles>,
+    }
+
+    impl ReadAt for TrackedReader {
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            len: u32,
+        ) -> EndpointFuture<'a, Result<Vec<u8>, SftpError>> {
+            Box::pin(async move {
+                if self.handles.fail_reads.load(Ordering::SeqCst) {
+                    return Err(SftpError::Remote("测试注入的读失败".to_owned()));
+                }
+                self.inner.read_at(offset, len).await
+            })
+        }
+
+        fn close<'a>(&'a self) -> EndpointFuture<'a, Result<(), SftpError>> {
+            Box::pin(async move {
+                self.handles.reads_closed.fetch_add(1, Ordering::SeqCst);
+                self.inner.close().await
+            })
+        }
+    }
+
+    struct TrackedWriter {
+        inner: Arc<dyn WriteAt>,
+        handles: Arc<Handles>,
+    }
+
+    impl WriteAt for TrackedWriter {
+        fn write_at<'a>(
+            &'a self,
+            offset: u64,
+            data: Vec<u8>,
+        ) -> EndpointFuture<'a, Result<(), SftpError>> {
+            self.inner.write_at(offset, data)
+        }
+
+        fn finish<'a>(&'a self) -> EndpointFuture<'a, Result<(), SftpError>> {
+            Box::pin(async move {
+                self.handles.writes_finished.fetch_add(1, Ordering::SeqCst);
+                let finished = self.inner.finish().await;
+                if self.handles.fail_finish.load(Ordering::SeqCst) {
+                    return Err(SftpError::Remote("测试注入的 fsync 失败".to_owned()));
+                }
+                finished
+            })
+        }
+    }
+
+    impl FileEndpoint for Tracked {
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn size<'a>(&'a self) -> EndpointFuture<'a, Result<Option<u64>, SftpError>> {
+            self.inner.size()
+        }
+        fn open_read<'a>(&'a self) -> EndpointFuture<'a, Result<Arc<dyn ReadAt>, SftpError>> {
+            Box::pin(async move {
+                let inner = self.inner.open_read().await?;
+                self.handles.reads_opened.fetch_add(1, Ordering::SeqCst);
+                let reader: Arc<dyn ReadAt> = Arc::new(TrackedReader {
+                    inner,
+                    handles: Arc::clone(&self.handles),
+                });
+                Ok(reader)
+            })
+        }
+        fn open_write<'a>(
+            &'a self,
+            resume_len: u64,
+        ) -> EndpointFuture<'a, Result<Arc<dyn WriteAt>, SftpError>> {
+            Box::pin(async move {
+                if self.handles.fail_open_write.load(Ordering::SeqCst) {
+                    return Err(SftpError::PermissionDenied {
+                        path: "/测试注入的打开失败".to_owned(),
+                    });
+                }
+                let inner = self.inner.open_write(resume_len).await?;
+                self.handles.writes_opened.fetch_add(1, Ordering::SeqCst);
+                let writer: Arc<dyn WriteAt> = Arc::new(TrackedWriter {
+                    inner,
+                    handles: Arc::clone(&self.handles),
+                });
+                Ok(writer)
+            })
+        }
+        fn commit<'a>(
+            &'a self,
+            total: u64,
+            overwrite: bool,
+        ) -> EndpointFuture<'a, Result<(), SftpError>> {
+            self.inner.commit(total, overwrite)
+        }
+        fn existing_size<'a>(&'a self) -> EndpointFuture<'a, Result<Option<u64>, SftpError>> {
+            self.inner.existing_size()
+        }
+        fn remove_existing<'a>(&'a self) -> EndpointFuture<'a, Result<(), SftpError>> {
+            self.inner.remove_existing()
+        }
+        fn remove_partial<'a>(&'a self) -> EndpointFuture<'a, Result<(), SftpError>> {
+            self.inner.remove_partial()
+        }
+        fn partial_len<'a>(&'a self) -> EndpointFuture<'a, Result<u64, SftpError>> {
+            self.inner.partial_len()
+        }
+        fn truncate_partial<'a>(&'a self, len: u64) -> EndpointFuture<'a, Result<(), SftpError>> {
+            self.inner.truncate_partial(len)
+        }
+        fn read_partial<'a>(
+            &'a self,
+            offset: u64,
+            len: u32,
+        ) -> EndpointFuture<'a, Result<Option<Vec<u8>>, SftpError>> {
+            self.inner.read_partial(offset, len)
+        }
+        fn set_attributes<'a>(
+            &'a self,
+            mtime: Option<u32>,
+            permissions: Option<u32>,
+        ) -> EndpointFuture<'a, Result<(), SftpError>> {
+            self.inner.set_attributes(mtime, permissions)
+        }
+        fn attributes<'a>(&'a self) -> EndpointFuture<'a, Result<FileAttributesPair, SftpError>> {
+            self.inner.attributes()
+        }
+    }
+
+    struct TrackedPair {
+        source: Arc<dyn FileEndpoint>,
+        target: Arc<dyn FileEndpoint>,
+        source_handles: Arc<Handles>,
+        target_handles: Arc<Handles>,
+        raw_target: Arc<dyn FileEndpoint>,
+    }
+
+    fn tracked_pair(data: &[u8]) -> TrackedPair {
+        let source_handles = Arc::new(Handles::default());
+        let target_handles = Arc::new(Handles::default());
+        let raw_source = MemoryEndpoint::new("source", data.to_vec()).as_endpoint();
+        let raw_target = MemoryEndpoint::new("target", Vec::new()).as_endpoint();
+        TrackedPair {
+            source: Tracked::wrap(raw_source, &source_handles),
+            target: Tracked::wrap(Arc::clone(&raw_target), &target_handles),
+            source_handles,
+            target_handles,
+            raw_target,
+        }
+    }
+
+    async fn copy_tracked(pair: &TrackedPair, total: u64) -> Result<CopyOutcome, SftpError> {
+        copy_file(
+            Arc::clone(&pair.source),
+            Arc::clone(&pair.target),
+            total,
+            0,
+            tuning(1024, 4),
+            &ControlFlag::new(),
+            |_, _| {},
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_normal_copy_closes_each_side_exactly_once() {
+        let pair = tracked_pair(&pattern(10_000));
+        let outcome = copy_tracked(&pair, 10_000).await.unwrap();
+        assert_eq!(outcome, CopyOutcome::Completed { bytes: 10_000 });
+        assert_eq!(Handles::count(&pair.source_handles.reads_opened), 1);
+        assert_eq!(Handles::count(&pair.source_handles.reads_closed), 1);
+        assert_eq!(Handles::count(&pair.target_handles.writes_opened), 1);
+        assert_eq!(Handles::count(&pair.target_handles.writes_finished), 1);
+    }
+
+    #[tokio::test]
+    async fn pause_and_cancel_also_close_both_handles() {
+        for cancel in [false, true] {
+            let pair = tracked_pair(&pattern(100_000));
+            let control = ControlFlag::new();
+            let flag = control.clone();
+            let outcome = copy_file(
+                Arc::clone(&pair.source),
+                Arc::clone(&pair.target),
+                100_000,
+                0,
+                tuning(1024, 1),
+                &control,
+                move |done, _| {
+                    if done >= 2048 {
+                        if cancel {
+                            flag.cancel();
+                        } else {
+                            flag.pause();
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    CopyOutcome::Paused { .. } | CopyOutcome::Cancelled { .. }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(Handles::count(&pair.source_handles.reads_closed), 1);
+            assert_eq!(Handles::count(&pair.target_handles.writes_finished), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_that_cannot_be_opened_still_closes_the_source() {
+        let pair = tracked_pair(&pattern(10_000));
+        pair.target_handles
+            .fail_open_write
+            .store(true, Ordering::SeqCst);
+        let err = copy_tracked(&pair, 10_000).await.expect_err("目标打不开");
+        assert!(
+            matches!(err, SftpError::PermissionDenied { .. }),
+            "返回的该是打开目标的错误：{err}"
+        );
+        assert_eq!(Handles::count(&pair.source_handles.reads_opened), 1);
+        assert_eq!(
+            Handles::count(&pair.source_handles.reads_closed),
+            1,
+            "源句柄不能漏关"
+        );
+        assert_eq!(Handles::count(&pair.target_handles.writes_opened), 0);
+        assert_eq!(Handles::count(&pair.target_handles.writes_finished), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_read_closes_both_sides_and_keeps_the_first_error() {
+        let pair = tracked_pair(&pattern(10_000));
+        pair.source_handles.fail_reads.store(true, Ordering::SeqCst);
+        // 收尾时目标的 fsync 也会失败：返回的还是读错误（先发生的）。
+        pair.target_handles
+            .fail_finish
+            .store(true, Ordering::SeqCst);
+        let err = copy_tracked(&pair, 10_000).await.expect_err("读失败");
+        assert!(err.to_string().contains("读失败"), "{err}");
+        assert_eq!(Handles::count(&pair.source_handles.reads_closed), 1);
+        assert_eq!(Handles::count(&pair.target_handles.writes_finished), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fsync_returns_that_error_but_the_handle_is_still_closed() {
+        let pair = tracked_pair(&pattern(10_000));
+        pair.target_handles
+            .fail_finish
+            .store(true, Ordering::SeqCst);
+        let err = copy_tracked(&pair, 10_000).await.expect_err("fsync 失败");
+        assert!(err.to_string().contains("fsync 失败"), "{err}");
+        assert_eq!(Handles::count(&pair.target_handles.writes_finished), 1);
+        assert_eq!(Handles::count(&pair.source_handles.reads_closed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_closes_both_sides_and_keeps_the_resumable_prefix() {
+        let source_handles = Arc::new(Handles::default());
+        let target_handles = Arc::new(Handles::default());
+        let raw_target = MemoryEndpoint::new("target", Vec::new());
+        raw_target.fail_write_after(2048);
+        let source = Tracked::wrap(
+            MemoryEndpoint::new("source", pattern(10_000)).as_endpoint(),
+            &source_handles,
+        );
+        let target = Tracked::wrap(raw_target.as_endpoint(), &target_handles);
+        let err = copy_file(
+            source,
+            Arc::clone(&target),
+            10_000,
+            0,
+            tuning(1024, 4),
+            &ControlFlag::new(),
+            |_, _| {},
+        )
+        .await
+        .expect_err("写失败");
+        assert!(err.is_disconnect(), "{err}");
+        assert_eq!(Handles::count(&source_handles.reads_closed), 1);
+        assert_eq!(Handles::count(&target_handles.writes_finished), 1);
+        // 续传逻辑没被破坏：临时文件留着，而且是从头连续的前缀（没有洞）。
+        let kept = target.partial_len().await.unwrap();
+        assert!(kept <= 2048, "{kept}");
+    }
+
+    #[tokio::test]
+    async fn a_normal_transfer_still_works_after_failures() {
+        let data = pattern(10_000);
+        let pair = tracked_pair(&data);
+        pair.source_handles.fail_reads.store(true, Ordering::SeqCst);
+        copy_tracked(&pair, 10_000).await.expect_err("先失败一次");
+        pair.source_handles
+            .fail_reads
+            .store(false, Ordering::SeqCst);
+        let outcome = copy_tracked(&pair, 10_000).await.expect("再传一次");
+        assert_eq!(outcome, CopyOutcome::Completed { bytes: 10_000 });
+        assert_eq!(partial_bytes(&pair.raw_target, 10_000).await, data);
+        assert_eq!(Handles::count(&pair.source_handles.reads_opened), 2);
+        assert_eq!(Handles::count(&pair.source_handles.reads_closed), 2);
+        assert_eq!(Handles::count(&pair.target_handles.writes_finished), 2);
     }
 }

@@ -988,7 +988,10 @@ export default function App() {
             // 后端已经把内容换回服务器上的版本：编辑器里也要换成那份（内容和编码 / 换行）。
             // 载入失败不能吞掉——编辑器里还是旧文本，后端会拒绝保存它，要让用户知道为什么（R-9 T02）。
             void applyEditEvent(event).then(
-              () => toast.info(`已放弃本地修改，「${name}」换回了服务器上的内容`),
+              (result) =>
+                result === "kept"
+                  ? toast.warning(`「${name}」重新载入期间内容有改动，没有覆盖，你输入的内容还在`)
+                  : toast.info(`已放弃本地修改，「${name}」换回了服务器上的内容`),
               (error: unknown) => {
                 const message = toEditorError(error).message;
                 markReloadFailed(event.edit_id, message);

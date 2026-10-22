@@ -48,9 +48,26 @@ impl Bridge {
         match method {
             METHOD_LIST_DIR => {
                 let params: PathParams = parse(params)?;
-                let (summary, fs, _) = self.file_target(scope, params.target_id.as_deref()).await?;
+                let (summary, fs, ticket) =
+                    self.file_target(scope, params.target_id.as_deref()).await?;
                 let started = std::time::Instant::now();
+                self.ensure_still_valid(
+                    scope,
+                    &ticket,
+                    &summary.host_label,
+                    "list_dir",
+                    &params.path,
+                    started,
+                )?;
                 let outcome = tool_list_dir(fs.as_ref(), &params.path).await;
+                self.ensure_still_valid(
+                    scope,
+                    &ticket,
+                    &summary.host_label,
+                    "list_dir",
+                    &params.path,
+                    started,
+                )?;
                 self.read_audit(
                     scope,
                     &summary.host_label,
@@ -69,9 +86,26 @@ impl Bridge {
             }
             METHOD_STAT => {
                 let params: PathParams = parse(params)?;
-                let (summary, fs, _) = self.file_target(scope, params.target_id.as_deref()).await?;
+                let (summary, fs, ticket) =
+                    self.file_target(scope, params.target_id.as_deref()).await?;
                 let started = std::time::Instant::now();
+                self.ensure_still_valid(
+                    scope,
+                    &ticket,
+                    &summary.host_label,
+                    "stat",
+                    &params.path,
+                    started,
+                )?;
                 let outcome = tool_stat(fs.as_ref(), &params.path).await;
+                self.ensure_still_valid(
+                    scope,
+                    &ticket,
+                    &summary.host_label,
+                    "stat",
+                    &params.path,
+                    started,
+                )?;
                 self.read_audit(
                     scope,
                     &summary.host_label,
@@ -87,11 +121,29 @@ impl Bridge {
             }
             METHOD_READ_FILE => {
                 let params: ReadFileParams = parse(params)?;
-                let (summary, fs, _) = self.file_target(scope, params.target_id.as_deref()).await?;
+                let (summary, fs, ticket) =
+                    self.file_target(scope, params.target_id.as_deref()).await?;
                 let started = std::time::Instant::now();
+                self.ensure_still_valid(
+                    scope,
+                    &ticket,
+                    &summary.host_label,
+                    "read_file",
+                    &params.path,
+                    started,
+                )?;
                 let outcome =
                     tool_read_file(fs.as_ref(), &params.path, params.offset, params.max_bytes)
                         .await;
+                // 读完之后、把内容交给智能体之前再核对一次：读的过程中目标被移出，内容也不能返回
+                self.ensure_still_valid(
+                    scope,
+                    &ticket,
+                    &summary.host_label,
+                    "read_file",
+                    &params.path,
+                    started,
+                )?;
                 self.read_audit(
                     scope,
                     &summary.host_label,
@@ -133,6 +185,29 @@ impl Bridge {
         let ticket = scope.ticket(&target_id);
         let fs = self.host.remote_fs(&target_id).await?;
         Ok((summary, fs, ticket))
+    }
+
+    /// 只读工具的有效性核对：目标被移出对话（哪怕又被加回来）、用户点了停止、作用范围销毁，
+    /// 这条请求都不能再读 / 再返回内容。和写文件、执行命令用的是同一张 [`RequestTicket`]。
+    /// 失效时记一条失败审计（不含内容），返回给模型的原因和写工具一致。
+    fn ensure_still_valid(
+        &self,
+        scope: &Arc<Scope>,
+        ticket: &RequestTicket,
+        host_label: &str,
+        tool: &'static str,
+        requested: &str,
+        started: std::time::Instant,
+    ) -> Result<(), String> {
+        match scope.ticket_refusal(ticket) {
+            None => Ok(()),
+            Some(reason) => {
+                self.read_audit(
+                    scope, host_label, tool, None, requested, None, false, started,
+                );
+                Err(reason.to_string())
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
