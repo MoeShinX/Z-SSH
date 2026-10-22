@@ -71,6 +71,36 @@ describe("computeDockLayout", () => {
     expect(big.sftpWidth).toBe(840);
   });
 
+  it("左边展开的主机树先扣掉：面板往最小收，终端仍留 360", () => {
+    const layout = computeDockLayout({
+      ...base,
+      windowWidth: 1400,
+      aiOpen: true,
+      sftpOpen: true,
+      reserved: 300,
+    });
+    expect(layout.collapseAi).toBe(false);
+    expect(layout.terminalWidth).toBe(TERMINAL_MIN);
+    expect(layout.aiWidth + layout.sftpWidth + layout.terminalWidth).toBe(1400 - 300);
+  });
+
+  it("只因为主机树太宽才放不下：不收起 AI，两个面板最小宽度，终端让出来", () => {
+    const layout = computeDockLayout({
+      ...base,
+      windowWidth: 1200,
+      aiOpen: true,
+      sftpOpen: true,
+      reserved: 480,
+    });
+    expect(layout).toEqual({ aiWidth: 320, sftpWidth: 320, collapseAi: false, terminalWidth: 80 });
+  });
+
+  it("只开一个面板时主机树占的宽度同样扣掉", () => {
+    const layout = computeDockLayout({ ...base, windowWidth: 1000, aiOpen: false, sftpOpen: true, reserved: 224 });
+    expect(layout.sftpWidth).toBe(1000 - 224 - TERMINAL_MIN);
+    expect(layout.terminalWidth).toBe(TERMINAL_MIN);
+  });
+
   it("任何窗口宽度下终端都不低于 360，三块加起来正好是窗口宽度", () => {
     for (let width = 700; width <= 2400; width += 37) {
       for (const [aiOpen, sftpOpen] of [[true, true], [true, false], [false, true]] as const) {

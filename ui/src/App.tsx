@@ -2269,6 +2269,8 @@ export default function App() {
     sftpOpen: sftpVisible,
     aiDesired: sanitizeStoredWidth(aiStoredWidth, AI_PANEL_DEFAULT),
     sftpDesired: sanitizeStoredWidth(sftpStoredWidth, SFTP_PANEL_DEFAULT),
+    // 终端界面左边展开的主机树占掉的宽度：终端保底宽度要在它之外算
+    reserved: view === "terminal" && !hostTreeCollapsed ? hostTreeWidth : 0,
   });
   // 窗口太窄两个放不下：收起 AI 面板并提示；窗口变宽后不自动展开。
   useEffect(() => {

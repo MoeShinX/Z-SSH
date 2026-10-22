@@ -2,7 +2,7 @@
 //!
 //! 规则：
 //! - 顺序固定（终端、AI、SFTP），这里只算宽度，不排顺序；
-//! - 终端至少保留 360px；
+//! - 终端至少保留 360px（左边展开的主机树占的宽度先扣掉，见 `reserved`）；
 //! - 放不下时先把两个面板往各自的最小宽度（320px）收，按"各自还能收多少"的比例分摊；
 //! - 收到最小还放不下，就收起 AI 面板（SFTP 是用户刚打开的，优先保留）。
 //!   窗口变宽后不自动再展开，由调用方决定。
@@ -21,6 +21,8 @@ export interface DockLayoutInput {
   /** 用户记住的宽度（设置表里的值，已经体检过）。 */
   aiDesired: number;
   sftpDesired: number;
+  /** 左边已经占掉的宽度（终端界面里展开的主机树），不能分给终端和面板。 */
+  reserved?: number;
 }
 
 export interface DockLayout {
@@ -39,7 +41,9 @@ function clamp(value: number, min: number, max: number): number {
 
 export function computeDockLayout(input: DockLayoutInput): DockLayout {
   const { windowWidth, aiOpen, sftpOpen, aiDesired, sftpDesired } = input;
-  const available = Math.max(0, Math.floor(windowWidth - TERMINAL_MIN));
+  // 面板的比例上限仍按窗口宽算（主机树开关不该让面板忽宽忽窄），终端保底按扣掉主机树之后算
+  const content = Math.max(0, windowWidth - Math.max(0, input.reserved ?? 0));
+  const available = Math.max(0, Math.floor(content - TERMINAL_MIN));
   const single = (desired: number, ratio: number): number => {
     const max = Math.max(0, Math.floor(Math.min(windowWidth * ratio, available)));
     const min = Math.min(PANEL_MIN, max);
@@ -47,15 +51,15 @@ export function computeDockLayout(input: DockLayoutInput): DockLayout {
   };
 
   if (!aiOpen && !sftpOpen) {
-    return { aiWidth: 0, sftpWidth: 0, collapseAi: false, terminalWidth: windowWidth };
+    return { aiWidth: 0, sftpWidth: 0, collapseAi: false, terminalWidth: content };
   }
   if (aiOpen && !sftpOpen) {
     const aiWidth = single(aiDesired, AI_PANEL_MAX_RATIO);
-    return { aiWidth, sftpWidth: 0, collapseAi: false, terminalWidth: windowWidth - aiWidth };
+    return { aiWidth, sftpWidth: 0, collapseAi: false, terminalWidth: content - aiWidth };
   }
   if (!aiOpen && sftpOpen) {
     const sftpWidth = single(sftpDesired, SFTP_PANEL_MAX_RATIO);
-    return { aiWidth: 0, sftpWidth, collapseAi: false, terminalWidth: windowWidth - sftpWidth };
+    return { aiWidth: 0, sftpWidth, collapseAi: false, terminalWidth: content - sftpWidth };
   }
 
   // 两个都开。
@@ -67,7 +71,7 @@ export function computeDockLayout(input: DockLayoutInput): DockLayout {
   );
   const excess = ai + sftp - available;
   if (excess <= 0) {
-    return { aiWidth: ai, sftpWidth: sftp, collapseAi: false, terminalWidth: windowWidth - ai - sftp };
+    return { aiWidth: ai, sftpWidth: sftp, collapseAi: false, terminalWidth: content - ai - sftp };
   }
   const slackAi = ai - PANEL_MIN;
   const slackSftp = sftp - PANEL_MIN;
@@ -76,15 +80,25 @@ export function computeDockLayout(input: DockLayoutInput): DockLayout {
     const cutSftp = excess - cutAi;
     ai -= cutAi;
     sftp -= cutSftp;
-    return { aiWidth: ai, sftpWidth: sftp, collapseAi: false, terminalWidth: windowWidth - ai - sftp };
+    return { aiWidth: ai, sftpWidth: sftp, collapseAi: false, terminalWidth: content - ai - sftp };
   }
-  // 两个都收到最小也放不下：收起 AI，SFTP 单独排。
+  // 两个都收到最小也放不下。只是因为主机树拉宽了才放不下时，不替用户关 AI 面板
+  // （拖主机树把 AI 面板拖没了会很意外）：两个面板都按最小宽度，终端让出来。
+  if (PANEL_MIN * 2 <= Math.floor(windowWidth - TERMINAL_MIN)) {
+    return {
+      aiWidth: PANEL_MIN,
+      sftpWidth: PANEL_MIN,
+      collapseAi: false,
+      terminalWidth: Math.max(0, content - PANEL_MIN * 2),
+    };
+  }
+  // 窗口本身就放不下：收起 AI，SFTP 单独排。
   const sftpAlone = single(sftpDesired, SFTP_PANEL_MAX_RATIO);
   return {
     aiWidth: 0,
     sftpWidth: sftpAlone,
     collapseAi: true,
-    terminalWidth: windowWidth - sftpAlone,
+    terminalWidth: content - sftpAlone,
   };
 }
 
