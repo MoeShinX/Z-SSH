@@ -71,7 +71,13 @@ Netcatty
   components/cloud-sync/ (CloudSyncControls, CloudSyncDashboardTabs,
   CloudSyncDialogs, CloudSyncLocalBackupsPanel); the sync engine, the
   encryption and the WebDAV / S3 storages are independent Rust
-  implementations. Adapted files are marked with an "Adapted
+  implementations. The OneDrive storage (crates/zssh-core/src/sync/onedrive/)
+  follows the OAuth scope set, the refresh-failure error classification and
+  the app-folder (special/approot) addressing of
+  electron/bridges/onedriveAuthBridge.cjs and
+  infrastructure/services/adapters/OneDriveAdapter.ts; the PKCE loopback
+  listener, the conditional (eTag / If-Match) upload-session writes and
+  everything else there are independent Rust implementations. Adapted files are marked with an "Adapted
   from Netcatty" comment at the top. The Z-SSH
   backend (SSH, flow control, vault storage, authentication, proxy and
   jump-host dialing, connection pool, AI tool bridge, opencode / codex /
@@ -91,6 +97,20 @@ CodeMirror 6 (built-in text editor, ui/src/components/editor/)
   Used unmodified as npm dependencies. MIT is compatible with distribution
   under GPL-3.0-or-later; the packages' own license texts are kept in
   node_modules/<package>/LICENSE and in ui/package-lock.json.
+
+react-markdown 10.1.0 + remark-gfm 4.0.1 (AI reply Markdown rendering,
+ui/src/components/ai/Markdown.tsx)
+  https://github.com/remarkjs/react-markdown
+  https://github.com/remarkjs/remark-gfm
+  Copyright (c) Espen Hovlandsdal, Titus Wormer and others
+  License: MIT for all 99 packages pulled in with them (the unified / remark /
+  micromark / mdast / hast / vfile / unist families and their small helpers),
+  except @ungap/structured-clone (ISC, Andrea Giammarchi). Raw HTML rendering
+  (rehype-raw) is deliberately not used.
+
+  Used unmodified as npm dependencies. MIT and ISC are compatible with
+  distribution under GPL-3.0-or-later; each package's own license text is kept
+  in node_modules/<package>/LICENSE and in ui/package-lock.json.
 
 Other third-party dependencies are listed with their licenses in Cargo.lock
 and ui/package-lock.json.

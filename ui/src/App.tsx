@@ -2099,6 +2099,8 @@ export default function App() {
     const bringToFront = () => {
       try {
         const win = getCurrentWindow();
+        // 主窗口缩在托盘里（隐藏）时 setFocus 叫不出来，要先 show：文件窗口把标签交回来时用户得看到它们。
+        void win.show().catch(() => {});
         void win.unminimize().catch(() => {});
         void win.setFocus().catch(() => {});
       } catch {

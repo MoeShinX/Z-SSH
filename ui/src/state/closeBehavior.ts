@@ -65,3 +65,25 @@ export function quitVerdict(state: QuitState): QuitVerdict {
   }
   return { type: "go" };
 }
+
+/** 关闭 Z-SFTP 文件窗口时：`close` 断开里面的 SFTP 再关窗口（默认），`merge` 把标签原样交回主窗口。 */
+export type FileWindowCloseAction = "close" | "merge";
+
+export const DEFAULT_FILE_WINDOW_CLOSE_ACTION: FileWindowCloseAction = "close";
+
+/** 库里读回来的值：只有明确是 `merge` 才合并，缺省或乱七八糟的值一律按默认（断开并关闭）。 */
+export function parseFileWindowCloseAction(raw: unknown): FileWindowCloseAction {
+  return raw === "merge" ? "merge" : DEFAULT_FILE_WINDOW_CLOSE_ACTION;
+}
+
+/**
+ * 关文件窗口时要不要先把标签合并回主窗口：设置选了合并、窗口里确实有标签、
+ * 并且不是"合并已经做完、窗口正在真的关"那一次。
+ */
+export function shouldMergeOnClose(
+  action: FileWindowCloseAction,
+  tabCount: number,
+  closing: boolean,
+): boolean {
+  return action === "merge" && tabCount > 0 && !closing;
+}

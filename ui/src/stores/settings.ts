@@ -19,7 +19,12 @@ import {
   TERMINAL_FOLLOW_SKIN,
   type Skin,
 } from "../state/skins";
-import { parseCloseAction, type CloseAction } from "../state/closeBehavior";
+import {
+  parseCloseAction,
+  parseFileWindowCloseAction,
+  type CloseAction,
+  type FileWindowCloseAction,
+} from "../state/closeBehavior";
 import { applyUiTokens, type UiThemeMode } from "../state/uiThemes";
 import { SAMPLE_RULES, upgradeLegacySamples } from "../terminal/highlightSamples";
 import type { ITheme } from "@xterm/xterm";
@@ -54,6 +59,8 @@ export const SETTING_DEFAULTS = {
   // tray_hint_shown：第一次缩到托盘的提示出过了（本机状态，不同步）
   close_action: "tray",
   tray_hint_shown: false,
+  // 关闭 Z-SFTP 文件窗口时：close = 断开并关闭（默认），merge = 标签交回主窗口；本机习惯，不同步。
+  file_window_close: "close",
   // 连接
   pool_idle_timeout_secs: 60,
   keepalive_interval_secs: 30,
@@ -128,6 +135,7 @@ export interface SettingValues {
   // 窗口
   close_action: CloseAction;
   tray_hint_shown: boolean;
+  file_window_close: FileWindowCloseAction;
   // 连接
   pool_idle_timeout_secs: number;
   keepalive_interval_secs: number;
@@ -285,6 +293,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
     values.terminal_theme = normalizeTerminalTheme(values.terminal_theme);
     // 「关闭主窗口时」：读不懂的值按默认（缩到托盘）
     values.close_action = parseCloseAction(values.close_action);
+    values.file_window_close = parseFileWindowCloseAction(values.file_window_close);
     confirmed = { ...values };
     set({ ...values, loaded: true });
     applyAppearance(get());

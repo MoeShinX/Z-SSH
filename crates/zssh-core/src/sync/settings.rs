@@ -68,6 +68,8 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     // 同步过去会让另一台电脑的 × 突然变了行为；「托盘提示出过了」是本机状态。都不同步。
     ("close_action", SyncMode::LocalOnly),
     ("tray_hint_shown", SyncMode::LocalOnly),
+    // 关闭 Z-SFTP 文件窗口时断开还是合并回主窗口（UI-5）：同样是每台电脑的使用习惯，不同步。
+    ("file_window_close", SyncMode::LocalOnly),
     ("quick_commands_bar", SyncMode::LocalOnly),
     ("quick_commands_group", SyncMode::LocalOnly),
     // 软件自身联网的代理：各台电脑的网络环境不一样
@@ -1118,6 +1120,7 @@ mod tests {
             // UI-4：关闭主窗口的行为是本机习惯，托盘提示状态是本机状态
             "close_action",
             "tray_hint_shown",
+            "file_window_close",
         ] {
             assert_eq!(sync_mode(key), Some(SyncMode::LocalOnly), "{key}");
             assert!(!is_synced(key), "{key} 不能同步");

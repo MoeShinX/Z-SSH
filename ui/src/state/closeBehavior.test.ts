@@ -4,7 +4,9 @@ import {
   decideClose,
   DEFAULT_CLOSE_ACTION,
   parseCloseAction,
+  parseFileWindowCloseAction,
   quitVerdict,
+  shouldMergeOnClose,
 } from "./closeBehavior";
 
 describe("parseCloseAction", () => {
@@ -75,5 +77,22 @@ describe("quitVerdict（和 UI-4 之前 onCloseRequested 的判断一致）", ()
     expect(quitVerdict({ unsavedDocs: 1, transfers: 1, dirtyEdits: 1, confirmed: true })).toEqual({
       type: "go",
     });
+  });
+});
+
+describe("关闭 Z-SFTP 文件窗口", () => {
+  it("缺省和读不懂的值都按「断开并关闭」，只有 merge 才合并", () => {
+    expect(parseFileWindowCloseAction(undefined)).toBe("close");
+    expect(parseFileWindowCloseAction("")).toBe("close");
+    expect(parseFileWindowCloseAction("something-else")).toBe("close");
+    expect(parseFileWindowCloseAction("close")).toBe("close");
+    expect(parseFileWindowCloseAction("merge")).toBe("merge");
+  });
+
+  it("合并只在：选了合并、窗口里有标签、不是正在真的关", () => {
+    expect(shouldMergeOnClose("merge", 2, false)).toBe(true);
+    expect(shouldMergeOnClose("close", 2, false)).toBe(false);
+    expect(shouldMergeOnClose("merge", 0, false)).toBe(false);
+    expect(shouldMergeOnClose("merge", 2, true)).toBe(false);
   });
 });

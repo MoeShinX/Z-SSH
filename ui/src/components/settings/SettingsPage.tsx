@@ -76,7 +76,7 @@ import {
   ThemeModeButtons,
 } from "./AppearancePickers";
 import { EXEC_MODE_OPTIONS, toExecMode } from "../../state/execMode";
-import { parseCloseAction } from "../../state/closeBehavior";
+import { parseCloseAction, parseFileWindowCloseAction } from "../../state/closeBehavior";
 
 type SectionId =
   | "appearance"
@@ -213,9 +213,13 @@ function Slider({
   );
 }
 
-/** 关闭主窗口时缩到托盘还是退出程序（UI-4）。本机习惯，不参与配置同步。 */
+/**
+ * 关闭主窗口时缩到托盘还是退出程序（UI-4），关闭 Z-SFTP 文件窗口时断开还是合并回主窗口（UI-5）。
+ * 都是本机习惯，不参与配置同步。
+ */
 function WindowCard() {
   const closeAction = useSettings((state) => state.close_action);
+  const fileWindowClose = useSettings((state) => state.file_window_close);
   const update = useSettings((state) => state.update);
   return (
     <SectionCard title="窗口">
@@ -233,6 +237,25 @@ function WindowCard() {
           <SelectContent>
             <SelectItem value="tray">缩到托盘</SelectItem>
             <SelectItem value="quit">退出程序</SelectItem>
+          </SelectContent>
+        </Select>
+      </SettingRow>
+      <SettingRow
+        title="关闭 Z-SFTP 窗口时"
+        description="断开并关闭：窗口里的 SFTP 全部断开（有传输在跑会先问）。合并回主窗口：标签原样交回主窗口，连接和传输都不中断。单个标签上的 × 始终是断开。"
+      >
+        <Select
+          value={fileWindowClose}
+          onValueChange={(value) =>
+            void update("file_window_close", parseFileWindowCloseAction(value))
+          }
+        >
+          <SelectTrigger className="h-9 w-56" data-testid="file-window-close">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="close">断开并关闭</SelectItem>
+            <SelectItem value="merge">合并回主窗口</SelectItem>
           </SelectContent>
         </Select>
       </SettingRow>

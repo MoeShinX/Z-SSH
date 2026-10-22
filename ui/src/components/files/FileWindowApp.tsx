@@ -30,6 +30,7 @@ import {
   tabFromHandoff,
   type FileWindowTab,
 } from "../../state/fileWindowTabs";
+import { shouldMergeOnClose } from "../../state/closeBehavior";
 import { useSettings } from "../../stores/settings";
 import SftpTabView, { type SftpPaths } from "../sftp/SftpTabView";
 import { WindowControls } from "../titlebar/TopTabs";
@@ -247,7 +248,30 @@ export default function FileWindowApp() {
     [removeTab],
   );
 
-  // 关窗口：有传输先问；然后断开这个窗口里的全部 SFTP。
+  /**
+   * 设置选了「合并回主窗口」时关窗口走这里：每个连好的标签原样交给主窗口（连接、传输都不断），
+   * 没连好的标签没有会话可交，直接收掉；最后一个标签走了，窗口自己会关。
+   * 某个标签交不过去就停在这里、窗口留着（报错已经弹了），不会把还没交的标签断开。
+   */
+  const mergeAllToMain = useCallback(async () => {
+    for (const tab of [...tabsRef.current]) {
+      if (tab.phase === "ready" && tab.sftpId) {
+        try {
+          await returnToMain(handoffOf(tab, pathsRef.current.get(tab.sftpId)));
+        } catch (error: unknown) {
+          toast.error(`移回主窗口失败：${errorText(error)}`);
+          return;
+        }
+        removeTab(tab.id, false);
+      } else {
+        removeTab(tab.id, true);
+      }
+    }
+  }, [removeTab]);
+  const mergeAllRef = useRef(mergeAllToMain);
+  mergeAllRef.current = mergeAllToMain;
+
+  // 关窗口：设置选了合并就把标签交回主窗口；否则有传输先问，然后断开这个窗口里的全部 SFTP。
   useEffect(() => {
     const win = getCurrentWindow();
     let stop: (() => void) | null = null;
@@ -261,6 +285,21 @@ export default function FileWindowApp() {
       .onCloseRequested(async (event) => {
         if (closingRef.current) {
           await closeAll();
+          return;
+        }
+        if (!useSettings.getState().loaded) {
+          // 设置还没读回来（刚打开几秒内）：先读，免得拿默认值盖掉用户选的「合并」。
+          await useSettings.getState().load().catch(() => {});
+        }
+        if (
+          shouldMergeOnClose(
+            useSettings.getState().file_window_close,
+            tabsRef.current.length,
+            closingRef.current,
+          )
+        ) {
+          event.preventDefault();
+          await mergeAllRef.current();
           return;
         }
         const busy = [...activeTransfers.current.values()].reduce((sum, n) => sum + n, 0);

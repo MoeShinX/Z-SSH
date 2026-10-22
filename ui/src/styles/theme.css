@@ -199,7 +199,7 @@ body {
 
 /* 自绘标题栏（TopTabs）：无边框窗口的窗口按钮。
    Adapted from Netcatty index.css 的 [data-section="top-tabs"] 一段。 */
-[data-section="top-tabs"] .window-control-btn {
+:is([data-section="top-tabs"], [data-section="file-window-titlebar"]) .window-control-btn {
   position: relative;
   z-index: 0;
   display: flex;
@@ -213,7 +213,7 @@ body {
   cursor: pointer;
 }
 
-[data-section="top-tabs"] .window-control-btn::before {
+:is([data-section="top-tabs"], [data-section="file-window-titlebar"]) .window-control-btn::before {
   content: "";
   position: absolute;
   left: 0;
@@ -225,15 +225,20 @@ body {
   transition: background-color 150ms ease;
 }
 
-[data-section="top-tabs"] .window-control-btn:hover::before {
+/* Z-SFTP 窗口的标题栏是 2.5rem 高（主窗口 2.25rem）：悬停底色也要一直顶到窗口上边。 */
+[data-section="file-window-titlebar"] .window-control-btn::before {
+  top: calc(1.75rem - 2.5rem);
+}
+
+:is([data-section="top-tabs"], [data-section="file-window-titlebar"]) .window-control-btn:hover::before {
   background: hsl(var(--foreground) / 0.1);
 }
 
-[data-section="top-tabs"] .window-control-btn--close:hover {
+:is([data-section="top-tabs"], [data-section="file-window-titlebar"]) .window-control-btn--close:hover {
   color: white;
 }
 
-[data-section="top-tabs"] .window-control-btn--close:hover::before {
+:is([data-section="top-tabs"], [data-section="file-window-titlebar"]) .window-control-btn--close:hover::before {
   background: rgb(239 68 68);
 }
 
