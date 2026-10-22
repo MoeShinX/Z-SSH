@@ -40,7 +40,7 @@ export function isEditableElement(element: Element | null): boolean {
   return false;
 }
 
-const NON_TEXT_INPUT_TYPES = new Set([
+export const NON_TEXT_INPUT_TYPES = new Set([
   "button",
   "checkbox",
   "color",

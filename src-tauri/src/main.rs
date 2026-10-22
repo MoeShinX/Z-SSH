@@ -5,6 +5,7 @@ mod commands;
 mod events;
 mod file_window;
 mod interact;
+mod native_menu;
 mod state;
 mod sync_controller;
 mod tray;
@@ -289,6 +290,10 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             apply_initial_window_geometry(app);
+            // WebView2 自带右键菜单只留编辑项（NATIVE-1）；挂不上只记日志
+            if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+                native_menu::install(&main);
+            }
             let data_dir = resolve_data_dir(app)?;
             let store = open_store(&data_dir)?;
             info!(dir = %data_dir.display(), "数据目录");

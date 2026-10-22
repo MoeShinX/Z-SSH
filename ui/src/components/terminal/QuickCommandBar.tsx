@@ -2,6 +2,7 @@
 //!
 //! - 单击：发到当前焦点的窗格；Ctrl+单击（或这个标签开着输入广播）：发到这个标签的所有分屏
 //! - 右键按钮：编辑 / 删除 / 发到所有分屏
+//! - 双击或右键按钮之间 / 后面的空白处：新建一条快捷命令
 //! - 最左边：管理快捷命令；分组切换；输入广播开关
 //! - 上边框可以拖：默认一行（放不下横向滚动），拖高后按钮自动换行、放不下纵向滚动；
 //!   双击拖动条恢复一行
@@ -34,6 +35,8 @@ export interface QuickCommandBarProps {
   /** `all` = 发到这个标签的所有分屏。 */
   onRun: (command: QuickCommand, all: boolean) => void;
   onManage: () => void;
+  /** 在空白处双击 / 右键：直接新建一条。 */
+  onCreate: () => void;
   onEdit: (command: QuickCommand) => void;
   onDelete: (command: QuickCommand) => void;
   /** 这个标签开着输入广播（键盘输入同时发到所有分屏）。 */
@@ -50,6 +53,7 @@ export default function QuickCommandBar({
   onGroupChange,
   onRun,
   onManage,
+  onCreate,
   onEdit,
   onDelete,
   broadcast,
@@ -119,6 +123,16 @@ export default function QuickCommandBar({
             ? "min-h-0 flex-wrap content-start self-stretch overflow-y-auto"
             : "items-center overflow-x-auto [scrollbar-width:none]",
         )}
+        // 只认点在列表自己身上（按钮之间、后面的空白）：命令按钮上的双击 / 右键照旧
+        onDoubleClick={(event) => {
+          if (event.target === event.currentTarget) onCreate();
+        }}
+        onContextMenu={(event) => {
+          if (event.target !== event.currentTarget) return;
+          event.preventDefault();
+          onCreate();
+        }}
+        title={commands.length > 0 ? "双击或右键空白处新建快捷命令" : undefined}
         onWheel={(event) => {
           const element = scrollRef.current;
           if (!tall && element && event.deltaY !== 0) element.scrollLeft += event.deltaY;

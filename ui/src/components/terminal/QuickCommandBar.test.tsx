@@ -32,6 +32,7 @@ const props = (patch: Partial<QuickCommandBarProps> = {}): QuickCommandBarProps 
   onGroupChange: vi.fn(),
   onRun: vi.fn(),
   onManage: vi.fn(),
+  onCreate: vi.fn(),
   onEdit: vi.fn(),
   onDelete: vi.fn(),
   broadcast: false,
@@ -48,6 +49,22 @@ describe("快捷命令栏", () => {
     expect(p.onRun).toHaveBeenLastCalledWith(expect.objectContaining({ id: "a" }), false);
     fireEvent.click(screen.getByText("系统更新"), { ctrlKey: true });
     expect(p.onRun).toHaveBeenLastCalledWith(expect.objectContaining({ id: "b" }), true);
+  });
+
+  it("双击或右键空白处新建；点在命令按钮上不算", () => {
+    const p = props();
+    const { container } = render(<QuickCommandBar {...p} />);
+    const list = container.querySelector('[data-section="quick-command-list"]') as HTMLElement;
+    fireEvent.doubleClick(list);
+    expect(p.onCreate).toHaveBeenCalledTimes(1);
+    const menu = fireEvent.contextMenu(list);
+    expect(p.onCreate).toHaveBeenCalledTimes(2);
+    // 空白处右键不弹浏览器自己的菜单
+    expect(menu).toBe(false);
+
+    fireEvent.doubleClick(screen.getByText("端口查看"));
+    fireEvent.contextMenu(screen.getByText("系统更新"));
+    expect(p.onCreate).toHaveBeenCalledTimes(2);
   });
 
   it("没有命令时引导去添加", () => {

@@ -2971,6 +2971,7 @@ export default function App() {
                         }
                         onRun={runQuickCommand}
                         onManage={() => openQuickCommandsPanel(quickCommands.length ? null : "new")}
+                        onCreate={() => openQuickCommandsPanel("new")}
                         onEdit={(command) => openQuickCommandsPanel(command.id)}
                         onDelete={(command) =>
                           setConfirm({

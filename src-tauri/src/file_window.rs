@@ -81,7 +81,7 @@ pub fn ensure_open<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = window.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("Z-SFTP")
         // 和主窗口一样自绘标题栏：系统标题栏只跟系统深浅色走，不跟 Z-SSH 的主题
         .decorations(false)
@@ -91,6 +91,8 @@ pub fn ensure_open<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .initialization_script("window.__ZSSH_WINDOW__ = 'files';")
         .build()
         .map_err(|err| format!("打开文件窗口失败：{err}"))?;
+    // WebView2 自带右键菜单只留编辑项（NATIVE-1）
+    crate::native_menu::install(&window);
     info!("文件窗口已打开");
     let _ = app.emit_to("main", STATE_EVENT, true);
     Ok(())
