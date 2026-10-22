@@ -43,7 +43,7 @@ const writeCall = {
 
 function renderCard(approval: PendingApproval, onAnswer = vi.fn()) {
   const view = render(
-    <ToolCard call={writeCall} hosts={{}} pinnedHosts={[]} approval={approval} onAnswer={onAnswer} />,
+    <ToolCard call={writeCall} hosts={{}} approval={approval} onAnswer={onAnswer} />,
   );
   return { ...view, onAnswer };
 }
@@ -96,7 +96,7 @@ describe("write_file 的确认卡片", () => {
         "danger: flagged as a system path (写入系统路径：系统配置目录 /etc)\n",
     };
     const { container } = render(
-      <ToolCard call={call} hosts={{}} pinnedHosts={[]} onAnswer={() => {}} />,
+      <ToolCard call={call} hosts={{}} onAnswer={() => {}} />,
     );
     expect(container.querySelector('[data-section="file-danger"]')?.textContent).toContain("/etc");
     expect(container.textContent).toContain("/etc/motd.zssh-bak-1");
@@ -114,7 +114,7 @@ describe("read_file 的工具卡片", () => {
       status: "done" as const,
     };
     const { container, queryByText } = render(
-      <ToolCard call={call} hosts={{}} pinnedHosts={[]} onAnswer={() => {}} />,
+      <ToolCard call={call} hosts={{}} onAnswer={() => {}} />,
     );
     expect(container.textContent).toContain("读取文件");
     expect(container.querySelector('[data-section="file-path"]')?.textContent).toBe(
@@ -134,7 +134,7 @@ describe("read_file 的工具卡片", () => {
       status: "done" as const,
     };
     const { container } = render(
-      <ToolCard call={call} hosts={{}} pinnedHosts={[]} onAnswer={() => {}} />,
+      <ToolCard call={call} hosts={{}} onAnswer={() => {}} />,
     );
     const pre = container.querySelector("details pre");
     expect(pre?.textContent).toBe("path: /home/u/notes.txt\ncontent:\nhello\nworld\n");
@@ -156,7 +156,7 @@ describe("write_file 的属主提示", () => {
       status: "done" as const,
     };
     const { container } = render(
-      <ToolCard call={call} hosts={{}} pinnedHosts={[]} onAnswer={() => {}} />,
+      <ToolCard call={call} hosts={{}} onAnswer={() => {}} />,
     );
     const note = container.querySelector('[data-section="owner-change"]');
     expect(note?.textContent).toContain("uid 0 / gid 0");

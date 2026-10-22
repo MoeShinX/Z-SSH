@@ -12,6 +12,8 @@ import { attachHighlighter, compileRules, parseRules } from "../terminal/highlig
 import { imeFocus } from "../terminal/imeFocus";
 import {
   createLinkDoubleClickGate,
+  isOpenableUrl,
+  LINK_CLICK_MOVE_PX,
   linkSelection,
   type HoveredLink,
   type TerminalLinkHandlers,
@@ -142,14 +144,15 @@ export default function TerminalView({
     setPending(null);
     toast.info("会话已变化，已取消待确认的粘贴");
   }, [pasteTarget, pending]);
-  // 鼠标当前悬停的链接（xterm 的 hover / leave 回调维护）。右键只在悬停链接时弹链接菜单，
-  // 所以"有没有悬停"同时放一份 state 给菜单触发器用；链接本身放 ref，避免每次悬停都重建终端。
+  // 鼠标当前悬停的链接（xterm 的 hover / leave 回调维护，菜单开着也照常更新）。右键只在悬停
+  // 链接时弹链接菜单，所以"有没有悬停"同时放一份 state 给菜单触发器用；链接本身放 ref，
+  // 避免每次悬停都重建终端。
   const hoveredLinkRef = useRef<HoveredLink | null>(null);
   const [linkHovered, setLinkHovered] = useState(false);
-  // 菜单开着的时候冻结悬停状态：弹出后鼠标事件被菜单挡住，xterm 的 leave 不代表用户离开了链接。
-  const menuOpenRef = useRef(false);
-  // 右键那一刻的链接（菜单项用它，不受之后悬停变化影响）
+  // 右键那一刻的链接目标网址：菜单项只认它，不受菜单开着时悬停变化的影响；菜单关了就清掉，
+  // 之后以实时悬停为准。能不能「打开」另存一份 state，给菜单项置灰用（非 http / https 只能复制）。
   const menuLinkRef = useRef<string | null>(null);
+  const [menuLinkOpenable, setMenuLinkOpenable] = useState(true);
   const openLink = (uri: string) => {
     void openExternalUrl(uri).catch((error: unknown) => {
       toast.error(typeof error === "string" ? error : "没能打开链接");
@@ -164,23 +167,41 @@ export default function TerminalView({
     const container = containerRef.current;
     if (!container) return;
 
-    // 链接：单击选中整条链接（之后可 Ctrl+C 复制；开了选中即复制就自动复制），双击用系统浏览器打开。
-    const isDoubleClick = createLinkDoubleClickGate();
+    // 链接（文本网址和 OSC 8 超链接共用）：单击选中链接的显示文字（之后可 Ctrl+C 复制；
+    // 开了选中即复制就自动复制），双击用系统浏览器打开目标网址。
+    const doubleClickGate = createLinkDoubleClickGate();
+    // 最近一次左键按下的位置，抬起时据此判断是不是拖选
+    let mouseDown: { x: number; y: number } | null = null;
     const links: TerminalLinkHandlers = {
+      // 实时跟着 xterm 的进入 / 离开走（菜单开着也一样）；离开链接就清掉双击候选
       onHover: (link) => {
-        if (menuOpenRef.current) return;
         hoveredLinkRef.current = link;
         setLinkHovered(link !== null);
+        if (!link) doubleClickGate.reset();
       },
-      onActivate: (uri) => {
-        if (isDoubleClick(uri)) {
-          // 第一下单击已经把链接选中了，选区保留
-          openLinkRef.current(uri);
+      onActivate: (uri, event, range) => {
+        // 文本网址的回调不带范围，用 hover 记下的那条；OSC 8 的回调自带范围
+        const hovered = hoveredLinkRef.current;
+        const target: HoveredLink | null = range
+          ? { uri, range }
+          : hovered && hovered.uri === uri
+            ? hovered
+            : null;
+        if (!target) return;
+        // 按下和抬起隔得远：是拖选，不是点链接
+        if (
+          mouseDown &&
+          Math.hypot(event.clientX - mouseDown.x, event.clientY - mouseDown.y) > LINK_CLICK_MOVE_PX
+        ) {
+          doubleClickGate.reset();
           return;
         }
-        const link = hoveredLinkRef.current;
-        if (!link || link.uri !== uri) return;
-        const { column, row, length } = linkSelection(link.range, terminal.cols);
+        if (doubleClickGate.isDoubleClick({ uri, range: target.range, detail: event.detail })) {
+          // 第一下单击已经把链接选中了，选区保留
+          if (isOpenableUrl(uri)) openLinkRef.current(uri);
+          return;
+        }
+        const { column, row, length } = linkSelection(target.range, terminal.cols);
         terminal.select(column, row, length);
       },
     };
@@ -205,6 +226,7 @@ export default function TerminalView({
       // 在链接上右键：不粘贴，交给下面的链接菜单（Radix 的触发器接着处理这个事件）
       if (hoveredLinkRef.current) {
         menuLinkRef.current = hoveredLinkRef.current.uri;
+        setMenuLinkOpenable(isOpenableUrl(hoveredLinkRef.current.uri));
         return;
       }
       if (!behaviorRef.current.rightClickPaste) return;
@@ -220,6 +242,9 @@ export default function TerminalView({
     // 链接上的第二下按下：不让 xterm 做双击选词，否则会把刚选中的整条链接换成一个词
     // （选中即复制时还会把这个词写进剪贴板）。抬起事件照常放行，链接的双击判定靠它。
     const onMouseDownCapture = (event: MouseEvent) => {
+      mouseDown = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
+      // 右键、或按在链接以外的地方：之前点的链接不再是双击候选
+      if (event.button !== 0 || !hoveredLinkRef.current) doubleClickGate.reset();
       if (event.button === 0 && event.detail >= 2 && hoveredLinkRef.current) {
         event.stopPropagation();
       }
@@ -424,7 +449,7 @@ export default function TerminalView({
     <>
       <ContextMenu
         onOpenChange={(open) => {
-          menuOpenRef.current = open;
+          if (!open) menuLinkRef.current = null;
         }}
       >
         <ContextMenuTrigger asChild disabled={!linkHovered}>
@@ -438,8 +463,10 @@ export default function TerminalView({
           }}
         >
           <ContextMenuItem
+            disabled={!menuLinkOpenable}
             onSelect={() => {
-              if (menuLinkRef.current) openLinkRef.current(menuLinkRef.current);
+              const uri = menuLinkRef.current;
+              if (uri && isOpenableUrl(uri)) openLinkRef.current(uri);
             }}
           >
             <ExternalLink className="mr-2 h-3.5 w-3.5" />

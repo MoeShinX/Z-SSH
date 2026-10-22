@@ -175,16 +175,6 @@ export function friendlyAgentError(message: string): string {
 /** 一个 @ 主机（或当前那台）在标签状态点上的状态（AI-2d 3.2）。 */
 export type HostDotState = "connected" | "connecting" | "offline";
 
-/**
- * 还能不能把这台主机 @ 进对话（AI-2d 3.1）。
- *
- * 已经是"当前焦点终端"那台就不要再加一个标签：目标列表里它已经以
- * "（当前）"的形式在了，再加一条就是重复。
- */
-export function canPinHost(hostId: number, currentHostId: number | null): boolean {
-  return currentHostId === null || hostId !== currentHostId;
-}
-
 /** @ 标签状态点的颜色类（AI-2d 3.2：反映真实状态，不是固定琥珀色）。 */
 export function hostDotClass(state: HostDotState): string {
   switch (state) {
@@ -394,4 +384,28 @@ export function ownerChangeOf(output: string): { from: string; to: string } | nu
     /owner: could not restore the file's owner: it changed from (.*?) to ([^\n(]+)/i,
   );
   return match ? { from: match[1].trim(), to: match[2].trim() } : null;
+}
+
+/** `host-<id>` 目标 ID 里的主机 id（不是这种格式返回 null）。 */
+export function parseHostTargetId(targetId: string): number | null {
+  const match = /^host-(\d+)$/.exec(targetId);
+  if (!match) return null;
+  const id = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(id) ? id : null;
+}
+
+/** 从工具输入里取目标 ID（AI-2c：`target_id`）。 */
+export function targetIdOf(input: unknown): string | null {
+  if (input && typeof input === "object" && "target_id" in input) {
+    const id = (input as { target_id?: unknown }).target_id;
+    if (typeof id === "string" && id !== "") return id;
+  }
+  return null;
+}
+
+/** 这个工具是不是作用在某个目标服务器上（`list_targets` 之类列表工具不是）。 */
+export function toolHasTarget(tool: string): boolean {
+  return ["run_command", "read_terminal", "list_dir", "read_file", "write_file", "stat"].includes(
+    bareToolName(tool),
+  );
 }

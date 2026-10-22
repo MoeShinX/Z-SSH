@@ -38,7 +38,6 @@ function renderApproval(command: string) {
     <ToolCard
       call={runCall(command)}
       hosts={{}}
-      pinnedHosts={[]}
       approval={approval(visibleCommandText(command))}
       onAnswer={vi.fn()}
     />,
@@ -67,7 +66,6 @@ describe("执行命令的审批卡片：不可见字符", () => {
       <ToolCard
         call={runCall("ls\\x15rm -rf ~")}
         hosts={{}}
-        pinnedHosts={[]}
         approval={approval("ls\\x15rm -rf ~")}
         onAnswer={vi.fn()}
       />,

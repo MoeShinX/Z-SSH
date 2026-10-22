@@ -74,12 +74,26 @@ import { callFailed, groupChatItems, progressText, summarizeCalls } from "./tool
 import { AI_PANEL_DEFAULT } from "../../state/panelWidths";
 import {
   agentAvailabilityOf,
-  canPinHost,
   hostDotClass,
   hostDotTitle,
   hostStateOf,
-  hostTargetId,
+  sessionIdOf,
+  targetIdOf,
 } from "./aiHelpers";
+import {
+  buildScopeTargets,
+  describeCallTarget,
+  pinHost,
+  pinIsCurrent,
+  pinKey,
+  pruneRetained,
+  registerTargets,
+  retainPrevious,
+  type KnownTarget,
+  type PinnedHost,
+  type ScopeSession,
+} from "./scopeTargets";
+import type { TargetRef } from "../../state/aiTarget";
 import {
   CONTEXT_LOST_NOTICE,
   formatHistoryTime,
@@ -88,6 +102,7 @@ import {
   historyHostLabel,
   newHistoryId,
   toHistoryMessages,
+  type CallTarget,
   type ChatItem,
   type ToolCall,
 } from "./chatHistory";
@@ -151,12 +166,13 @@ export interface PendingApproval {
   file?: ApprovalRequest["file"];
 }
 
-/** 输入框里 @ 进来的一个目标（主机库里的主机）。 */
-export interface PinnedHost {
-  hostId: number;
-  name: string;
-  username: string;
-}
+export type { PinnedHost };
+
+/** AI 在终端里执行命令的开始 / 结束（App 据此在后台标签上显示活动提示）。 */
+export type AiActivityEvent =
+  | { kind: "start"; callId: string; targetId: string }
+  | { kind: "end"; callId: string }
+  | { kind: "reset" };
 
 /** 一个 @ 主机（或者当前那台）的连接状态（标签上的状态点）。 */
 export type HostConnectionState = "connected" | "connecting" | "offline";
@@ -179,8 +195,12 @@ interface AIChatPanelProps {
   firstUse: boolean;
   onMarkUsed: () => void;
   onOpenSettings: () => void;
-  /** 点工具卡片上的"在标签 xxx 执行"跳到那个标签。 */
-  onOpenHost?: (hostId: number) => void;
+  /** 点工具卡片上的"查看终端"：切到那个目标所在的标签和窗格。 */
+  onViewTarget?: (target: TargetRef) => void;
+  /** 界面里所有还开着的会话 ID（判断切走时保留的会话是不是已经关了；不给就当都开着）。 */
+  openSessionIds?: ReadonlySet<string>;
+  /** AI 在终端里执行命令的开始 / 结束。 */
+  onAiActivity?: (event: AiActivityEvent) => void;
   onClose: () => void;
   /** 三块同屏（M3-3）：SFTP 面板占的宽度（拖宽上限要让给它）。 */
   reservedWidth?: number;
@@ -200,13 +220,14 @@ export function appendAssistantText(items: ChatItem[], text: string): ChatItem[]
 }
 
 export default function AIChatPanel({
-  tabId,
   sessions,
   hostStates,
   firstUse,
   onMarkUsed,
   onOpenSettings,
-  onOpenHost,
+  onViewTarget,
+  openSessionIds,
+  onAiActivity,
   onClose,
   reservedWidth = 0,
   widthOverride = null,
@@ -272,6 +293,41 @@ export default function AIChatPanel({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const inputSize = useAiInputHeight(rootRef);
 
+  // 切焦点（AI-SCOPE-1 第 3 节）：对话进行中，原来的"当前"自动转成固定目标留在范围里
+  // （显示成可以 × 掉的标签），新焦点成为"当前"；对话还没开始就跟着焦点走、不累积。
+  // 放在渲染阶段同步完成：目标列表只看到"一步到位"的结果，不会先把旧的移出再加回来
+  // （后端把"目标被移出"当作在途请求失效的信号）。
+  const currentSession: ScopeSession | null = sessions[0] ?? null;
+  const [previousSession, setPreviousSession] = useState<ScopeSession | null>(currentSession);
+  const conversationStarted = sessionKey !== null && hasUserMessage(items);
+  if ((currentSession?.sessionId ?? null) !== (previousSession?.sessionId ?? null)) {
+    setPreviousSession(currentSession);
+    if (conversationStarted) {
+      setPinned((prev) => retainPrevious(prev, previousSession, openSessionIds));
+    }
+  }
+  // 自动保留的会话关了就跟着消失。
+  useEffect(() => {
+    setPinned((prev) => pruneRetained(prev, openSessionIds));
+  }, [openSessionIds]);
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
+  /** 同一台主机只出现一次的目标列表（同步给后端，也是目标标签和卡片的依据）。 */
+  const scopeTargets = useMemo(
+    () => buildScopeTargets(sessions, pinned, openSessionIds),
+    [sessions, pinned, openSessionIds],
+  );
+  /** 对话里出现过的目标：卡片据此标主机名、跳到终端（会话关了也留着）。 */
+  const knownTargetsRef = useRef(new Map<string, KnownTarget>());
+  registerTargets(knownTargetsRef.current, sessions, pinned);
+  const targetStateRef = useRef({ currentId: null as string | null, count: 0 });
+  targetStateRef.current = {
+    currentId: scopeTargets.find((t) => t.current)?.target_id ?? null,
+    count: scopeTargets.length,
+  };
+  const activityRef = useRef(onAiActivity);
+  activityRef.current = onAiActivity;
+
   const keyRef = useRef<string | null>(null);
   const scopeIdRef = useRef<string | null>(null);
   /** 上一次同步给 scope 的目标 ID（判断增减）。 */
@@ -317,6 +373,24 @@ export default function AIChatPanel({
     // 思考过程现在不显示：也不打断文字的合并
     if (payload.kind === "reasoning_delta") return;
     flushText();
+    // 这次调用作用在哪个目标上（卡片标主机名 / 查看终端），以及后台标签的活动提示。
+    let callTarget: CallTarget | null = null;
+    if (payload.kind === "tool_start") {
+      const state = targetStateRef.current;
+      callTarget = describeCallTarget(
+        payload.tool,
+        payload.input,
+        knownTargetsRef.current,
+        state.currentId,
+        state.count,
+      );
+      if (isRunCommand(payload.tool)) {
+        const id = targetIdOf(payload.input) ?? sessionIdOf(payload.input) ?? state.currentId;
+        if (id) activityRef.current?.({ kind: "start", callId: payload.call_id, targetId: id });
+      }
+    } else if (payload.kind === "tool_end" && isRunCommand(payload.tool)) {
+      activityRef.current?.({ kind: "end", callId: payload.call_id });
+    }
     setItems((prev) => {
       switch (payload.kind) {
         case "tool_start":
@@ -333,6 +407,7 @@ export default function AIChatPanel({
                 input: payload.input,
                 output: "",
                 status: "running",
+                ...(callTarget ? { target: callTarget } : {}),
               },
             },
           ];
@@ -367,6 +442,7 @@ export default function AIChatPanel({
     if (payload.kind === "turn_end") {
       setRunning(false);
       setAiRunningInTerminal(false);
+      activityRef.current?.({ kind: "reset" });
       setSaveTick((n) => n + 1);
     }
     if (payload.kind === "resume_failed") {
@@ -376,6 +452,7 @@ export default function AIChatPanel({
     if (payload.kind === "error") {
       setRunning(false);
       setAiRunningInTerminal(false);
+      activityRef.current?.({ kind: "reset" });
       setSaveTick((n) => n + 1);
       if (isAborted(payload.message)) {
         // 用户主动停止（MessageAbortedError）：不是错误，不弹提示（AI-2e 3.1）。
@@ -470,31 +547,14 @@ export default function AIChatPanel({
   useEffect(() => {
     const key = keyRef.current;
     if (!key) return;
-    const wanted: ScopeTargetChange[] = [
-      ...sessions.map((s, index) => ({
-        target_id: s.sessionId,
-        host_label: s.hostLabel,
-        username: s.username,
-        status: "connected",
-        current: index === 0, // 第一个会话（焦点 pane）算"当前"
-        pinned: false,
-      })),
-      ...pinned.map((host) => ({
-        target_id: hostTargetId(host.hostId),
-        host_label: host.name,
-        username: host.username,
-        status: "pinned",
-        current: false,
-        pinned: true,
-      })),
-    ];
+    const wanted: ScopeTargetChange[] = scopeTargets;
     const wantedIds = wanted.map((t) => t.target_id);
     const removed = scopeTargetsRef.current.filter((id) => !wantedIds.includes(id));
     scopeTargetsRef.current = wantedIds;
     void aiAgentScopeSync(key, wanted, removed).catch((error: unknown) =>
       console.warn("同步目标列表失败", error),
     );
-  }, [sessions, pinned, sessionKey]);
+  }, [scopeTargets, sessionKey]);
 
   /**
    * 用户最后一次自己选的思考强度（null = 默认强度）：换模型、换智能体时能保持就保持，
@@ -523,6 +583,9 @@ export default function AIChatPanel({
     setItems(history ? fromHistoryMessages(history.messages, toolMetaOf) : []);
     historyIdRef.current = history?.id ?? null;
     conversationAgentRef.current = target;
+    // 上一个对话切走时自动保留的会话不带进新对话；用户自己 @ 的照旧保留。
+    knownTargetsRef.current.clear();
+    setPinned((prev) => (prev.some((p) => p.retained) ? prev.filter((p) => !p.retained) : prev));
     setContextLost(false);
     setApprovals([]);
     setRunning(false);
@@ -605,6 +668,7 @@ export default function AIChatPanel({
     setSessionKey(null);
     setApprovals([]);
     setAiRunningInTerminal(false);
+    activityRef.current?.({ kind: "reset" });
   }, []);
 
   /** 点历史列表里的一条：结束当前对话，打开那条回看并尝试续接。 */
@@ -683,20 +747,23 @@ export default function AIChatPanel({
     const key = keyRef.current;
     if (!key) return;
     setAiRunningInTerminal(false);
+    activityRef.current?.({ kind: "reset" });
     await aiAgentAbort(key).catch((error: unknown) =>
       console.warn("停止回合失败", error),
     );
   }, []);
 
-  // 面板关掉 / 换标签：结束对话（摘掉会话、销毁 scope）。
+  // 面板关掉：结束对话（摘掉会话、销毁 scope）。切标签不结束对话——「查看终端」要切过去，
+  // 对话和它的作用范围得留着（AI-SCOPE-1）。
   useEffect(() => {
     return () => {
       const key = keyRef.current;
       keyRef.current = null;
       scopeIdRef.current = null;
+      activityRef.current?.({ kind: "reset" });
       if (key) void aiAgentStop(key).catch(() => {});
     };
-  }, [tabId]);
+  }, []);
 
   // @ 选择：打开弹窗时拉主机库。
   const openPicker = useCallback(() => {
@@ -711,25 +778,21 @@ export default function AIChatPanel({
 
   /** 当前焦点终端的会话属于哪台主机（判断 @ 的是不是"当前"那台）。 */
   const currentHostId = sessions[0]?.hostId ?? null;
-  const addPinned = useCallback(
-    (host: HostPickerEntry) => {
-      setPicker(null);
-      // 已经是"当前"那台就不要再加一个标签（AI-2d 3.1）。
-      if (!canPinHost(host.host_id, currentHostId)) {
-        toast.info(`${host.name} 已经是当前终端了`);
-        return;
-      }
-      setPinned((prev) =>
-        prev.some((h) => h.hostId === host.host_id)
-          ? prev
-          : [...prev, { hostId: host.host_id, name: host.name, username: host.username }],
-      );
-    },
-    [currentHostId],
-  );
+  const addPinned = useCallback((host: HostPickerEntry) => {
+    setPicker(null);
+    // 同一台主机只算一个目标（AI-SCOPE-1 第 1 节）：已经在对话里的（当前、本标签其他窗格、
+    // 之前 @ 过的）不新增标签；当前标签里有它的会话时记一个固定标记，让切走焦点后它仍留在范围里。
+    const result = pinHost(
+      pinnedRef.current,
+      { hostId: host.host_id, name: host.name, username: host.username },
+      sessionsRef.current,
+    );
+    if (result.pinned !== pinnedRef.current) setPinned(result.pinned);
+    if (result.alreadyIn) toast.info(`${host.name} 已经在对话里了`);
+  }, []);
 
-  const removePinned = useCallback((hostId: number) => {
-    setPinned((prev) => prev.filter((h) => h.hostId !== hostId));
+  const removePinned = useCallback((key: string) => {
+    setPinned((prev) => prev.filter((p) => pinKey(p) !== key));
   }, []);
 
   const hasSessions = sessions.length > 0;
@@ -810,12 +873,16 @@ export default function AIChatPanel({
     );
   }, []);
 
-  // 会话 id → 主机显示名（工具卡片上标出跑在哪台服务器）。
+  // 目标 id（会话 id / host-<id>）→ 主机显示名（工具卡片上标出跑在哪台服务器）。
+  // 对话里出现过的都在，切走后关掉的会话也还认得。
   const hostLabels = useMemo(() => {
     const map: Record<string, string> = {};
-    for (const session of sessions) map[session.sessionId] = session.hostLabel;
+    for (const [id, target] of knownTargetsRef.current) map[id] = target.label;
     return map;
-  }, [sessions]);
+    // knownTargetsRef 的内容随 sessions / pinned 登记，这两个变了才需要重算
+  }, [sessions, pinned]);
+  /** 对话里有不止一个目标：卡片上要标明在哪台主机执行。 */
+  const showTarget = scopeTargets.length > 1;
 
   const filteredPicker = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
@@ -1122,8 +1189,8 @@ export default function AIChatPanel({
                   key={`group-${row.calls[0].callId}`}
                   calls={row.calls}
                   hosts={hostLabels}
-                  pinnedHosts={pinned}
-                  onOpenHost={onOpenHost}
+                  showTarget={showTarget}
+                  onViewTarget={onViewTarget}
                 />
               );
             }
@@ -1140,9 +1207,9 @@ export default function AIChatPanel({
                 key={row.call.callId}
                 call={row.call}
                 hosts={hostLabels}
-                pinnedHosts={pinned}
+                showTarget={showTarget}
                 approval={approval}
-                onOpenHost={onOpenHost}
+                onViewTarget={onViewTarget}
                 onAnswerApproval={answerApproval}
               />
             );
@@ -1174,9 +1241,9 @@ export default function AIChatPanel({
                   status: "running",
                 }}
                 hosts={hostLabels}
-                pinnedHosts={pinned}
+                showTarget={showTarget}
                 approval={approval}
-                onOpenHost={onOpenHost}
+                onViewTarget={onViewTarget}
                 onAnswer={(allow) => {
                   setApprovals((prev) => prev.filter((a) => a.reqId !== approval.reqId));
                   void aiApprovalAnswer(approval.reqId, allow).catch((error: unknown) =>
@@ -1222,25 +1289,35 @@ export default function AIChatPanel({
               {s.hostLabel}（当前）
             </span>
           ))}
-          {pinned.map((host) => (
-            <span
-              key={host.hostId}
-              className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px]"
-              title={hostDotTitle(hostStateOf(hostStates, host.hostId))}
-            >
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${hostDotClass(hostStateOf(hostStates, host.hostId))}`}
-              />
-              {host.name}
-              <button
-                onClick={() => removePinned(host.hostId)}
-                className="text-muted-foreground hover:text-foreground"
-                title="移除"
-              >
-                <X size={11} />
-              </button>
-            </span>
-          ))}
+          {pinned
+            .filter((pin) => !pinIsCurrent(pin, currentSession ?? undefined))
+            .map((pin) => {
+              const state: HostConnectionState =
+                pin.hostId !== null ? hostStateOf(hostStates, pin.hostId) : "connected";
+              return (
+                <span
+                  key={pinKey(pin)}
+                  data-section="pinned-target"
+                  data-retained={pin.retained ? "true" : undefined}
+                  className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px]"
+                  title={
+                    pin.retained
+                      ? "切走前的终端，已保留在本次对话里"
+                      : hostDotTitle(state)
+                  }
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full ${hostDotClass(state)}`} />
+                  {pin.name}
+                  <button
+                    onClick={() => removePinned(pinKey(pin))}
+                    className="text-muted-foreground hover:text-foreground"
+                    title="移除"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              );
+            })}
         </div>
         {!hasSessions && pinned.length === 0 && (
           <p className="mb-1.5 text-xs text-muted-foreground">
@@ -1375,13 +1452,12 @@ export default function AIChatPanel({
                 </p>
               )}
               {filteredPicker.map((host) => {
-                const isCurrent = !canPinHost(host.host_id, currentHostId);
+                const isCurrent = host.host_id === currentHostId;
                 return (
                   <button
                     key={host.host_id}
                     onClick={() => addPinned(host)}
-                    disabled={isCurrent}
-                    className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted disabled:opacity-60"
+                    className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted"
                   >
                     <span>
                       {host.name}
@@ -1468,13 +1544,13 @@ const ToolGroup = memo(
   function ToolGroup({
     calls,
     hosts,
-    pinnedHosts,
-    onOpenHost,
+    showTarget,
+    onViewTarget,
   }: {
     calls: ToolCall[];
     hosts: Record<string, string>;
-    pinnedHosts: PinnedHost[];
-    onOpenHost?: (hostId: number) => void;
+    showTarget: boolean;
+    onViewTarget?: (target: TargetRef) => void;
   }) {
     const [open, setOpen] = useState(false);
     const failed = calls.filter(callFailed).length;
@@ -1505,8 +1581,8 @@ const ToolGroup = memo(
                 key={call.callId}
                 call={call}
                 hosts={hosts}
-                pinnedHosts={pinnedHosts}
-                onOpenHost={onOpenHost}
+                showTarget={showTarget}
+                onViewTarget={onViewTarget}
                 onAnswer={noopAnswer}
               />
             ))}
@@ -1518,8 +1594,8 @@ const ToolGroup = memo(
   // calls 每次渲染都是新数组，但里面的调用对象没变就不重画（流式输出时每帧都会渲染）
   (prev, next) =>
     prev.hosts === next.hosts &&
-    prev.pinnedHosts === next.pinnedHosts &&
-    prev.onOpenHost === next.onOpenHost &&
+    prev.showTarget === next.showTarget &&
+    prev.onViewTarget === next.onViewTarget &&
     prev.calls.length === next.calls.length &&
     prev.calls.every((call, index) => call === next.calls[index]),
 );
@@ -1528,16 +1604,17 @@ const ToolGroup = memo(
 export function ToolCard({
   call,
   hosts,
-  pinnedHosts,
+  showTarget = false,
   approval,
-  onOpenHost,
+  onViewTarget,
   onAnswer,
 }: {
   call: ToolCall;
   hosts: Record<string, string>;
-  pinnedHosts: PinnedHost[];
+  /** 对话里有不止一个目标：必须标明在哪台主机执行。 */
+  showTarget?: boolean;
   approval?: PendingApproval;
-  onOpenHost?: (hostId: number) => void;
+  onViewTarget?: (target: TargetRef) => void;
   onAnswer: (allow: boolean) => void;
 }) {
   const rawCommand = commandOf(call.input);
@@ -1554,9 +1631,10 @@ export function ToolCard({
   const [diffExpanded, setDiffExpanded] = useState(false);
   const host = hostOf(call.input, hosts);
   const exitCode = call.status === "done" ? exitCodeOf(call.output) : null;
-  // host-<id> 目标：显示 @ 进来的主机名，点它可以跳过去。
-  const targetId = targetIdOf(call.input);
-  const pinnedHost = pinnedHosts.find((h) => `host-${h.hostId}` === targetId);
+  // 执行所在的主机：目标多于一个时必须显示（只有一个时省略，避免啰嗦）。
+  const target = call.target;
+  const targetLabel = target && (showTarget || target.multi) ? target.label : null;
+  const hostName = targetLabel ?? host;
   return (
     <div
       className={cn(
@@ -1567,16 +1645,23 @@ export function ToolCard({
       <div className="flex items-center justify-between gap-2">
         <span className="flex items-center gap-1.5">
           <span className="font-medium">{friendlyToolName(call.tool)}</span>
-          {host && (
-            <span className="font-mono text-[11px] text-muted-foreground">{host}</span>
-          )}
-          {pinnedHost && (
-            <button
-              className="font-mono text-[11px] text-muted-foreground underline decoration-dotted"
-              title="在标签里打开"
-              onClick={() => onOpenHost?.(pinnedHost.hostId)}
+          {hostName && (
+            <span
+              data-section="call-target"
+              className="font-mono text-[11px] text-muted-foreground"
             >
-              在标签 {pinnedHost.name} 执行
+              {hostName}
+            </span>
+          )}
+          {target && onViewTarget && (
+            <button
+              type="button"
+              data-action="view-terminal"
+              className="text-[11px] text-muted-foreground underline decoration-dotted hover:text-foreground"
+              title="切到这台主机的终端标签（还没连上、正在连也可以，能看到连接过程）"
+              onClick={() => onViewTarget({ sessionId: target.sessionId, hostId: target.hostId })}
+            >
+              查看终端
             </button>
           )}
         </span>
@@ -1732,15 +1817,6 @@ export function ToolCard({
       )}
     </div>
   );
-}
-
-/** 从工具输入里取目标 ID（AI-2c：`target_id`）。 */
-function targetIdOf(input: unknown): string | null {
-  if (input && typeof input === "object" && "target_id" in input) {
-    const id = (input as { target_id?: unknown }).target_id;
-    if (typeof id === "string") return id;
-  }
-  return null;
 }
 
 /** 工具结果里被拒绝的文案（AI-1 的拒绝错误文本）。 */

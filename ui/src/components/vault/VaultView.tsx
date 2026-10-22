@@ -373,8 +373,8 @@ export function HostTreeAside({
   const treeActions: HostActions = infoPanel
     ? {
         ...hostActions,
-        select: (host) => {
-          clickHostInfo(host.id);
+        select: (host, clickCount) => {
+          clickHostInfo(host.id, clickCount);
           hostActions.select(host);
         },
         connect: (host) => {
@@ -732,7 +732,8 @@ function GroupBranch({
 }
 
 export interface HostActions {
-  select: (host: Host) => void;
+  /** `clickCount` 是点击计数（`MouseEvent.detail`），双击的第二下是 2；没有鼠标事件的调用方不传。 */
+  select: (host: Host, clickCount?: number) => void;
   connect: (host: Host) => void;
   openSftp: (host: Host) => void;
   remove: (host: Host) => void;
@@ -765,7 +766,7 @@ function HostLeaf({
           data-section="tree-host"
           data-drop-group={host.group_id ?? "none"}
           onPointerDown={(event) => startHostDrag(host, event)}
-          onClick={() => !dragJustEnded() && actions.select(host)}
+          onClick={(event) => !dragJustEnded() && actions.select(host, event.detail)}
           onDoubleClick={() => actions.connect(host)}
           title={`${host.username}@${host.host}:${host.port}（双击连接）`}
           {...guideAttrs(guide)}

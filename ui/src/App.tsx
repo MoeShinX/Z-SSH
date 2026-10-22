@@ -84,7 +84,8 @@ import {
   sanitizeStoredWidth,
   setHostTreeRightReserved,
 } from "./state/panelWidths";
-import AIChatPanel from "./components/ai/AIChatPanel";
+import AIChatPanel, { type AiActivityEvent } from "./components/ai/AIChatPanel";
+import { aiTabBadges, locateTarget, tabForTargetId, type TargetRef } from "./state/aiTarget";
 import { aiTabFor } from "./state/aiTab";
 import DockRow from "./components/terminal/DockRow";
 import TerminalLayer from "./components/terminal/TerminalLayer";
@@ -2318,6 +2319,65 @@ export default function App() {
     return states;
   }, [ws.panes]);
 
+  // 所有还开着的会话（AI 切走焦点时保留的会话是不是已经关了，面板据此判断）。
+  const openSessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const pane of Object.values(ws.panes)) if (pane.sessionId) ids.add(pane.sessionId);
+    return ids;
+  }, [ws.panes]);
+
+  // 后台标签的 AI 活动提示（AI-SCOPE-1 第 4 节）：AI 正在某个没在看的标签里执行命令时
+  // 显示活动点；跑完还没看过显示「有新输出」点；切过去就清掉。
+  const [aiRunning, setAiRunning] = useState<Record<string, string>>({});
+  const aiRunningRef = useRef<Record<string, string>>({});
+  const [aiUnseen, setAiUnseen] = useState<string[]>([]);
+  const handleAiActivity = useCallback((event: AiActivityEvent) => {
+    if (event.kind === "start") {
+      aiRunningRef.current = { ...aiRunningRef.current, [event.callId]: event.targetId };
+      setAiRunning(aiRunningRef.current);
+    } else if (event.kind === "end") {
+      const targetId = aiRunningRef.current[event.callId];
+      if (targetId === undefined) return;
+      const { [event.callId]: _done, ...rest } = aiRunningRef.current;
+      aiRunningRef.current = rest;
+      setAiRunning(rest);
+      const current = wsRef.current;
+      const tabId = tabForTargetId(current.tabs, current.panes, targetId);
+      if (tabId) setAiUnseen((prev) => (prev.includes(tabId) ? prev : [...prev, tabId]));
+    } else if (Object.keys(aiRunningRef.current).length > 0) {
+      aiRunningRef.current = {};
+      setAiRunning({});
+    }
+  }, []);
+  const watchedTabId = view === "terminal" ? ws.activeTabId : null;
+  useEffect(() => {
+    if (watchedTabId && aiUnseen.includes(watchedTabId)) {
+      setAiUnseen((prev) => prev.filter((id) => id !== watchedTabId));
+    }
+  }, [watchedTabId, aiUnseen]);
+  const aiBadges = useMemo(
+    () =>
+      aiTabBadges(ws.tabs, ws.panes, Object.values(aiRunning), aiUnseen, watchedTabId),
+    [ws.tabs, ws.panes, aiRunning, aiUnseen, watchedTabId],
+  );
+
+  // 工具卡片上的「查看终端」：切到那个目标所在的标签和窗格（还没连上也可以，能看到连接过程）。
+  const viewAiTarget = useCallback((target: TargetRef) => {
+    const found = locateTarget(wsRef.current.tabs, wsRef.current.panes, target);
+    if (!found) {
+      toast.info("这台主机现在没有打开的终端标签");
+      return;
+    }
+    setWs((current) => ({
+      ...current,
+      activeTabId: found.tabId,
+      tabs: current.tabs.map((item) =>
+        item.id === found.tabId ? { ...item, focus: found.paneId } : item,
+      ),
+    }));
+    setView("terminal");
+  }, []);
+
   // 第一次用 AI 的提示只出一次（存库）。
   useEffect(() => {
     void settingsGet("ai_first_use_done")
@@ -2751,6 +2811,7 @@ export default function App() {
         onDuplicateTab={duplicateTab}
         onCloseTabs={closeTabs}
         onNewTab={newTab}
+        aiBadges={aiBadges}
         aiOpen={aiOpen}
         onToggleAI={() => {
           if (view !== "terminal" || !activeTab) {
@@ -3039,23 +3100,9 @@ export default function App() {
               toast.info("命令的输出会发送给 opencode 所用的模型服务商");
             }}
             onOpenSettings={showSettings}
-            onOpenHost={(hostId) => {
-              // 跳到有这台主机会话的那个标签（AI 自动连接时后台开的标签）。
-              const panes = wsRef.current.panes;
-              const target = Object.entries(panes).find(
-                ([, pane]) =>
-                  pane.sessionId && pane.origin.kind === "host" && pane.origin.hostId === hostId,
-              );
-              if (!target) return;
-              const paneId = target[0];
-              const tab = wsRef.current.tabs.find((item) =>
-                paneIds(item.tree).includes(paneId),
-              );
-              if (tab) {
-                setWs((current) => ({ ...current, activeTabId: tab.id, tabs: current.tabs.map((item) => (item.id === tab.id ? { ...item, focus: paneId } : item)) }));
-                setView("terminal");
-              }
-            }}
+            onViewTarget={viewAiTarget}
+            openSessionIds={openSessionIds}
+            onAiActivity={handleAiActivity}
             onClose={() => setAiOpen(false)}
             reservedWidth={sftpVisible ? dockLayout.sftpWidth : 0}
             widthOverride={sftpVisible ? dockLayout.aiWidth : null}

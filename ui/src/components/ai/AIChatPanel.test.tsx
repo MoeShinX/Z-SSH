@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   agentAvailabilityOf,
-  canPinHost,
   commandOf,
   exitCodeOf,
   friendlyAgentError,
@@ -74,13 +73,6 @@ describe("AI 面板：主机名和退出码", () => {
 });
 
 describe("AI 面板：@ 标签（AI-2d 第 3 节）", () => {
-  it("已经是当前那台就不能再 @（不加重复标签）", () => {
-    expect(canPinHost(3, 3)).toBe(false);
-    expect(canPinHost(4, 3)).toBe(true);
-    // 没有"当前"（没有已连上的会话）时什么都能 @。
-    expect(canPinHost(3, null)).toBe(true);
-  });
-
   it("状态点反映真实状态，不是固定琥珀色", () => {
     expect(hostDotClass("connected")).toBe("bg-emerald-500");
     expect(hostDotClass("connecting")).toContain("bg-amber-400");

@@ -386,11 +386,30 @@ describe("终端里的链接", () => {
     act(() => fake.links?.onHover(uri === null ? null : { uri, range }));
   }
 
+  /** 模拟 xterm 在鼠标抬起时调 activate：文本网址不带范围，OSC 8 带范围。 */
+  function activate(
+    uri: string,
+    {
+      detail = 1,
+      x = 0,
+      y = 0,
+      range,
+    }: { detail?: number; x?: number; y?: number; range?: typeof RANGE } = {},
+  ) {
+    const event = new MouseEvent("mouseup", { button: 0, detail, clientX: x, clientY: y });
+    act(() => fake.links?.onActivate(uri, event, range));
+  }
+
+  /** 在终端上按下左键（点击计数 detail）。 */
+  function press(detail = 1, x = 0, y = 0) {
+    fireEvent.mouseDown(fake.openedEl as HTMLElement, { button: 0, detail, clientX: x, clientY: y });
+  }
+
   it("单击：选中整条链接，不打开", () => {
     render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
     hover();
 
-    act(() => fake.links?.onActivate(URI));
+    activate(URI);
 
     // 列从 0 起、行从 0 起，长度含两端：5..30 共 26 格
     expect(fake.selected).toEqual([[4, 11, 26]]);
@@ -401,30 +420,135 @@ describe("终端里的链接", () => {
     render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
     hover(URI, { start: { x: 70, y: 5 }, end: { x: 15, y: 6 } });
 
-    act(() => fake.links?.onActivate(URI));
+    activate(URI);
 
     expect(fake.selected).toEqual([[69, 4, 26]]);
   });
 
-  it("双击：才调用打开，第一下选中的链接保留", () => {
+  it("双击（点击计数 2）：才调用打开，第一下选中的链接保留", () => {
     render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
     hover();
 
-    act(() => fake.links?.onActivate(URI));
-    act(() => fake.links?.onActivate(URI));
+    activate(URI, { detail: 1 });
+    activate(URI, { detail: 2 });
 
     expect(fake.opened).toEqual([URI]);
     expect(fake.selected).toEqual([[4, 11, 26]]);
   });
 
-  it("隔了很久的两次单击不算双击", () => {
+  it("连点三下只打开一次", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+
+    activate(URI, { detail: 1 });
+    activate(URI, { detail: 2 });
+    activate(URI, { detail: 3 });
+
+    expect(fake.opened).toEqual([URI]);
+  });
+
+  it("隔了很久的两次点击不算双击", () => {
     render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
     hover();
 
     const now = vi.spyOn(Date, "now").mockReturnValueOnce(1000).mockReturnValueOnce(3000);
-    act(() => fake.links?.onActivate(URI));
-    act(() => fake.links?.onActivate(URI));
+    activate(URI, { detail: 1 });
+    activate(URI, { detail: 2 });
     now.mockRestore();
+
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("同一个网址在屏幕上两处，各单击一下（相隔 200ms）：不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const rangeB = { start: { x: 5, y: 20 }, end: { x: 30, y: 20 } };
+
+    hover(URI, RANGE);
+    activate(URI);
+    hover(null);
+    vi.advanceTimersByTime(200);
+    hover(URI, rangeB);
+    activate(URI);
+
+    expect(fake.opened).toEqual([]);
+    // 各自点的那一下都选中了自己那一处
+    expect(fake.selected).toEqual([
+      [4, 11, 26],
+      [4, 19, 26],
+    ]);
+  });
+
+  it("两处相同网址：就算第二下的点击计数是 2，范围不同也不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const rangeB = { start: { x: 5, y: 20 }, end: { x: 30, y: 20 } };
+
+    hover(URI, RANGE);
+    activate(URI, { detail: 1 });
+    // 不经过 leave 直接换到另一处（快速移动时 xterm 的事件顺序）
+    hover(URI, rangeB);
+    activate(URI, { detail: 2 });
+
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("两下之间鼠标离开了链接：不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    activate(URI, { detail: 1 });
+    hover(null);
+    hover();
+    activate(URI, { detail: 2 });
+
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("两下之间点了别处：不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    activate(URI, { detail: 1 });
+    // 在链接以外按下（此刻没有悬停链接），再回到链接上点第二下
+    hover(null);
+    press(1, 300, 300);
+    hover();
+    activate(URI, { detail: 2 });
+
+    expect(fake.opened).toEqual([]);
+  });
+
+  it("按下和抬起相距很远（拖选）：不选中链接，也不算双击", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    activate(URI, { detail: 1 });
+    expect(fake.selected).toHaveLength(1);
+
+    press(2, 100, 100);
+    activate(URI, { detail: 2, x: 160, y: 100 });
+
+    expect(fake.opened).toEqual([]);
+    expect(fake.selected).toHaveLength(1);
+  });
+
+  it("OSC 8 超链接：选中的是显示文字的范围，双击打开的是目标网址", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const target = "https://target.example/page";
+    // 显示文字在第 3～9 列，目标网址和它毫无关系
+    const display = { start: { x: 3, y: 7 }, end: { x: 9, y: 7 } };
+    hover(target, display);
+
+    activate(target, { detail: 1, range: display });
+    activate(target, { detail: 2, range: display });
+
+    expect(fake.selected).toEqual([[2, 6, 7]]);
+    expect(fake.opened).toEqual([target]);
+  });
+
+  it("OSC 8 非 http / https 的目标：双击不打开", () => {
+    render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const target = "file:///C:/x.exe";
+    hover(target, RANGE);
+
+    activate(target, { detail: 1, range: RANGE });
+    activate(target, { detail: 2, range: RANGE });
 
     expect(fake.opened).toEqual([]);
   });
@@ -496,5 +620,75 @@ describe("终端里的链接", () => {
 
     expect(view.queryByText("打开链接")).toBeNull();
     expect(clipboard.readText).not.toHaveBeenCalled();
+  });
+
+  it("菜单开着时收到离开：菜单不收，点「复制链接」用的仍是打开菜单时的链接", () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    expect(view.getByText("复制链接")).not.toBeNull();
+
+    hover(null);
+    hover("https://other.example/zzz", { start: { x: 1, y: 3 }, end: { x: 9, y: 3 } });
+    fireEvent.click(view.getByText("复制链接"));
+
+    expect(clipboard.writeText).toHaveBeenCalledWith(URI);
+  });
+
+  it("菜单开着时收到离开：「打开链接」用的仍是打开菜单时的链接", () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    hover(null);
+    fireEvent.click(view.getByText("打开链接"));
+
+    expect(fake.opened).toEqual([URI]);
+  });
+
+  it("菜单关闭后在空白处右键：走原行为（右键粘贴），不再弹上一个链接的菜单", async () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    expect(view.getByText("打开链接")).not.toBeNull();
+    // 菜单开着，鼠标移走（xterm 的离开事件照常到达）
+    hover(null);
+    // 点「复制链接」关闭菜单
+    fireEvent.click(view.getByText("复制链接"));
+    expect(view.queryByText("打开链接")).toBeNull();
+
+    // 空白处右键：右键粘贴
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(view.queryByText("打开链接")).toBeNull();
+    expect(clipboard.readText).toHaveBeenCalledTimes(1);
+    expect(fake.pasted).toEqual(["pasted"]);
+  });
+
+  it("OSC 8 非 http / https 的目标：右键菜单里「打开链接」置灰，复制的是目标", () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const target = "file:///C:/x.exe";
+    hover(target, RANGE);
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    const open = view.getByText("打开链接").closest("[role='menuitem']");
+    expect(open?.getAttribute("data-disabled")).not.toBeNull();
+    fireEvent.click(view.getByText("打开链接"));
+    expect(fake.opened).toEqual([]);
+
+    fireEvent.click(view.getByText("复制链接"));
+    expect(clipboard.writeText).toHaveBeenCalledWith(target);
+  });
+
+  it("OSC 8 链接上右键：复制的是目标网址，不是显示文字", () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    const target = "https://target.example/page?x=1";
+    hover(target, { start: { x: 3, y: 7 }, end: { x: 9, y: 7 } });
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    fireEvent.click(view.getByText("复制链接"));
+
+    expect(clipboard.writeText).toHaveBeenCalledWith(target);
   });
 });

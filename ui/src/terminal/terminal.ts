@@ -27,8 +27,12 @@ export interface TerminalBundle {
 }
 
 /**
- * `links` 接管网址链接的点击和悬停：不传就不加载链接插件。xterm 默认的处理是单击
- * `window.open`，在 WebView2 里既不是用户的默认浏览器又容易误触，所以一律由调用方决定。
+ * `links` 接管链接的点击和悬停，两种来源共用同一套回调：文本里的网址（WebLinksAddon）
+ * 和程序用转义序列输出的超链接（OSC 8，走 `options.linkHandler`）。不传就都不接管。
+ * xterm 默认的处理是单击 `window.open`（OSC 8 还先弹 `confirm`），在 WebView2 里既不是
+ * 用户的默认浏览器又容易误触，所以一律由调用方决定。
+ * `allowNonHttpProtocols` 保持默认（false）：非 http / https 的 OSC 8 目标 xterm 根本不会
+ * 当成链接，也就不会走到这里。
  */
 export function createTerminal(theme: ITheme, links?: TerminalLinkHandlers): TerminalBundle {
   const terminal = new Terminal({
@@ -39,6 +43,16 @@ export function createTerminal(theme: ITheme, links?: TerminalLinkHandlers): Ter
     allowProposedApi: true,
     cursorBlink: true,
     theme,
+    // OSC 8 的 activate 是左键 / 右键抬起都会来，和网址一样只认左键。
+    linkHandler: links
+      ? {
+          activate: (event, uri, range) => {
+            if (event.button === 0) links.onActivate(uri, event, range);
+          },
+          hover: (_event, uri, range) => links.onHover({ uri, range }),
+          leave: () => links.onHover(null),
+        }
+      : null,
   });
 
   const fitAddon = new FitAddon();
@@ -48,7 +62,7 @@ export function createTerminal(theme: ITheme, links?: TerminalLinkHandlers): Ter
       // xterm 在鼠标抬起时激活链接，右键抬起也会来；只认左键。
       new WebLinksAddon(
         (event, uri) => {
-          if (event.button === 0) links.onActivate(uri);
+          if (event.button === 0) links.onActivate(uri, event);
         },
         {
           hover: (_event, uri, range) => links.onHover({ uri, range }),

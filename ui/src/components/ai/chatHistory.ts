@@ -16,6 +16,19 @@ export interface ToolCall {
   location?: "terminal" | "background";
   /** 降级到后台的原因。 */
   fallbackReason?: string;
+  /** 作用的目标（开始调用时记下，只在界面里用，不存历史；回看历史的卡片没有）。 */
+  target?: CallTarget;
+}
+
+/** 一次工具调用作用在哪个目标上。 */
+export interface CallTarget {
+  /** 目标 ID（工具输入里的，省略时是当时的"当前"）：会话 ID 或 `host-<id>`。 */
+  id: string;
+  label: string;
+  hostId: number | null;
+  sessionId: string | null;
+  /** 调用当时对话里有不止一个目标（卡片上要标明主机名）。 */
+  multi: boolean;
 }
 
 /** 消息区的一条：用户消息、助手正文、工具调用。 */

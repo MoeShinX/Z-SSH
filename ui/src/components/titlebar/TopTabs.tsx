@@ -37,6 +37,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PaneSession, Tab } from "../../state/sessions";
 import { paneIds } from "../../state/splitTree";
 import { tabDot } from "../../state/sessions";
+import type { TabAiBadge } from "../../state/aiTarget";
 import { useResolvedMode, useSettings, useTerminalITheme, useTerminalMode } from "../../stores/settings";
 import { SkinGrid, THEME_MODES } from "../settings/AppearancePickers";
 import { cn } from "../../lib/utils";
@@ -70,6 +71,8 @@ interface TopTabsProps {
   /** 标签右键：关闭其他 / 右侧 / 所有标签。 */
   onCloseTabs?: (tabId: string, which: "others" | "right" | "all") => void;
   onNewTab: () => void;
+  /** 标签上的 AI 活动提示：running = AI 正在这个标签里执行命令，unseen = 跑完了还没看过。 */
+  aiBadges?: Record<string, TabAiBadge>;
   /** AI 面板是否展开；只有终端标签下有意义。 */
   aiOpen: boolean;
   onToggleAI: () => void;
@@ -109,6 +112,7 @@ export default function TopTabs({
   onDuplicateTab,
   onCloseTabs,
   onNewTab,
+  aiBadges,
   aiOpen,
   onToggleAI,
   sftpOpen,
@@ -335,6 +339,7 @@ export default function TopTabs({
                       label={tab.title}
                       dotClass={dot.className}
                       dotTitle={dot.title}
+                      aiBadge={aiBadges?.[tab.id]}
                       dockTarget={drag?.over === tab.id && drag.verdict === "ok" ? "ok" : undefined}
                     />
                   </div>
@@ -480,6 +485,8 @@ interface TabShapeProps {
   icon?: React.ReactNode;
   dotClass?: string;
   dotTitle?: string;
+  /** AI 活动提示（和连接状态点分开，紫色）。 */
+  aiBadge?: TabAiBadge;
   /** 悬停提示；没有就用 label。 */
   tooltip?: string;
   className?: string;
@@ -502,6 +509,7 @@ function TabShape({
   icon,
   dotClass,
   dotTitle,
+  aiBadge,
   tooltip,
   className,
   tabId,
@@ -545,6 +553,16 @@ function TabShape({
         <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotClass)} title={dotTitle} />
       )}
       <span className="min-w-0 flex-1 truncate">{label}</span>
+      {aiBadge && (
+        <span
+          data-ai-badge={aiBadge}
+          title={aiBadge === "running" ? "AI 正在这个标签里执行命令" : "AI 在这个标签里有新输出"}
+          className={cn(
+            "h-1.5 w-1.5 shrink-0 rounded-full bg-violet-500",
+            aiBadge === "running" && "animate-pulse",
+          )}
+        />
+      )}
       {onClose && (
         <button
           data-tauri-drag-region={false}

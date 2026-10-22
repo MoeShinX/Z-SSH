@@ -21,7 +21,7 @@ vi.mock("../../api/settings", () => ({
 }));
 
 import type { Host, Proxy } from "../../api/vault";
-import { COLLAPSE_DELAY_MS, resetHostInfoForTests } from "../../state/hostInfoPanel";
+import { COLLAPSE_DELAY_MS, resetHostInfoForTests, useHostInfoId } from "../../state/hostInfoPanel";
 import { UNGROUPED_KEY } from "../../state/hostTree";
 import { useSettings } from "../../stores/settings";
 import { useVault } from "../../stores/vault";
@@ -85,6 +85,12 @@ function setup(infoPanel: boolean) {
     />,
   );
   return actions;
+}
+
+/** 记下面板展开的主机 id 的每一次变化（含收起成 null），用来断言"中途没收起过"。 */
+function HostInfoProbe({ seen }: { seen: (number | null)[] }) {
+  seen.push(useHostInfoId());
+  return null;
 }
 
 const panel = () => document.querySelector<HTMLElement>('[data-section="host-info"]');
@@ -177,6 +183,50 @@ describe("终端界面主机树的属性面板", () => {
     advance(COLLAPSE_DELAY_MS + 10);
     expect(actions.connect).toHaveBeenCalledTimes(2);
     expect(panel()).not.toBeNull();
+  });
+
+  it.each([350, 450])("较慢的双击（两下相隔 %dms）：面板全程没有收起过，连接只执行一次", (gap) => {
+    const seen: (number | null)[] = [];
+    render(<HostInfoProbe seen={seen} />);
+    const actions = setup(true);
+    const el = leaf("web-1");
+
+    // 先展开（单击），再对开着的这台做慢双击
+    fireEvent.click(el, { detail: 1 });
+    expect(panel()).not.toBeNull();
+    seen.length = 0;
+
+    fireEvent.click(el, { detail: 1 });
+    advance(gap);
+    fireEvent.click(el, { detail: 2 });
+    fireEvent.doubleClick(el, { detail: 2 });
+    advance(COLLAPSE_DELAY_MS + 10);
+
+    expect(seen.every((id) => id === 1)).toBe(true);
+    expect(panel()).not.toBeNull();
+    expect(actions.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("点击计数 >= 2 的单击不当作再点一下收起（即使收起已经过了延迟）", () => {
+    setup(true);
+    const el = leaf("web-1");
+    fireEvent.click(el, { detail: 1 });
+    fireEvent.click(el, { detail: 2 });
+    advance(COLLAPSE_DELAY_MS + 10);
+    expect(panel()).not.toBeNull();
+    fireEvent.click(el, { detail: 3 });
+    advance(COLLAPSE_DELAY_MS + 10);
+    expect(panel()).not.toBeNull();
+  });
+
+  it("真正的单击（计数为 1）再点同一台仍会收起", () => {
+    setup(true);
+    const el = leaf("web-1");
+    fireEvent.click(el, { detail: 1 });
+    expect(panel()).not.toBeNull();
+    fireEvent.click(el, { detail: 1 });
+    advance(COLLAPSE_DELAY_MS + 10);
+    expect(panel()).toBeNull();
   });
 
   it("有跳板机 / 指定代理时多出对应的行，显示名字", () => {
