@@ -178,6 +178,29 @@ pub struct ConflictDecision {
     pub rename_to: Option<String>,
 }
 
+impl ConflictDecision {
+    /// 用户没改对话框预填的建议名，就不算手动名字。
+    ///
+    /// 界面把建议名预填进输入框，选"重命名"时总是把输入框的值送回来；如果直接当手动名，
+    /// 提问到回答之间这个名字被别人占了，这个文件就会因为「新名字已存在」失败。
+    /// 和建议名一样（只比文件名）= 用户没动过 = 走自动起名，被占就往后找；只有改过才是手动名。
+    #[must_use]
+    pub fn without_suggested_name(mut self, suggested_target: &str) -> Self {
+        let suggested = suggested_target
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(suggested_target);
+        if self
+            .rename_to
+            .as_deref()
+            .is_some_and(|name| name.trim() == suggested)
+        {
+            self.rename_to = None;
+        }
+        self
+    }
+}
+
 /// 同一次提交（一次 `sftp_transfer_submit`、一次粘贴）里所有任务共享的"全部应用"选择。
 ///
 /// 引擎按任务各记一份 `conflict_all`，一次传 10 个同名文件就是 10 个任务，第一个对话框里勾了
@@ -1064,6 +1087,7 @@ impl TransferEngine {
                 self.set_state(state, TransferState::WaitingConflict);
                 self.emit(state, true);
                 let suggested_target = self.suggest_free_name(state, planned, target_path).await;
+                let suggested_name = suggested_target.clone();
                 let decision = self
                     .resolver
                     .decide(ConflictInfo {
@@ -1079,7 +1103,8 @@ impl TransferEngine {
                         suggested_target,
                         batch: batch.as_ref().map(|batch| batch.id()),
                     })
-                    .await;
+                    .await
+                    .without_suggested_name(&suggested_name);
                 self.set_state(state, TransferState::Running);
                 self.emit(state, true);
                 decision

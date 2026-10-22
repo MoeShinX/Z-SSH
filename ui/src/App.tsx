@@ -8,6 +8,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -76,7 +77,13 @@ import { useTerminalCwd } from "./state/followCwd";
 import { sessionCwd, termWrite } from "./api/session";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { handleExternalDragEvent } from "./state/pointerDrag";
-import { AI_PANEL_DEFAULT, SFTP_PANEL_DEFAULT, sanitizeStoredWidth } from "./state/panelWidths";
+import {
+  AI_PANEL_DEFAULT,
+  SFTP_PANEL_DEFAULT,
+  hostTreeRightReserved,
+  sanitizeStoredWidth,
+  setHostTreeRightReserved,
+} from "./state/panelWidths";
 import AIChatPanel from "./components/ai/AIChatPanel";
 import { aiTabFor } from "./state/aiTab";
 import DockRow from "./components/terminal/DockRow";
@@ -2263,6 +2270,15 @@ export default function App() {
   const aiVisible = view === "terminal" && aiOpen && Boolean(activeTab) && !activeTab?.sftp;
   const sftpVisible =
     view === "terminal" && sftpDockOpen && Boolean(activeTab) && !activeTab?.sftp;
+  // 主机树的上限要给右边开着的面板让位（只有终端界面算；主机页没有这些面板）。写进模块级
+  // 共享状态，主机页、终端界面、顶栏三处的主机树宽度才一致；用 layout effect 是为了
+  // 在绘制之前就生效，不闪一下旧宽度。
+  useLayoutEffect(() => {
+    setHostTreeRightReserved(
+      view === "terminal" ? hostTreeRightReserved(aiVisible, sftpVisible) : 0,
+    );
+  }, [view, aiVisible, sftpVisible]);
+  useLayoutEffect(() => () => setHostTreeRightReserved(0), []);
   const dockLayout = computeDockLayout({
     windowWidth,
     aiOpen: aiVisible,

@@ -2237,6 +2237,81 @@ async fn a_hand_typed_name_equal_to_the_conflicting_target_is_rejected() {
     assert_eq!(endpoints.remote_contents("/remote/s.bin"), vec![b'O'; 100]);
 }
 
+/// 对话框预填的建议名没被用户改过、而它在回答之前被别人占了：不算手动名字，接着往后找空名字。
+#[tokio::test]
+async fn an_untouched_suggested_name_taken_meanwhile_falls_through_to_the_next_free_one() {
+    let root = temp_root("suggested-taken-meanwhile");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/g.bin", vec![b'O'; 100]);
+    let taken_later = Arc::clone(&endpoints);
+    let resolver = Scripted::new(move |_, info| {
+        assert_eq!(info.suggested_target, "/remote/g (2).bin");
+        // 提问到回答之间，建议名被别的任务 / 程序占了。
+        taken_later.put_remote("/remote/g (2).bin", vec![b'T'; 100]);
+        answer(ConflictAction::Rename, false, Some("g (2).bin"))
+    });
+    let (engine, mut events) = engine_with(&endpoints, Arc::clone(&resolver), 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "g.bin", b'N')).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(
+        endpoints.remote_contents("/remote/g (3).bin"),
+        vec![b'N'; 512]
+    );
+    assert_eq!(
+        endpoints.remote_contents("/remote/g (2).bin"),
+        vec![b'T'; 100],
+        "后来占上的那个文件不能动"
+    );
+    assert_eq!(endpoints.remote_contents("/remote/g.bin"), vec![b'O'; 100]);
+}
+
+/// 用户改过名字、而改后的名字在回答之前被占了：仍是手动名，按「新名字也已存在」失败（SFTP-8）。
+#[tokio::test]
+async fn an_edited_name_taken_meanwhile_still_fails_as_a_hand_typed_one() {
+    let root = temp_root("edited-taken-meanwhile");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/e.bin", vec![b'O'; 100]);
+    let taken_later = Arc::clone(&endpoints);
+    let resolver = Scripted::new(move |_, _| {
+        taken_later.put_remote("/remote/mine.bin", vec![b'T'; 100]);
+        answer(ConflictAction::Rename, false, Some("mine.bin"))
+    });
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "e.bin", b'N')).await;
+    assert!(
+        matches!(&report.state, TransferState::Failed(text) if text.contains("新名字 mine.bin 也已存在")),
+        "{report:?}"
+    );
+    assert!(
+        !endpoints.remote_exists("/remote/e (2).bin"),
+        "不能悄悄换成自动名字"
+    );
+}
+
+#[test]
+fn only_a_name_equal_to_the_suggestion_is_dropped() {
+    let decide = |typed: Option<&str>| answer(ConflictAction::Rename, false, typed);
+    let suggested = "/remote/sub/a (2).bin";
+    assert_eq!(
+        decide(Some("a (2).bin")).without_suggested_name(suggested),
+        decide(None)
+    );
+    assert_eq!(
+        decide(Some(" a (2).bin ")).without_suggested_name(suggested),
+        decide(None)
+    );
+    assert_eq!(
+        decide(Some("a (3).bin")).without_suggested_name(suggested),
+        decide(Some("a (3).bin"))
+    );
+    assert_eq!(decide(None).without_suggested_name(suggested), decide(None));
+    // Windows 路径的建议名同样只比文件名
+    assert_eq!(
+        decide(Some("d (2).bin")).without_suggested_name(r"C:\dl\d (2).bin"),
+        decide(None)
+    );
+}
+
 #[tokio::test]
 async fn a_free_hand_typed_name_is_used_as_is() {
     let root = temp_root("manual-name-free");

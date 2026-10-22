@@ -6,6 +6,10 @@
 //! - 放不下时先把两个面板往各自的最小宽度（320px）收，按"各自还能收多少"的比例分摊；
 //! - 收到最小还放不下，就收起 AI 面板（SFTP 是用户刚打开的，优先保留）。
 //!   窗口变宽后不自动再展开，由调用方决定。
+//!
+//! 总宽恒等于窗口宽（主机树 + 终端 + 面板），终端不低于 `TERMINAL_MIN`（窗口本身比主机树 +
+//! 终端最小宽度还小的极端情况除外）。主机树不会把右边的面板挤出去：它自己的上限已经扣掉了右边
+//! 开着的面板的最小宽度（见 `panelBounds("hostTree", …)`），所以这里「放不下」只会是窗口本身太窄。
 
 import {
   AI_PANEL_MAX_RATIO,
@@ -82,17 +86,7 @@ export function computeDockLayout(input: DockLayoutInput): DockLayout {
     sftp -= cutSftp;
     return { aiWidth: ai, sftpWidth: sftp, collapseAi: false, terminalWidth: content - ai - sftp };
   }
-  // 两个都收到最小也放不下。只是因为主机树拉宽了才放不下时，不替用户关 AI 面板
-  // （拖主机树把 AI 面板拖没了会很意外）：两个面板都按最小宽度，终端让出来。
-  if (PANEL_MIN * 2 <= Math.floor(windowWidth - TERMINAL_MIN)) {
-    return {
-      aiWidth: PANEL_MIN,
-      sftpWidth: PANEL_MIN,
-      collapseAi: false,
-      terminalWidth: Math.max(0, content - PANEL_MIN * 2),
-    };
-  }
-  // 窗口本身就放不下：收起 AI，SFTP 单独排。
+  // 两个都收到最小也放不下（按扣掉主机树之后的宽度算）：收起 AI，SFTP 单独排。
   const sftpAlone = single(sftpDesired, SFTP_PANEL_MAX_RATIO);
   return {
     aiWidth: 0,

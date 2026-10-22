@@ -11,11 +11,13 @@ import {
   beginPanelDrag,
   clampPanelWidth,
   endPanelDrag,
+  getHostTreeRightReserved,
   getPanelDragWidth,
   HOST_TREE_DEFAULT,
   panelBounds,
   sanitizeStoredWidth,
   setPanelDragWidth,
+  subscribeHostTreeRightReserved,
   subscribePanelDragWidth,
   type PanelBounds,
   type PanelKind,
@@ -64,16 +66,20 @@ export function usePanelWidth(
     () => null,
   );
 
-  const bounds = panelBounds(kind, windowWidth, options.reserved ?? 0);
+  // 主机树的上限要给终端界面右边开着的面板让位；这个数由 App 写进模块级共享状态，
+  // 这样主机页、终端界面、顶栏三处读到的主机树宽度一致。
+  const rightReserved = useSyncExternalStore(
+    subscribeHostTreeRightReserved,
+    getHostTreeRightReserved,
+    () => 0,
+  );
+  const reserved = options.reserved ?? (kind === "hostTree" ? rightReserved : 0);
+
+  const bounds = panelBounds(kind, windowWidth, reserved);
   const width =
     dragWidth ??
     options.override ??
-    clampPanelWidth(
-      kind,
-      sanitizeStoredWidth(stored, fallback),
-      windowWidth,
-      options.reserved ?? 0,
-    );
+    clampPanelWidth(kind, sanitizeStoredWidth(stored, fallback), windowWidth, reserved);
 
   const onResize = useCallback((next: number) => setPanelDragWidth(key, next), [key]);
   // 先写设置再清拖动值：设置表是同步更新的，这样两步之间不会闪回旧宽度。

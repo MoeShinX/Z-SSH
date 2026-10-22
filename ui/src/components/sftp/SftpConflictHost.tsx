@@ -8,11 +8,12 @@
 
 import { useEffect, useRef } from "react";
 
-import { onSftpConflict, sftpConflictAnswer } from "../../api/sftp";
+import { onSftpConflict, onSftpConflictDone, sftpConflictAnswer } from "../../api/sftp";
 import {
   batchKey,
   batchPeers,
   conflictTimeLeft,
+  isStaleConflictError,
   nextConflict,
   useSftpConflicts,
   type PendingConflict,
@@ -20,11 +21,20 @@ import {
 import { toast } from "../ui/toast";
 import { SftpConflictDialog, type ConflictAnswer } from "./SftpDialogs";
 
+/**
+ * 回答失败的统一处理：提问已经不在后端了（别的窗口先答了、超时了）是正常的竞态，
+ * 安静地说一句就行，不弹错误；其余才是真故障。
+ */
+function reportAnswerError(error: unknown) {
+  if (isStaleConflictError(error)) toast.info("这个同名提问已经处理过了");
+  else toast.error(String(error));
+}
+
 /** 用批次里记住的动作回答一条提问（不弹窗）：改名不带用户输入的名字，由后端用自动名字。 */
 function answerQuietly(item: PendingConflict, action: ConflictAnswer["action"]) {
   useSftpConflicts.getState().remove(item.prompt.conflict_id);
   void sftpConflictAnswer(item.prompt.conflict_id, action, true, undefined).catch(
-    (error: unknown) => toast.error(String(error)),
+    reportAnswerError,
   );
 }
 
@@ -63,6 +73,23 @@ export default function SftpConflictHost({ sessionIds }: SftpConflictHostProps) 
       stop?.();
     };
   }, [push]);
+
+  // 后端说这条提问结束了（别的窗口答了、超时、标签关了）：从队列撤掉。事件广播给所有窗口，
+  // 不撤的话会话迁到本窗口时已经答过的提问会再弹一次，用户确认后后端还报「没有这个冲突提问」。
+  useEffect(() => {
+    let cancelled = false;
+    let stop: (() => void) | null = null;
+    void onSftpConflictDone((conflictId) => remove(conflictId))
+      .then((unlisten) => {
+        if (cancelled) unlisten();
+        else stop = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, [remove]);
 
   // 同批次的提问：选过"全部应用"之后到的（事件在路上、会话刚搬来）也直接回答掉。
   useEffect(() => {
@@ -109,7 +136,7 @@ export default function SftpConflictHost({ sessionIds }: SftpConflictHostProps) 
       reply.action,
       reply.applyToAll,
       reply.renameTo,
-    ).catch((error: unknown) => toast.error(String(error)));
+    ).catch(reportAnswerError);
     // 勾了"全部应用"：同批次还在排队的提问用同一个动作回答掉；之后才到的靠上面的 effect。
     if (reply.applyToAll) {
       const key = batchKey(head.sftpId, head.prompt);

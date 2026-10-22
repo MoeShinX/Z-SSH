@@ -45,6 +45,15 @@ export const useSftpConflicts = create<ConflictQueueState>((set) => ({
     ),
 }));
 
+/**
+ * 回答时后端说这条提问已经不在了（别的窗口先答了、超时了、标签关了）。
+ * 这是正常的竞态，不是故障：界面静默撤掉那条即可。
+ */
+export function isStaleConflictError(error: unknown): boolean {
+  const text = String(error);
+  return text.includes("没有这个冲突提问") || text.includes("这次冲突提问已经结束");
+}
+
 /** 现在该弹哪一条：队列里先到的、属于这个窗口还开着的会话的那条。 */
 export function nextConflict(
   queue: readonly PendingConflict[],

@@ -3,7 +3,14 @@
 import { describe, expect, it } from "vitest";
 
 import { compactColumns, computeDockLayout, DOCK_ORDER } from "./dockLayout";
-import { clampPanelWidth, panelBounds, SFTP_PANEL_DEFAULT, TERMINAL_MIN } from "./panelWidths";
+import {
+  clampPanelWidth,
+  hostTreeRightReserved,
+  PANEL_MIN,
+  panelBounds,
+  SFTP_PANEL_DEFAULT,
+  TERMINAL_MIN,
+} from "./panelWidths";
 
 const base = { aiDesired: 400, sftpDesired: 420 };
 
@@ -84,7 +91,23 @@ describe("computeDockLayout", () => {
     expect(layout.aiWidth + layout.sftpWidth + layout.terminalWidth).toBe(1400 - 300);
   });
 
-  it("只因为主机树太宽才放不下：不收起 AI，两个面板最小宽度，终端让出来", () => {
+  it("复审给的那组数：窗口 1000、主机树 400、AI + SFTP——收起 AI，总宽不超窗口，终端不低于 360", () => {
+    const layout = computeDockLayout({
+      ...base,
+      windowWidth: 1000,
+      aiOpen: true,
+      sftpOpen: true,
+      reserved: 400,
+    });
+    expect(layout.collapseAi).toBe(true);
+    expect(layout.aiWidth).toBe(0);
+    // 扣掉主机树只剩 600：SFTP 最多 600 - 360 = 240
+    expect(layout.sftpWidth).toBe(240);
+    expect(layout.terminalWidth).toBe(TERMINAL_MIN);
+    expect(400 + layout.aiWidth + layout.sftpWidth + layout.terminalWidth).toBe(1000);
+  });
+
+  it("主机树太宽导致两个面板收到最小也放不下：照样收起 AI（SFTP 保留），不再让终端变窄", () => {
     const layout = computeDockLayout({
       ...base,
       windowWidth: 1200,
@@ -92,7 +115,9 @@ describe("computeDockLayout", () => {
       sftpOpen: true,
       reserved: 480,
     });
-    expect(layout).toEqual({ aiWidth: 320, sftpWidth: 320, collapseAi: false, terminalWidth: 80 });
+    expect(layout.collapseAi).toBe(true);
+    expect(layout.terminalWidth).toBeGreaterThanOrEqual(TERMINAL_MIN);
+    expect(480 + layout.sftpWidth + layout.terminalWidth).toBe(1200);
   });
 
   it("只开一个面板时主机树占的宽度同样扣掉", () => {
@@ -109,6 +134,105 @@ describe("computeDockLayout", () => {
         expect(layout.aiWidth + layout.sftpWidth + layout.terminalWidth).toBe(width);
       }
     }
+  });
+});
+
+describe("主机树 + 终端 + 面板：总宽恒等于窗口宽，终端不低于 360（SFTP-9）", () => {
+  const combos = [
+    ["AI", true, false],
+    ["SFTP", false, true],
+    ["AI+SFTP", true, true],
+  ] as const;
+
+  it("主机树按它自己的上限（会让位给右边面板）取宽：700~2400、主机树 0/180/224/400/480、三种组合", () => {
+    for (let width = 700; width <= 2400; width += 25) {
+      for (const stored of [0, 180, 224, 400, 480]) {
+        for (const [label, aiOpen, sftpOpen] of combos) {
+          // 和 App 的接线一样：0 表示收起；展开时宽度被含右边面板占用的上限夹住
+          const hostTree =
+            stored === 0
+              ? 0
+              : clampPanelWidth("hostTree", stored, width, hostTreeRightReserved(aiOpen, sftpOpen));
+          const layout = computeDockLayout({
+            windowWidth: width,
+            aiOpen,
+            sftpOpen,
+            aiDesired: 400,
+            sftpDesired: 420,
+            reserved: hostTree,
+          });
+          const where = `窗口 ${width} 主机树 ${stored}→${hostTree} ${label}`;
+          expect(hostTree + layout.aiWidth + layout.sftpWidth + layout.terminalWidth, where).toBe(
+            width,
+          );
+          expect(layout.terminalWidth, where).toBeGreaterThanOrEqual(TERMINAL_MIN);
+          if (layout.collapseAi) {
+            expect(layout.aiWidth, where).toBe(0);
+            // 只有窗口本身太窄（主机树已是 180 仍放不下）才收起 AI
+            expect(hostTree, where).toBeLessThanOrEqual(180);
+          }
+        }
+      }
+    }
+  });
+
+  it("不经上限夹取、硬塞一个很宽的主机树时也不超支（窗口够宽时终端 ≥ 360）", () => {
+    for (let width = 900; width <= 2400; width += 25) {
+      for (const reserved of [0, 180, 224, 400, 480]) {
+        for (const [label, aiOpen, sftpOpen] of combos) {
+          const layout = computeDockLayout({
+            windowWidth: width,
+            aiOpen,
+            sftpOpen,
+            aiDesired: 400,
+            sftpDesired: 420,
+            reserved,
+          });
+          const where = `窗口 ${width} 主机树 ${reserved} ${label}`;
+          expect(reserved + layout.aiWidth + layout.sftpWidth + layout.terminalWidth, where).toBe(
+            width,
+          );
+          expect(layout.terminalWidth, where).toBeGreaterThanOrEqual(TERMINAL_MIN);
+        }
+      }
+    }
+  });
+
+  it("没有特殊照顾：放得下就都放，放不下就收 AI", () => {
+    const fits = computeDockLayout({
+      ...base,
+      windowWidth: 1500,
+      aiOpen: true,
+      sftpOpen: true,
+      reserved: 180,
+    });
+    expect(fits.collapseAi).toBe(false);
+    // 窗口 1100、主机树 180：内容 920，360 + 640 = 1000 放不下
+    const tight = computeDockLayout({
+      ...base,
+      windowWidth: 1100,
+      aiOpen: true,
+      sftpOpen: true,
+      reserved: 180,
+    });
+    expect(tight.collapseAi).toBe(true);
+  });
+});
+
+describe("主机树的上限随右边面板变化（SFTP-9）", () => {
+  it("上限 = min(480, 窗口 40%, 窗口 - 360 - 右边面板最小宽度)，下限保底 180", () => {
+    expect(hostTreeRightReserved(false, false)).toBe(0);
+    expect(hostTreeRightReserved(true, false)).toBe(PANEL_MIN);
+    expect(hostTreeRightReserved(false, true)).toBe(PANEL_MIN);
+    expect(hostTreeRightReserved(true, true)).toBe(PANEL_MIN * 2);
+
+    expect(panelBounds("hostTree", 1400, 0).max).toBe(480);
+    expect(panelBounds("hostTree", 1400, 320).max).toBe(480); // 1400-360-320=720 > 480
+    expect(panelBounds("hostTree", 1400, 640).max).toBe(400); // 1400-360-640
+    expect(panelBounds("hostTree", 1000, 0).max).toBe(400);
+    expect(panelBounds("hostTree", 1000, 320).max).toBe(320);
+    expect(panelBounds("hostTree", 1000, 640)).toEqual({ min: 180, max: 180 }); // 挤到负数也保底 180
+    expect(clampPanelWidth("hostTree", 400, 1000, 640)).toBe(180);
   });
 });
 

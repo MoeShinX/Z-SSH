@@ -453,6 +453,13 @@ export function onSftpConflict(
   );
 }
 
+/** 一条冲突提问结束了（被回答 / 超时 / 标签关闭）：各窗口据此撤掉队列里的那条。 */
+export function onSftpConflictDone(
+  handler: (conflictId: number) => void,
+): Promise<UnlistenFn> {
+  return listen<number>("sftp_conflict_done", (event) => handler(event.payload));
+}
+
 export function onSftpDelete(
   handler: (sftpId: string, event: SftpDeleteEvent) => void,
 ): Promise<UnlistenFn> {

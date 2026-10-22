@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 use zssh_core::sftp::fs::DirEntry;
@@ -48,6 +48,8 @@ use crate::state::{AppState, CancelSignal, SessionConnection};
 pub const SFTP_STATE_EVENT: &str = "sftp_state";
 pub const SFTP_TRANSFER_EVENT: &str = "sftp_transfer_event";
 pub const SFTP_CONFLICT_EVENT: &str = "sftp_conflict_prompt";
+/// 一条冲突提问结束了（回答 / 超时 / 取消）：载荷是 `conflict_id`，各窗口据此撤掉队列里的那条。
+pub const SFTP_CONFLICT_DONE_EVENT: &str = "sftp_conflict_done";
 pub const SFTP_DELETE_EVENT: &str = "sftp_delete_event";
 
 /// 等用户处理冲突的最长时间：超了按"跳过"（任务不能一直挂着）。
@@ -357,6 +359,14 @@ impl SftpRegistry {
         (id, receiver)
     }
 
+    /// 把一条还挂着的提问从登记表里拿掉（不发回答）；已经没有就什么都不做。
+    fn forget_conflict(&self, conflict_id: u64) {
+        self.conflicts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&conflict_id);
+    }
+
     /// 前端的回答送回后端。
     fn answer_conflict(&self, conflict_id: u64, decision: ConflictDecision) -> Result<(), String> {
         let pending = self
@@ -551,49 +561,84 @@ impl ConflictResolver for UiConflictResolver {
             {
                 return skip_decision();
             }
-            let (conflict_id, receiver) = self.registry.add_conflict(&self.sftp_id);
-            // 建议名由引擎给：已经跳过了被占用的名字（上传 / 下载从 `名字 (2)` 起，
-            // 复制粘贴从「名字 - 副本」起）。
-            let suggested = info.suggested_target.clone();
-            let prompt = ConflictPromptDto {
-                conflict_id,
-                job: info.job,
-                direction: match info.direction {
-                    Direction::Upload => "upload",
-                    Direction::Download => "download",
-                    Direction::RemoteCopy => "remote_copy",
-                    Direction::LocalCopy => "local_copy",
-                },
-                source: info.source.clone(),
-                target: info.target.clone(),
-                source_size: info.source_size,
-                target_size: info.target_size,
-                source_mtime: info.source_mtime.map(u64::from),
-                target_mtime: info.target_mtime.map(u64::from),
-                can_resume: info.can_resume,
-                suggested_name: file_name_of(&suggested).to_owned(),
-                batch: info.batch,
-            };
-            if let Err(err) = self
-                .app
-                .emit(SFTP_CONFLICT_EVENT, (self.sftp_id.clone(), prompt))
-            {
-                warn!(%err, "发冲突提问事件失败");
-                return skip_decision();
-            }
-            // 超时 / sender 被丢掉（标签关闭）：跳过，任务不能挂着。
-            match tokio::time::timeout(self.timeout, receiver).await {
-                Ok(Ok(decision)) => decision,
-                Ok(Err(_)) => {
-                    debug!(conflict_id, "冲突提问被取消（标签关闭），按跳过");
-                    skip_decision()
-                }
-                Err(_) => {
-                    info!(conflict_id, "等用户处理冲突超时，按跳过");
-                    skip_decision()
-                }
-            }
+            ask_user(&self.app, &self.registry, &self.sftp_id, self.timeout, info).await
         })
+    }
+}
+
+/// 一条提问结束时（被回答、超时、标签关闭取消、等待方被丢掉）告诉所有窗口撤掉它。
+///
+/// 提问事件是广播给所有窗口的，每个窗口都把它收进自己的队列；只有回答的那个窗口会自己删，
+/// 别的窗口里那条要等 2 分钟超时才清，这期间把会话迁过去（拆出停靠面板、合并回主窗口）就会把
+/// 已经答过的提问再弹一遍。放在 `Drop` 里是为了不管等待怎么结束都发，包括 future 被直接丢掉。
+struct ConflictDone<'a, R: Runtime> {
+    app: &'a AppHandle<R>,
+    registry: &'a SftpRegistry,
+    conflict_id: u64,
+}
+
+impl<R: Runtime> Drop for ConflictDone<'_, R> {
+    fn drop(&mut self) {
+        // 超时 / 被丢掉时登记表里还留着这条，一并清掉（迟到的回答会得到「没有这个冲突提问」）。
+        self.registry.forget_conflict(self.conflict_id);
+        if let Err(err) = self.app.emit(SFTP_CONFLICT_DONE_EVENT, self.conflict_id) {
+            warn!(%err, conflict_id = self.conflict_id, "发冲突提问结束事件失败");
+        }
+    }
+}
+
+/// 发一条冲突提问并等回答（`UiConflictResolver::decide` 的主体；拆出来是为了能用模拟运行时测）。
+async fn ask_user<R: Runtime>(
+    app: &AppHandle<R>,
+    registry: &SftpRegistry,
+    sftp_id: &str,
+    timeout: Duration,
+    info: ConflictInfo,
+) -> ConflictDecision {
+    let (conflict_id, receiver) = registry.add_conflict(sftp_id);
+    let _done = ConflictDone {
+        app,
+        registry,
+        conflict_id,
+    };
+    // 建议名由引擎给：已经跳过了被占用的名字（上传 / 下载从 `名字 (2)` 起，
+    // 复制粘贴从「名字 - 副本」起）。
+    let suggested = info.suggested_target.clone();
+    let prompt = ConflictPromptDto {
+        conflict_id,
+        job: info.job,
+        direction: match info.direction {
+            Direction::Upload => "upload",
+            Direction::Download => "download",
+            Direction::RemoteCopy => "remote_copy",
+            Direction::LocalCopy => "local_copy",
+        },
+        source: info.source.clone(),
+        target: info.target.clone(),
+        source_size: info.source_size,
+        target_size: info.target_size,
+        source_mtime: info.source_mtime.map(u64::from),
+        target_mtime: info.target_mtime.map(u64::from),
+        can_resume: info.can_resume,
+        suggested_name: file_name_of(&suggested).to_owned(),
+        batch: info.batch,
+    };
+    if let Err(err) = app.emit(SFTP_CONFLICT_EVENT, (sftp_id.to_owned(), prompt)) {
+        warn!(%err, "发冲突提问事件失败");
+        return skip_decision();
+    }
+    // 超时 / sender 被丢掉（标签关闭）：跳过，任务不能挂着。
+    match tokio::time::timeout(timeout, receiver).await {
+        // 对话框预填的就是建议名：用户没改它就不算手动名字，让引擎走自动起名（被占就往后找）。
+        Ok(Ok(decision)) => decision.without_suggested_name(&suggested),
+        Ok(Err(_)) => {
+            debug!(conflict_id, "冲突提问被取消（标签关闭），按跳过");
+            skip_decision()
+        }
+        Err(_) => {
+            info!(conflict_id, "等用户处理冲突超时，按跳过");
+            skip_decision()
+        }
     }
 }
 
@@ -1850,5 +1895,173 @@ mod options_tests {
         assert_eq!(transfer_options(&store).concurrency, 3);
         store.setting_set("sftp_preserve_mtime", "false").unwrap();
         assert!(!transfer_options(&store).preserve_mtime);
+    }
+
+    // ---- 冲突提问的结束事件（SFTP-9）：用模拟运行时，不开窗口 ----
+
+    use std::sync::mpsc;
+    use tauri::test::MockRuntime;
+    use tauri::Listener;
+
+    fn mock_app() -> tauri::App<MockRuntime> {
+        tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock app")
+    }
+
+    fn sample_info() -> ConflictInfo {
+        ConflictInfo {
+            job: 1,
+            direction: Direction::Upload,
+            source: "C:/work/a.txt".to_owned(),
+            target: "/srv/a.txt".to_owned(),
+            source_size: Some(10),
+            target_size: Some(5),
+            source_mtime: None,
+            target_mtime: None,
+            can_resume: false,
+            suggested_target: "/srv/a (2).txt".to_owned(),
+            batch: None,
+        }
+    }
+
+    /// 监听提问事件和结束事件，返回两个接收端（载荷里取出 `conflict_id`）。
+    fn watch_prompts(
+        app: &tauri::AppHandle<MockRuntime>,
+    ) -> (mpsc::Receiver<u64>, mpsc::Receiver<u64>) {
+        let (prompt_tx, prompt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        app.listen(SFTP_CONFLICT_EVENT, move |event| {
+            let (_, prompt): (String, serde_json::Value) =
+                serde_json::from_str(event.payload()).expect("提问载荷");
+            let _ = prompt_tx.send(prompt["conflict_id"].as_u64().expect("conflict_id"));
+        });
+        app.listen(SFTP_CONFLICT_DONE_EVENT, move |event| {
+            let _ = done_tx.send(event.payload().parse::<u64>().expect("结束事件载荷是编号"));
+        });
+        (prompt_rx, done_rx)
+    }
+
+    async fn next_id(receiver: &mpsc::Receiver<u64>) -> u64 {
+        for _ in 0..500 {
+            if let Ok(id) = receiver.try_recv() {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("没等到事件");
+    }
+
+    #[tokio::test]
+    async fn answering_a_conflict_broadcasts_that_it_is_done() {
+        let app = mock_app();
+        let (prompts, done) = watch_prompts(app.handle());
+        let registry = Arc::new(SftpRegistry::default());
+        let asking = ask_user(
+            app.handle(),
+            &registry,
+            "tab-1",
+            Duration::from_secs(30),
+            sample_info(),
+        );
+        let answering = async {
+            let id = next_id(&prompts).await;
+            assert!(done.try_recv().is_err(), "还没回答就不该发结束事件");
+            registry
+                .answer_conflict(
+                    id,
+                    ConflictDecision {
+                        action: ConflictAction::Overwrite,
+                        apply_to_all: false,
+                        rename_to: None,
+                    },
+                )
+                .expect("回答");
+            id
+        };
+        let (decision, id) = tokio::join!(asking, answering);
+        assert_eq!(decision.action, ConflictAction::Overwrite);
+        assert_eq!(next_id(&done).await, id);
+        assert!(done.try_recv().is_err(), "只发一次");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_conflict_broadcasts_done_and_forgets_the_prompt() {
+        let app = mock_app();
+        let (prompts, done) = watch_prompts(app.handle());
+        let registry = Arc::new(SftpRegistry::default());
+        let decision = ask_user(
+            app.handle(),
+            &registry,
+            "tab-1",
+            Duration::from_millis(50),
+            sample_info(),
+        )
+        .await;
+        assert_eq!(decision.action, ConflictAction::Skip);
+        let id = next_id(&prompts).await;
+        assert_eq!(next_id(&done).await, id);
+        // 登记表里也没了：迟到的回答得到「没有这个冲突提问」，前端据此静默处理。
+        let late = registry.answer_conflict(id, skip_decision());
+        assert!(late.expect_err("已超时").contains("没有这个冲突提问"));
+    }
+
+    #[tokio::test]
+    async fn closing_the_tab_cancels_the_prompt_and_broadcasts_done() {
+        let app = mock_app();
+        let (prompts, done) = watch_prompts(app.handle());
+        let registry = Arc::new(SftpRegistry::default());
+        let asking = ask_user(
+            app.handle(),
+            &registry,
+            "tab-1",
+            Duration::from_secs(30),
+            sample_info(),
+        );
+        let closing = async {
+            let id = next_id(&prompts).await;
+            assert_eq!(registry.cancel_conflicts_of("tab-1"), 1);
+            id
+        };
+        let (decision, id) = tokio::join!(asking, closing);
+        assert_eq!(decision.action, ConflictAction::Skip);
+        assert_eq!(next_id(&done).await, id);
+    }
+
+    #[tokio::test]
+    async fn an_untouched_suggested_name_is_not_a_hand_typed_one() {
+        // 用户没改对话框预填的建议名：回到引擎时 rename_to 是 None（走自动起名）；改过的原样保留。
+        for (typed, expected) in [
+            ("a (2).txt", None),
+            ("  a (2).txt ", None),
+            ("mine.txt", Some("mine.txt")),
+        ] {
+            let app = mock_app();
+            let (prompts, _done) = watch_prompts(app.handle());
+            let registry = Arc::new(SftpRegistry::default());
+            let asking = ask_user(
+                app.handle(),
+                &registry,
+                "tab-1",
+                Duration::from_secs(30),
+                sample_info(),
+            );
+            let answering = async {
+                let id = next_id(&prompts).await;
+                registry
+                    .answer_conflict(
+                        id,
+                        ConflictDecision {
+                            action: ConflictAction::Rename,
+                            apply_to_all: false,
+                            rename_to: Some(typed.to_owned()),
+                        },
+                    )
+                    .expect("回答");
+            };
+            let (decision, ()) = tokio::join!(asking, answering);
+            assert_eq!(decision.action, ConflictAction::Rename);
+            assert_eq!(decision.rename_to.as_deref(), expected, "输入 {typed:?}");
+        }
     }
 }

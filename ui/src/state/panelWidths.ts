@@ -30,6 +30,8 @@ export const SFTP_SPLIT_MIN = 0.15;
  * 主机树侧栏（UI-5）：默认 224px（原来写死的 w-56）。
  * 下限 180：顶栏左侧那一块（logo、侧栏开关、「主机」标签）要放得下，主机名也不至于太挤；
  * 上限 min(480, 窗口宽的 40%)：再宽就是浪费终端的地方，同样要给终端留 TERMINAL_MIN。
+ * 终端界面里右边开着 AI / SFTP 面板时，上限还要再扣掉它们的最小宽度（见 `hostTreeRightReserved`），
+ * 但下限仍保底 180：宁可让 `computeDockLayout` 去收起 AI，也不把主机树挤没。
  */
 export const HOST_TREE_DEFAULT = 224;
 export const HOST_TREE_MIN = 180;
@@ -66,7 +68,11 @@ export function panelBounds(
           ? HOST_TREE_MAX_RATIO
           : ASIDE_PANEL_MAX_RATIO;
   const available = Math.max(0, Math.floor(windowWidth - TERMINAL_MIN - Math.max(0, reserved)));
-  const min = Math.min(kind === "hostTree" ? HOST_TREE_MIN : PANEL_MIN, available);
+  // 主机树的下限只看窗口本身（不扣右边的面板）：右边面板占得再多，它也不能比 180 更窄。
+  const min =
+    kind === "hostTree"
+      ? Math.min(HOST_TREE_MIN, Math.max(0, Math.floor(windowWidth - TERMINAL_MIN)))
+      : Math.min(PANEL_MIN, available);
   const hardMax = kind === "hostTree" ? HOST_TREE_MAX : Number.POSITIVE_INFINITY;
   const max = Math.max(min, Math.floor(Math.min(windowWidth * ratio, available, hardMax)));
   return { min, max };
@@ -93,6 +99,38 @@ export function sanitizeStoredWidth(raw: unknown, fallback: number): number {
   if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
   if (raw <= 0 || raw > 20000) return fallback;
   return Math.round(raw);
+}
+
+// ---------------------------------------------------------------------------
+// 主机树右边开着的面板：主机树的上限要给它们让位。App 知道哪些面板开着，主机页、终端界面、
+// 顶栏三处各自调 `useHostTreeWidth`，所以这个数放在模块级共享，三处读到同一个宽度。
+// ---------------------------------------------------------------------------
+
+/** 右边开着的面板（AI、SFTP，各占最小宽度）给主机树留出的宽度。 */
+export function hostTreeRightReserved(aiOpen: boolean, sftpOpen: boolean): number {
+  return (aiOpen ? PANEL_MIN : 0) + (sftpOpen ? PANEL_MIN : 0);
+}
+
+let rightReserved = 0;
+const rightReservedListeners = new Set<() => void>();
+
+export function getHostTreeRightReserved(): number {
+  return rightReserved;
+}
+
+/** 设置右边面板占用的宽度（只有终端界面算；主机页传 0）。 */
+export function setHostTreeRightReserved(width: number): void {
+  const next = Math.max(0, Math.round(width));
+  if (rightReserved === next) return;
+  rightReserved = next;
+  for (const listener of rightReservedListeners) listener();
+}
+
+export function subscribeHostTreeRightReserved(listener: () => void): () => void {
+  rightReservedListeners.add(listener);
+  return () => {
+    rightReservedListeners.delete(listener);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +197,7 @@ export function resetPanelDraggingForTests(): void {
   dragging = false;
   listeners.clear();
   dragWidths.clear();
+  rightReserved = 0;
 }
 
 /** 拖动期间加在 `<body>` 上的类：禁掉文字选中（UI-1 第 2 节）。 */

@@ -13,7 +13,14 @@ import type { SftpConflictPrompt } from "../../api/sftp";
 
 const mocks = vi.hoisted(() => ({
   handlers: [] as Array<(sftpId: string, prompt: unknown) => void>,
-  answer: vi.fn(async () => {}),
+  answer: vi.fn(async (..._args: unknown[]) => {}),
+  doneHandlers: [] as Array<(conflictId: number) => void>,
+  toastInfo: vi.fn(),
+  toastError: vi.fn(),
+}));
+
+vi.mock("../ui/toast", () => ({
+  toast: { info: mocks.toastInfo, error: mocks.toastError, success: vi.fn(), warning: vi.fn() },
 }));
 
 vi.mock("../../api/sftp", async (importOriginal) => {
@@ -24,6 +31,12 @@ vi.mock("../../api/sftp", async (importOriginal) => {
       mocks.handlers.push(handler);
       return () => {
         mocks.handlers = mocks.handlers.filter((item) => item !== handler);
+      };
+    }),
+    onSftpConflictDone: vi.fn(async (handler: (conflictId: number) => void) => {
+      mocks.doneHandlers.push(handler);
+      return () => {
+        mocks.doneHandlers = mocks.doneHandlers.filter((item) => item !== handler);
       };
     }),
     sftpConflictAnswer: mocks.answer,
@@ -55,6 +68,13 @@ async function emit(sftpId: string, payload: SftpConflictPrompt) {
   });
 }
 
+/** 模拟后端发来「这条提问结束了」（回答 / 超时 / 取消；同样广播给所有窗口）。 */
+async function emitDone(conflictId: number) {
+  await act(async () => {
+    for (const handler of [...mocks.doneHandlers]) handler(conflictId);
+  });
+}
+
 async function mount(sessionIds: string[]) {
   const view = render(<SftpConflictHost sessionIds={sessionIds} />);
   await act(async () => {});
@@ -63,7 +83,11 @@ async function mount(sessionIds: string[]) {
 
 beforeEach(() => {
   mocks.handlers = [];
-  mocks.answer.mockClear();
+  mocks.doneHandlers = [];
+  mocks.answer.mockReset();
+  mocks.answer.mockImplementation(async () => {});
+  mocks.toastInfo.mockClear();
+  mocks.toastError.mockClear();
   useSftpConflicts.setState({ queue: [] });
 });
 
@@ -274,5 +298,70 @@ describe("全部应用对整个批次生效（SFTP-7）", () => {
     fireEvent.click(screen.getByRole("button", { name: "确定" }));
     expect(mocks.answer).toHaveBeenNthCalledWith(1, 1, "rename", true, "a - 副本.txt");
     expect(mocks.answer).toHaveBeenNthCalledWith(2, 2, "rename", true, undefined);
+  });
+});
+
+describe("提问在别的窗口答完之后（SFTP-9）", () => {
+  it("别的窗口答了：本窗口队列里那条被撤掉，之后会话迁过来也不再弹", async () => {
+    // 本窗口（B）还不认这个会话：提问收进队列但不弹。
+    const view = await mount([]);
+    await emit("moved", prompt(11));
+    expect(useSftpConflicts.getState().queue).toHaveLength(1);
+
+    // A 窗口回答之后，后端广播结束事件。
+    await emitDone(11);
+    expect(useSftpConflicts.getState().queue).toHaveLength(0);
+
+    // 会话迁到本窗口：不能把答过的提问再弹出来，更不会再回答一次。
+    view.rerender(<SftpConflictHost sessionIds={["moved"]} />);
+    await act(async () => {});
+    expect(screen.queryByText("目标已存在")).toBeNull();
+    expect(mocks.answer).not.toHaveBeenCalled();
+  });
+
+  it("正在显示的提问被别处答掉 / 超时：对话框收起，下一条接着弹", async () => {
+    await mount(["s1"]);
+    await emit("s1", prompt(1));
+    await emit("s1", prompt(2));
+    expect(screen.getByText("/srv/file1.txt")).toBeTruthy();
+    await emitDone(1);
+    expect(await screen.findByText("/srv/file2.txt")).toBeTruthy();
+    expect(mocks.answer).not.toHaveBeenCalled();
+  });
+
+  it("只撤结束的那一条，别的提问照旧", async () => {
+    await mount([]);
+    await emit("s1", prompt(1));
+    await emit("s1", prompt(2));
+    await emitDone(2);
+    expect(useSftpConflicts.getState().queue.map((item) => item.prompt.conflict_id)).toEqual([1]);
+  });
+
+  it("回答时后端说「没有这个冲突提问」：从队列撤掉并说一句，不弹错误", async () => {
+    mocks.answer.mockRejectedValueOnce("没有这个冲突提问：5");
+    await mount(["s1"]);
+    await emit("s1", prompt(5));
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    await act(async () => {});
+    expect(useSftpConflicts.getState().queue).toHaveLength(0);
+    expect(mocks.toastInfo).toHaveBeenCalledWith("这个同名提问已经处理过了");
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("别的回答失败原因照常报错", async () => {
+    mocks.answer.mockRejectedValueOnce("网络断了");
+    await mount(["s1"]);
+    await emit("s1", prompt(6));
+    fireEvent.click(screen.getByRole("button", { name: "确定" }));
+    await act(async () => {});
+    expect(mocks.toastError).toHaveBeenCalledWith("网络断了");
+    expect(mocks.toastInfo).not.toHaveBeenCalled();
+  });
+
+  it("卸载后不再监听结束事件", async () => {
+    const view = await mount(["s1"]);
+    expect(mocks.doneHandlers).toHaveLength(1);
+    view.unmount();
+    expect(mocks.doneHandlers).toHaveLength(0);
   });
 });

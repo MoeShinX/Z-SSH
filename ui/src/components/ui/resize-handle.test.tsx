@@ -6,7 +6,7 @@
 
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 vi.mock("../../stores/settings", async () => {
   const { create } = await import("zustand");
@@ -22,9 +22,18 @@ vi.mock("../../stores/settings", async () => {
   return { useSettings: store };
 });
 
-import type { PanelKind } from "../../state/panelWidths";
+import {
+  hostTreeRightReserved,
+  setHostTreeRightReserved,
+  type PanelKind,
+} from "../../state/panelWidths";
 import { useSettings } from "../../stores/settings";
-import { ResizeHandle, usePanelWidth, type PanelWidthKey } from "./resize-handle";
+import {
+  ResizeHandle,
+  useHostTreeWidth,
+  usePanelWidth,
+  type PanelWidthKey,
+} from "./resize-handle";
 
 /** 假设置表里读一个键。 */
 function stored(key: PanelWidthKey): unknown {
@@ -80,6 +89,7 @@ function handle(): HTMLElement {
 
 afterEach(() => {
   cleanup();
+  setHostTreeRightReserved(0);
   seed("layout.ai_panel_width", 400);
   seed("layout.aside_panel_width", 380);
   seed("layout.host_tree_width", 224);
@@ -210,5 +220,77 @@ describe("右边缘把手（主机树，UI-5）", () => {
     fireEvent.pointerMove(handle(), { clientX: 450, pointerId: 1 });
     expect(screen.getByTestId("panel").textContent).toBe("450");
     fireEvent.pointerUp(handle(), { clientX: 450, pointerId: 1 });
+  });
+});
+
+describe("主机树给右边开着的面板让位（SFTP-9）", () => {
+  const tree = () => (
+    <Harness kind="hostTree" storageKey="layout.host_tree_width" fallback={224} side="right" />
+  );
+
+  it("右边没有面板：和以前一样（jsdom 窗口宽 1024，上限 409）", () => {
+    seed("layout.host_tree_width", 400);
+    render(tree());
+    expect(screen.getByTestId("panel").textContent).toBe("400");
+  });
+
+  it("右边开着一个面板：上限 = 窗口 - 360 - 320 = 344，已存的更宽值被收窄", () => {
+    seed("layout.host_tree_width", 400);
+    act(() => setHostTreeRightReserved(hostTreeRightReserved(false, true)));
+    render(tree());
+    expect(screen.getByTestId("panel").textContent).toBe("344");
+  });
+
+  it("AI 和 SFTP 都开：拖不到会把右边挤掉的宽度，下限仍是 180 不会被挤成 0", () => {
+    act(() => setHostTreeRightReserved(hostTreeRightReserved(true, true)));
+    render(tree());
+    // 1024 - 360 - 640 < 180：上限抬到下限，主机树就是 180
+    expect(screen.getByTestId("panel").textContent).toBe("180");
+    fireEvent.pointerDown(handle(), { clientX: 180, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientX: 5000, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("180");
+    fireEvent.pointerMove(handle(), { clientX: -5000, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("180");
+    fireEvent.pointerUp(handle(), { clientX: 180, pointerId: 1 });
+  });
+
+  it("拖动时被右边面板的占用挡住：只能拖到 344", () => {
+    act(() => setHostTreeRightReserved(hostTreeRightReserved(true, false)));
+    render(tree());
+    fireEvent.pointerDown(handle(), { clientX: 224, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientX: 5000, pointerId: 1 });
+    expect(screen.getByTestId("panel").textContent).toBe("344");
+    fireEvent.pointerUp(handle(), { clientX: 5000, pointerId: 1 });
+    expect(stored("layout.host_tree_width")).toBe(344);
+  });
+
+  it("主机页、终端界面、顶栏三处读到同一个宽度，面板开关时一起变", () => {
+    seed("layout.host_tree_width", 400);
+    const seen: Record<string, number> = {};
+    function Probe({ name }: { name: string }) {
+      const { width } = useHostTreeWidth();
+      seen[name] = width;
+      return <span data-testid={name}>{width}</span>;
+    }
+    render(
+      <>
+        <Probe name="vault" />
+        <Probe name="terminal" />
+        <Probe name="titlebar" />
+      </>,
+    );
+    expect([seen.vault, seen.terminal, seen.titlebar]).toEqual([400, 400, 400]);
+
+    // 终端界面打开 SFTP 面板
+    act(() => setHostTreeRightReserved(hostTreeRightReserved(false, true)));
+    expect([seen.vault, seen.terminal, seen.titlebar]).toEqual([344, 344, 344]);
+
+    // 再开 AI：180
+    act(() => setHostTreeRightReserved(hostTreeRightReserved(true, true)));
+    expect([seen.vault, seen.terminal, seen.titlebar]).toEqual([180, 180, 180]);
+
+    // 回主机页（App 把占用清零）：恢复
+    act(() => setHostTreeRightReserved(0));
+    expect([seen.vault, seen.terminal, seen.titlebar]).toEqual([400, 400, 400]);
   });
 });
