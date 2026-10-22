@@ -59,55 +59,79 @@ const PTY_DENIED_NOTICE: &str =
     "\r\n\x1b[33m[Z-SSH] 服务器拒绝分配终端（PTY），以无终端模式继续\x1b[0m\r\n";
 
 /// 请求 PTY 和 shell，两步都等服务器的回复；返回等回复期间先到的输出（原顺序）。
+///
+/// `data_limit` 是等回复期间允许累计的数据字节数（和正常缓冲同一个值）：russh 收到数据
+/// 就自动放宽窗口，不等这里处理，不设上限的话服务器一直发内存就一直涨。
 async fn request_pty_and_shell(
-    channel: &mut Channel<Msg>,
+    write_half: &ChannelWriteHalf<Msg>,
+    read_half: &mut ChannelReadHalf,
     cols: u16,
     rows: u16,
     reply_timeout: Duration,
+    data_limit: usize,
 ) -> Result<Vec<Item>, ZsshError> {
     // 有的服务器回复之前就先发数据，这些一个字节都不能丢。
-    let mut pending: Vec<Item> = Vec::new();
+    let mut pending = Pending::default();
 
-    channel
+    write_half
         .request_pty(true, TERM, u32::from(cols), u32::from(rows), 0, 0, &[])
         .await
         .map_err(|err| ZsshError::Shell(format!("请求 PTY 失败：{err}")))?;
-    if !wait_reply(channel, "PTY", reply_timeout, &mut pending).await? {
-        pending.insert(0, Item::Data(PTY_DENIED_NOTICE.as_bytes().to_vec()));
-    }
+    let pty_accepted =
+        wait_reply(read_half, "PTY", reply_timeout, &mut pending, data_limit).await?;
 
-    channel
+    write_half
         .request_shell(true)
         .await
         .map_err(|err| ZsshError::Shell(format!("请求 shell 失败：{err}")))?;
-    if !wait_reply(channel, "shell", reply_timeout, &mut pending).await? {
+    if !wait_reply(read_half, "shell", reply_timeout, &mut pending, data_limit).await? {
         return Err(ZsshError::Shell("服务器拒绝打开 shell".into()));
     }
-    Ok(pending)
+
+    let mut items = pending.items;
+    if !pty_accepted {
+        items.insert(0, Item::Data(PTY_DENIED_NOTICE.as_bytes().to_vec()));
+    }
+    Ok(items)
+}
+
+/// 等回复期间先到的输出，连同累计的数据字节数（用来卡上限）。
+#[derive(Default)]
+struct Pending {
+    items: Vec<Item>,
+    data_bytes: usize,
 }
 
 /// 在通道上等一个请求的回复：`Ok(true)` = Success，`Ok(false)` = Failure。
 ///
-/// 等的过程中到的数据和退出事件存进 `pending`；通道关了、EOF 了、没了都算打开失败。
+/// 等的过程中到的数据和退出事件存进 `pending`；通道关了、EOF 了、没了都算打开失败；
+/// 累计数据超过 `data_limit` 也算打开失败。
 async fn wait_reply(
-    channel: &mut Channel<Msg>,
+    read_half: &mut ChannelReadHalf,
     what: &str,
     reply_timeout: Duration,
-    pending: &mut Vec<Item>,
+    pending: &mut Pending,
+    data_limit: usize,
 ) -> Result<bool, ZsshError> {
     let wait = async {
         loop {
-            match channel.wait().await {
+            match read_half.wait().await {
                 Some(ChannelMsg::Success) => return Ok(true),
                 Some(ChannelMsg::Failure) => return Ok(false),
                 // stderr 走扩展数据，和 read_channel 一样按普通输出处理。
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    pending.push(Item::Data(data.to_vec()));
+                    pending.data_bytes = pending.data_bytes.saturating_add(data.len());
+                    if pending.data_bytes > data_limit {
+                        return Err(ZsshError::Shell(format!(
+                            "服务器在回复前发送了过多数据（等待 {what} 请求的回复时，超过 {data_limit} 字节）"
+                        )));
+                    }
+                    pending.items.push(Item::Data(data.to_vec()));
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    pending.push(Item::Exit(Some(exit_status)));
+                    pending.items.push(Item::Exit(Some(exit_status)));
                 }
-                Some(ChannelMsg::ExitSignal { .. }) => pending.push(Item::Exit(None)),
+                Some(ChannelMsg::ExitSignal { .. }) => pending.items.push(Item::Exit(None)),
                 Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
                     return Err(ZsshError::Shell(format!(
                         "服务器在打开终端时关闭了连接（等待 {what} 请求的回复时）"
@@ -124,6 +148,66 @@ async fn wait_reply(
             "等待服务器回复 {what} 请求超时（{} 秒）",
             reply_timeout.as_secs_f32().ceil() as u64
         ))),
+    }
+}
+
+/// 关通道时最多等多久（连接已经坏了的话 `close()` 可能一直发不出去）。
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 还没交给 [`ShellSession`] 的通道写半边：丢弃即关闭。
+///
+/// 开终端要等服务器回复，最长 20 秒；这期间用户关掉窗格，外层会直接丢弃正在等的 future，
+/// 走不到任何"失败后关通道"的代码。russh 的 `Channel` / `ChannelWriteHalf` 被丢弃时不会通知
+/// 服务器，复用的连接上这条通道会一直占着一个会话名额（MaxSessions）。所以由守卫在
+/// `Drop` 里兜底：用 `tokio::spawn` 异步发 `close()`（`Drop` 里不能 await）。
+/// 打开成功时用 [`CloseOnDrop::disarm`] 取出写半边，守卫就不再管了。
+struct CloseOnDrop {
+    write_half: Option<ChannelWriteHalf<Msg>>,
+}
+
+impl CloseOnDrop {
+    fn new(write_half: ChannelWriteHalf<Msg>) -> Self {
+        Self {
+            write_half: Some(write_half),
+        }
+    }
+
+    /// 只有 disarm / close_now 会取走写半边，而它们都消耗 self，所以这里实际不会是 None。
+    fn write_half(&self) -> Result<&ChannelWriteHalf<Msg>, ZsshError> {
+        self.write_half
+            .as_ref()
+            .ok_or_else(|| ZsshError::Shell("通道写半边已被取走".into()))
+    }
+
+    /// 解除守卫，把写半边交出去。
+    fn disarm(mut self) -> Result<ChannelWriteHalf<Msg>, ZsshError> {
+        self.write_half
+            .take()
+            .ok_or_else(|| ZsshError::Shell("通道写半边已被取走".into()))
+    }
+
+    /// 正常的失败路径：直接等着把通道关掉（有超时），不依赖 Drop。
+    async fn close_now(mut self) {
+        if let Some(write_half) = self.write_half.take() {
+            let _ = timeout(CLOSE_TIMEOUT, write_half.close()).await;
+        }
+    }
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        let Some(write_half) = self.write_half.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = timeout(CLOSE_TIMEOUT, write_half.close()).await;
+                });
+            }
+            // 没有运行时（运行时已经在关闭）：发不出异步消息，连接此时也基本在随之关闭。
+            Err(_) => tracing::debug!("开终端被取消时没有 tokio 运行时，未能发送通道关闭"),
+        }
     }
 }
 
@@ -160,24 +244,36 @@ impl ShellSession {
 
     /// 同 [`ShellSession::open_with_buffer_limit`]，等每个回复的超时可调（测试用，不用真等 20 秒）。
     pub(crate) async fn open_with_reply_timeout(
-        mut channel: Channel<Msg>,
+        channel: Channel<Msg>,
         cols: u16,
         rows: u16,
         buffer_limit: usize,
         ring: Option<SharedTerminalRing>,
         reply_timeout: Duration,
     ) -> Result<Self, ZsshError> {
-        let pending = match request_pty_and_shell(&mut channel, cols, rows, reply_timeout).await {
+        // 先拆开：读半边用来等回复，写半边放进守卫。不管后面是失败、超时还是外层直接把
+        // 这个 future 丢掉（用户关窗格），没交给 ShellSession 的通道都会被关掉。
+        let (mut read_half, write_half) = channel.split();
+        let guard = CloseOnDrop::new(write_half);
+        let pending = match request_pty_and_shell(
+            guard.write_half()?,
+            &mut read_half,
+            cols,
+            rows,
+            reply_timeout,
+            buffer_limit.max(1),
+        )
+        .await
+        {
             Ok(pending) => pending,
             Err(err) => {
                 // 通道已经开出来了：不关的话，复用的连接上会一直占着一个会话名额
                 // （服务器的 MaxSessions 有上限）。
-                let _ = timeout(Duration::from_secs(2), channel.close()).await;
+                guard.close_now().await;
                 return Err(err);
             }
         };
-
-        let (read_half, write_half) = channel.split();
+        let write_half = guard.disarm()?;
         let (events_tx, events) = mpsc::channel(EVENT_BUFFER);
         let gate = Arc::new(FlowGate::new());
         let buffer = Arc::new(SessionBuffer::new(buffer_limit));

@@ -36,6 +36,9 @@ struct Script {
     before_shell_reply_stderr: Vec<u8>,
     /// shell 请求成功之后发的数据。
     after_shell: Vec<u8>,
+    /// 前几个 PTY 请求按 [`Reply::Silent`] 处理，之后才按 `pty` 的设置回复
+    /// （同一条连接上第一个通道不回复、第二个通道正常的场景用）。
+    silent_pty_requests: usize,
 }
 
 impl Script {
@@ -46,6 +49,7 @@ impl Script {
             before_pty_reply: Vec::new(),
             before_shell_reply_stderr: Vec::new(),
             after_shell: Vec::new(),
+            silent_pty_requests: 0,
         }
     }
 }
@@ -95,6 +99,10 @@ impl server::Handler for FakeServer {
     ) -> Result<(), Self::Error> {
         if !self.script.before_pty_reply.is_empty() {
             session.data(channel, self.script.before_pty_reply.clone())?;
+        }
+        if self.script.silent_pty_requests > 0 {
+            self.script.silent_pty_requests -= 1;
+            return respond(Reply::Silent, channel, session);
         }
         respond(self.script.pty, channel, session)
     }
@@ -199,15 +207,15 @@ async fn open(
     channel: Channel<client::Msg>,
     reply_timeout: Duration,
 ) -> Result<ShellSession, ZsshError> {
-    ShellSession::open_with_reply_timeout(
-        channel,
-        80,
-        24,
-        DEFAULT_BUFFER_LIMIT,
-        None,
-        reply_timeout,
-    )
-    .await
+    open_with_limit(channel, reply_timeout, DEFAULT_BUFFER_LIMIT).await
+}
+
+async fn open_with_limit(
+    channel: Channel<client::Msg>,
+    reply_timeout: Duration,
+    buffer_limit: usize,
+) -> Result<ShellSession, ZsshError> {
+    ShellSession::open_with_reply_timeout(channel, 80, 24, buffer_limit, None, reply_timeout).await
 }
 
 fn error_text(result: Result<ShellSession, ZsshError>) -> String {
@@ -331,4 +339,133 @@ async fn channel_closed_while_waiting_for_shell_reply() {
         text.contains("服务器在打开终端时关闭了连接"),
         "实际：{text}"
     );
+}
+
+// ---- TERM-3：取消时关通道 ----
+
+/// 等回复期间把打开任务中止（相当于用户关掉窗格，外层丢弃了正在等的 future），
+/// 服务器要在短时间内看到这个通道被关。
+async fn assert_cancel_closes_channel(script: Script) {
+    let (addr, mut closed) = spawn_server(script).await;
+    let (_handle, channel) = connect_and_open_channel(addr).await;
+
+    let task = tokio::spawn(open(channel, Duration::from_secs(30)));
+    // 留够时间让请求发出去、打开任务停在等回复上。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!task.is_finished(), "服务器不回复，打开应当还在等");
+    task.abort();
+
+    let seen = timeout(Duration::from_secs(2), closed.recv()).await;
+    assert!(
+        matches!(seen, Ok(Some(()))),
+        "取消后服务器应当在 2 秒内看到通道被关闭"
+    );
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_pty_reply_closes_the_channel() {
+    assert_cancel_closes_channel(Script::new(Reply::Silent, Reply::Success)).await;
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_shell_reply_closes_the_channel() {
+    assert_cancel_closes_channel(Script::new(Reply::Success, Reply::Silent)).await;
+}
+
+#[tokio::test]
+async fn cancelled_channel_is_closed_and_the_connection_stays_usable() {
+    // 第一个通道的 PTY 请求服务器不回复，第二个通道正常。
+    let mut script = Script::new(Reply::Success, Reply::Success);
+    script.silent_pty_requests = 1;
+    script.after_shell = b"second
+"
+    .to_vec();
+    let (addr, mut closed) = spawn_server(script).await;
+    let (handle, first) = connect_and_open_channel(addr).await;
+
+    let task = tokio::spawn(open(first, Duration::from_secs(30)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    task.abort();
+    let seen = timeout(Duration::from_secs(2), closed.recv()).await;
+    assert!(
+        matches!(seen, Ok(Some(()))),
+        "被取消的通道应当在 2 秒内被关闭"
+    );
+
+    // 同一条连接上再开一个通道，照常能用。
+    let second = handle.channel_open_session().await.expect("连接应仍可用");
+    let mut shell = open(second, Duration::from_secs(5))
+        .await
+        .expect("第二个通道正常打开");
+    let out = collect_output(&mut shell, 8).await;
+    assert_eq!(
+        out,
+        b"second
+"
+    );
+    // 成功打开后守卫已解除：不能再有多余的关闭。
+    assert!(
+        timeout(Duration::from_millis(300), closed.recv())
+            .await
+            .is_err(),
+        "成功打开的通道不该被守卫关掉"
+    );
+    shell.write(b"x").await.expect("打开后的通道还能写");
+}
+
+// ---- TERM-3：等回复期间的输出上限 ----
+
+#[tokio::test]
+async fn too_much_data_before_the_reply_fails_and_closes_the_channel() {
+    let mut script = Script::new(Reply::Success, Reply::Success);
+    script.before_pty_reply = vec![b'x'; 4096];
+    let (addr, mut closed) = spawn_server(script).await;
+    let (_handle, channel) = connect_and_open_channel(addr).await;
+
+    let text = error_text(open_with_limit(channel, Duration::from_secs(5), 1024).await);
+    assert!(
+        text.contains("服务器在回复前发送了过多数据"),
+        "实际：{text}"
+    );
+    let seen = timeout(Duration::from_secs(5), closed.recv()).await;
+    assert!(matches!(seen, Ok(Some(()))), "超限后通道应当被关闭");
+}
+
+#[tokio::test]
+async fn the_cap_counts_data_across_both_replies_and_stderr() {
+    // 两段各 700 字节、单段都不到上限，合计超过 1024。
+    let mut script = Script::new(Reply::Success, Reply::Success);
+    script.before_pty_reply = vec![b'a'; 700];
+    script.before_shell_reply_stderr = vec![b'b'; 700];
+    let (addr, _closed) = spawn_server(script).await;
+    let (_handle, channel) = connect_and_open_channel(addr).await;
+
+    let text = error_text(open_with_limit(channel, Duration::from_secs(5), 1024).await);
+    assert!(
+        text.contains("服务器在回复前发送了过多数据"),
+        "实际：{text}"
+    );
+}
+
+#[tokio::test]
+async fn data_exactly_at_the_cap_is_kept_in_full_and_in_order() {
+    let mut script = Script::new(Reply::Success, Reply::Success);
+    let mut early = Vec::new();
+    // 1024 字节：PTY 回复前 600 + shell 回复前（stderr）424，刚好等于上限。
+    early.extend((0..600u32).map(|i| (i % 251) as u8));
+    script.before_pty_reply = early.clone();
+    let tail: Vec<u8> = (0..424u32).map(|i| (i % 241) as u8).collect();
+    script.before_shell_reply_stderr = tail.clone();
+    script.after_shell = b"END".to_vec();
+    let (addr, _closed) = spawn_server(script).await;
+    let (_handle, channel) = connect_and_open_channel(addr).await;
+
+    let mut shell = open_with_limit(channel, Duration::from_secs(5), 1024)
+        .await
+        .expect("刚好不超过上限应当成功");
+    let mut expected = early;
+    expected.extend_from_slice(&tail);
+    expected.extend_from_slice(b"END");
+    let out = collect_output(&mut shell, expected.len()).await;
+    assert_eq!(out, expected, "数据一个字节不丢、顺序不变");
 }
