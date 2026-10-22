@@ -159,6 +159,9 @@ pub struct ConflictInfo {
     pub target_mtime: Option<u32>,
     /// 能不能续传（目标比源小）。
     pub can_resume: bool,
+    /// 对话框里预填的新名字（完整路径）：第一个没被占用的自动名字；检查不了或者试到上限
+    /// 就退回固定的 `名字 (2)` / `名字 - 副本`，不能因为检查失败卡住提问。
+    pub suggested_target: String,
     /// 这次提问属于哪个批次（同一次提交 / 粘贴）。界面用它把同批次还在排队的提问一起回答；
     /// `None` = 不属于任何批次（单独提交的任务、重试过的任务）。
     pub batch: Option<u64>,
@@ -734,6 +737,8 @@ impl TransferEngine {
         // 重试的任务：上次留下的 .zssh-part 先当续传起点试（尾部对账把着关）。
         let mut resume_from_partial = prefer_resume;
         let mut renamed_target: Option<String> = None;
+        // 改名时已经抢到手的新名字的目标锁：交给下一轮用，中间不放手（见 `pick_free_name`）。
+        let mut renamed_guard: Option<lock::TargetGuard> = None;
         // 用户是否**真的**同意过覆盖这个目标。开始时目标不存在（没问过）就是 false：
         // 提交用不覆盖的改名，传输期间别人建的同名文件不会被悄悄盖掉（C05）。
         let mut overwrite_authorized = false;
@@ -747,7 +752,10 @@ impl TransferEngine {
                 .clone()
                 .unwrap_or_else(|| planned.target.clone());
             // 同一个最终目标同时只让一个任务写；这一轮结束（成功、失败、暂停）就放掉。
-            let _target_guard = self.lock_target(state.job.direction, &target).await?;
+            let _target_guard = match renamed_guard.take() {
+                Some(guard) => guard,
+                None => self.lock_target(state.job.direction, &target).await?,
+            };
             let pair = match self
                 .endpoints
                 .pair(
@@ -788,8 +796,9 @@ impl TransferEngine {
                         }
                         return Ok(FileOutcome::Skipped);
                     }
-                    ConflictOutcome::Renamed(name) => {
+                    ConflictOutcome::Renamed(name, guard) => {
                         renamed_target = Some(name);
+                        renamed_guard = guard;
                         continue;
                     }
                 }
@@ -1013,7 +1022,9 @@ impl TransferEngine {
                 })
             }
             // 暂停前选了改名：接着往那个名字传，不能回到原目标上（那等于没经同意就覆盖）。
-            Some(RememberedConflict::Renamed(name)) => return Ok(ConflictOutcome::Renamed(name)),
+            Some(RememberedConflict::Renamed(name)) => {
+                return Ok(ConflictOutcome::Renamed(name, None))
+            }
             None => {}
         }
         let Some(existing_size) = target.existing_size().await? else {
@@ -1052,6 +1063,7 @@ impl TransferEngine {
                 // 等用户回答期间让界面看得出是在等人（回答最长等 2 分钟，不能显示成「准备中」）。
                 self.set_state(state, TransferState::WaitingConflict);
                 self.emit(state, true);
+                let suggested_target = self.suggest_free_name(state, planned, target_path).await;
                 let decision = self
                     .resolver
                     .decide(ConflictInfo {
@@ -1064,6 +1076,7 @@ impl TransferEngine {
                         source_mtime,
                         target_mtime,
                         can_resume,
+                        suggested_target,
                         batch: batch.as_ref().map(|batch| batch.id()),
                     })
                     .await;
@@ -1078,10 +1091,12 @@ impl TransferEngine {
                 batch.remember(decision.action);
             }
         }
-        let outcome = self.apply_conflict_decision(state, &decision, can_resume, target_path);
+        let outcome = self
+            .apply_conflict_decision(state, planned, &decision, can_resume, target_path)
+            .await?;
         let remembered = match &outcome {
             ConflictOutcome::Proceed { .. } => Some(RememberedConflict::Overwrite),
-            ConflictOutcome::Renamed(name) => Some(RememberedConflict::Renamed(name.clone())),
+            ConflictOutcome::Renamed(name, _) => Some(RememberedConflict::Renamed(name.clone())),
             ConflictOutcome::Skip => None,
         };
         if let Some(remembered) = remembered {
@@ -1093,14 +1108,15 @@ impl TransferEngine {
     }
 
     /// 把用户的冲突选择变成这个文件接下来怎么做。
-    fn apply_conflict_decision(
+    async fn apply_conflict_decision(
         &self,
         state: &Arc<JobState>,
+        planned: &plan::PlannedFile,
         decision: &ConflictDecision,
         can_resume: bool,
         target_path: &str,
-    ) -> ConflictOutcome {
-        match decision.action {
+    ) -> Result<ConflictOutcome, SftpError> {
+        Ok(match decision.action {
             ConflictAction::Overwrite => ConflictOutcome::Proceed {
                 resume: false,
                 overwrite: true,
@@ -1126,21 +1142,124 @@ impl TransferEngine {
                 // 对话框传回来的只是一个**文件名**（不是路径）：要接在原目标所在的
                 // 目录后面，不然会写到相对路径上（远端是家目录、本地是工作目录）。
                 // 带路径分隔符的名字不接受，退回自动名字。
-                let renamed = decision
+                let manual = decision
                     .rename_to
                     .as_deref()
                     .map(str::trim)
                     .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
-                    .map(|name| with_file_name(target_path, name))
-                    .unwrap_or_else(|| match state.job.direction {
-                        // 复制粘贴的自动名字和粘贴时的习惯一致：「名字 - 副本」，不是「名字 (2)」。
-                        Direction::RemoteCopy | Direction::LocalCopy => copy_path(target_path, 1),
-                        Direction::Upload | Direction::Download => renamed_path(target_path, 2),
-                    });
+                    .map(|name| with_file_name(target_path, name));
+                let (renamed, guard) = match manual {
+                    Some(path) => self.claim_manual_name(state, planned, path).await?,
+                    None => self.pick_free_name(state, planned, target_path).await?,
+                };
                 self.push_note(state, format!("目标已存在，改成 {renamed}"));
-                ConflictOutcome::Renamed(renamed)
+                ConflictOutcome::Renamed(renamed, Some(guard))
+            }
+        })
+    }
+
+    /// 第 `n` 个（从 1 数起）自动名字：上传 / 下载是 `名字 (2)`、`名字 (3)`…；
+    /// 复制粘贴是 `名字 - 副本`、`名字 - 副本 2`…（和粘贴时的习惯一致）。
+    fn auto_candidate(direction: Direction, target_path: &str, n: usize) -> String {
+        match direction {
+            Direction::RemoteCopy | Direction::LocalCopy => copy_path(target_path, n),
+            Direction::Upload | Direction::Download => renamed_path(target_path, n + 1),
+        }
+    }
+
+    /// 目标端这个路径上是不是已经有东西（文件、目录、链接都算占用）。
+    async fn path_taken(
+        &self,
+        state: &Arc<JobState>,
+        planned: &plan::PlannedFile,
+        path: &str,
+    ) -> Result<bool, SftpError> {
+        let pair = self
+            .endpoints
+            .pair(
+                state.job.direction,
+                state.job.peer.as_deref(),
+                &planned.source,
+                path,
+                &self.owner_of(state),
+            )
+            .await?;
+        Ok(pair.target.existing_size().await?.is_some())
+    }
+
+    /// 自动改名：往后找第一个没被占用的名字，**同时把它的目标锁抢下来**一路带到传输。
+    ///
+    /// 为什么选名字和上锁要在一起：同一时刻两个任务都想改名到同一个空名字时，光看「现在
+    /// 有没有这个文件」是看不出来的（先到的那个文件还没写出来）。谁先抢到锁谁用，后到的
+    /// 看到 `TargetBusy` 就当这个名字被占了，接着往后找；此时原目标的锁还在手里，所以
+    /// 选名到开写之间没有空隙。
+    async fn pick_free_name(
+        &self,
+        state: &Arc<JobState>,
+        planned: &plan::PlannedFile,
+        target_path: &str,
+    ) -> Result<(String, lock::TargetGuard), SftpError> {
+        for n in 1..=MAX_RENAME_TRIES {
+            let candidate = Self::auto_candidate(state.job.direction, target_path, n);
+            let guard = match self.lock_target(state.job.direction, &candidate).await {
+                Ok(guard) => guard,
+                // 别的任务正要写这个名字。
+                Err(SftpError::TargetBusy { .. }) => continue,
+                Err(err) => return Err(err),
+            };
+            if self.path_taken(state, planned, &candidate).await? {
+                continue;
+            }
+            return Ok((candidate, guard));
+        }
+        Err(SftpError::NoFreeName {
+            path: target_path.to_owned(),
+            tried: MAX_RENAME_TRIES,
+        })
+    }
+
+    /// 用户在对话框里手动输入的新名字：必须没被占用（也不能是别的任务正在写的），
+    /// 否则这个文件按失败处理，不静默覆盖、也不悄悄换成别的名字。
+    async fn claim_manual_name(
+        &self,
+        state: &Arc<JobState>,
+        planned: &plan::PlannedFile,
+        path: String,
+    ) -> Result<(String, lock::TargetGuard), SftpError> {
+        let exists = |path: &str| SftpError::RenameTargetExists {
+            name: path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned(),
+        };
+        // 先查再锁：新名字和原目标其实是同一个文件（只是大小写不同的写法）时，
+        // 锁会说「别的任务在写」，实际该告诉用户「新名字也已存在」。
+        if self.path_taken(state, planned, &path).await? {
+            return Err(exists(&path));
+        }
+        let guard = self.lock_target(state.job.direction, &path).await?;
+        // 拿到锁之后再看一眼：刚才查完到上锁之间，别的任务可能刚好写完这个名字。
+        if self.path_taken(state, planned, &path).await? {
+            return Err(exists(&path));
+        }
+        Ok((path, guard))
+    }
+
+    /// 对话框里预填的名字：第一个没被占用的自动名字。只是建议，不上锁；检查失败
+    /// 或试到上限就退回固定的第一个名字（不能因为这个卡住提问）。
+    async fn suggest_free_name(
+        &self,
+        state: &Arc<JobState>,
+        planned: &plan::PlannedFile,
+        target_path: &str,
+    ) -> String {
+        let direction = state.job.direction;
+        for n in 1..=MAX_RENAME_TRIES {
+            let candidate = Self::auto_candidate(direction, target_path, n);
+            match self.path_taken(state, planned, &candidate).await {
+                Ok(false) => return candidate,
+                Ok(true) => {}
+                Err(_) => break,
             }
         }
+        Self::auto_candidate(direction, target_path, 1)
     }
 
     fn finish_with_error(&self, state: &Arc<JobState>, err: SftpError) {
@@ -1302,8 +1421,13 @@ enum ConflictOutcome {
         overwrite: bool,
     },
     Skip,
-    Renamed(String),
+    /// 改成这个名字。带着的锁是新名字的目标锁（选名字的时候就抢下来了）；
+    /// 暂停后重进时记住的旧名字没有锁（`None`），照常在下一轮重新拿。
+    Renamed(String, Option<lock::TargetGuard>),
 }
+
+/// 自动改名最多往后试这么多个名字，再多就按失败处理（不能无限循环）。
+const MAX_RENAME_TRIES: usize = 1000;
 
 /// 退避：200ms、400ms、800ms…（上限 5 秒）。
 pub fn backoff_delay(attempt: u32) -> Duration {

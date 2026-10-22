@@ -82,6 +82,16 @@ pub enum SftpError {
     #[error("另一个传输任务正在写 {path}，等它结束后再试")]
     TargetBusy { path: String },
 
+    /// 冲突对话框里手动输入的新名字也已经被占用（不会覆盖它，这个文件按失败处理）。
+    #[error("新名字 {name} 也已存在，请换一个名字再试")]
+    RenameTargetExists { name: String },
+
+    /// 自动改名一路试下来，附近的名字全被占满了。
+    #[error(
+        "{path} 旁边的自动改名（试了 {tried} 个名字）都已被占用，请手动换个名字，或先清理同名文件"
+    )]
+    NoFreeName { path: String, tried: usize },
+
     #[error("操作被取消")]
     Cancelled,
 

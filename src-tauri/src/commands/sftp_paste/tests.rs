@@ -148,6 +148,7 @@ fn info() -> ConflictInfo {
         source_mtime: None,
         target_mtime: None,
         can_resume: false,
+        suggested_target: "/b/x - 副本.txt".to_owned(),
         batch: None,
     }
 }

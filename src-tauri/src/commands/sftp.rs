@@ -552,13 +552,9 @@ impl ConflictResolver for UiConflictResolver {
                 return skip_decision();
             }
             let (conflict_id, receiver) = self.registry.add_conflict(&self.sftp_id);
-            // 复制粘贴的冲突：建议名是「名字 - 副本」（和资源管理器的习惯一致），不是 `名字 (2)`。
-            let suggested = match info.direction {
-                Direction::RemoteCopy | Direction::LocalCopy => {
-                    zssh_core::sftp::transfer::copy_path(&info.target, 1)
-                }
-                _ => zssh_core::sftp::transfer::renamed_path(&info.target, 2),
-            };
+            // 建议名由引擎给：已经跳过了被占用的名字（上传 / 下载从 `名字 (2)` 起，
+            // 复制粘贴从「名字 - 副本」起）。
+            let suggested = info.suggested_target.clone();
             let prompt = ConflictPromptDto {
                 conflict_id,
                 job: info.job,

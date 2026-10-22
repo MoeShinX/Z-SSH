@@ -178,6 +178,21 @@ pub fn first_free_copy_path(dest: &str, mut taken: impl FnMut(&str) -> bool) -> 
     }
 }
 
+/// 冲突对话框里预填的远端副本名：第一个没被占用的「名字 - 副本」「名字 - 副本 2」…
+/// 只是建议——查不了（出错）或者试了 1000 个还被占着，就退回固定的「名字 - 副本」，
+/// 不能因为这个卡住提问。
+async fn suggest_remote_copy_name(browse: &SftpChannel, target: &str) -> String {
+    for index in 1..=1000 {
+        let candidate = copy_path(target, index);
+        match browse.lstat(&candidate).await {
+            Ok(_) => {}
+            Err(zssh_core::sftp::SftpError::NotFound { .. }) => return candidate,
+            Err(_) => break,
+        }
+    }
+    copy_path(target, 1)
+}
+
 enum Dest {
     /// 目标是这个路径，现在不存在（或者是要覆盖的文件）。
     Free(String),
@@ -320,6 +335,8 @@ impl CopyConflictResolver for MergeConflictBridge<'_> {
                     rename_to: None,
                 },
                 None => {
+                    let suggested_target =
+                        suggest_remote_copy_name(self.browse, &info.target).await;
                     self.resolver
                         .decide(ConflictInfo {
                             job: 0,
@@ -331,6 +348,7 @@ impl CopyConflictResolver for MergeConflictBridge<'_> {
                             source_mtime: info.source_mtime,
                             target_mtime: info.target_mtime,
                             can_resume: false,
+                            suggested_target,
                             batch: Some(self.batch.id()),
                         })
                         .await
@@ -715,6 +733,7 @@ async fn resolve_remote_dest(
         Err(_) => return Ok(Dest::Free(dest)),
     };
     let source_attrs = tab.browse.lstat(&item.path).await.ok();
+    let suggested_target = suggest_remote_copy_name(&tab.browse, &dest).await;
     let decision = ask(
         resolver,
         state,
@@ -728,6 +747,7 @@ async fn resolve_remote_dest(
             source_mtime: source_attrs.as_ref().and_then(|attrs| attrs.mtime),
             target_mtime: existing.mtime,
             can_resume: false,
+            suggested_target,
             batch: Some(state.batch.id()),
         },
         same_entry,
@@ -901,6 +921,9 @@ async fn resolve_local_dest(
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|elapsed| u32::try_from(elapsed.as_secs()).ok())
     };
+    let suggested_target = first_free_copy_path(&dest.display().to_string(), |candidate| {
+        std::fs::symlink_metadata(candidate).is_ok()
+    });
     let decision = ask(
         resolver,
         state,
@@ -914,6 +937,7 @@ async fn resolve_local_dest(
             source_mtime: source_meta.as_ref().and_then(mtime),
             target_mtime: mtime(&existing),
             can_resume: false,
+            suggested_target,
             batch: Some(state.batch.id()),
         },
         same_entry,

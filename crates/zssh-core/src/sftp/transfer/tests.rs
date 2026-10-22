@@ -2069,3 +2069,337 @@ async fn copy_jobs_in_a_batch_get_copy_style_names_when_renaming_for_all() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 自动改名往后找没被占用的名字（SFTP-8）
+// ---------------------------------------------------------------------------
+
+/// 一个上传任务：本地新建 `name`（内容全是 `fill`），目标是远端同名文件。
+fn upload_job(root: &crate::test_util::TestDir, name: &str, fill: u8) -> TransferJob {
+    let source = root.join(name);
+    std::fs::write(&source, vec![fill; 512]).unwrap();
+    TransferJob {
+        direction: Direction::Upload,
+        source: source.display().to_string(),
+        target: format!("/remote/{name}"),
+        recursive: false,
+        peer: None,
+    }
+}
+
+fn engine_with(
+    endpoints: &Arc<MemoryEndpoints>,
+    resolver: Arc<Scripted>,
+    concurrency: usize,
+) -> (Arc<TransferEngine>, mpsc::UnboundedReceiver<TransferEvent>) {
+    TransferEngine::new(
+        endpoints.clone(),
+        resolver as Arc<dyn ConflictResolver>,
+        TransferOptions {
+            concurrency,
+            ..local_options()
+        },
+    )
+}
+
+async fn run_one(
+    engine: &Arc<TransferEngine>,
+    events: &mut mpsc::UnboundedReceiver<TransferEvent>,
+    job: TransferJob,
+) -> ProgressReport {
+    let id = engine.submit(job);
+    drain_until_finished(events, id, Duration::from_secs(30)).await
+}
+
+#[tokio::test]
+async fn auto_rename_skips_names_that_are_already_taken() {
+    let root = temp_root("auto-rename-taken");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    for name in ["f.bin", "f (2).bin", "f (3).bin"] {
+        endpoints.put_remote(&format!("/remote/{name}"), vec![b'O'; 100]);
+    }
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, None));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "f.bin", b'N')).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(
+        endpoints.remote_contents("/remote/f (4).bin"),
+        vec![b'N'; 512]
+    );
+    for name in ["f.bin", "f (2).bin", "f (3).bin"] {
+        assert_eq!(
+            endpoints.remote_contents(&format!("/remote/{name}")),
+            vec![b'O'; 100],
+            "{name} 原来的内容不能动"
+        );
+    }
+}
+
+#[tokio::test]
+async fn copy_jobs_skip_taken_copy_names() {
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/src/c.txt", vec![b'S'; 300]);
+    for name in ["c.txt", "c - 副本.txt", "c - 副本 2.txt"] {
+        endpoints.put_remote(&format!("/dst/{name}"), vec![b'D'; 50]);
+    }
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, None));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(
+        &engine,
+        &mut events,
+        TransferJob {
+            direction: Direction::RemoteCopy,
+            source: "/src/c.txt".to_owned(),
+            target: "/dst/c.txt".to_owned(),
+            recursive: false,
+            peer: None,
+        },
+    )
+    .await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(
+        endpoints.remote_contents("/dst/c - 副本 3.txt"),
+        vec![b'S'; 300]
+    );
+}
+
+#[tokio::test]
+async fn downloads_skip_taken_local_names() {
+    let root = temp_root("auto-rename-local");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/d.bin", vec![b'R'; 400]);
+    let target = root.join("d.bin");
+    std::fs::write(&target, b"old").unwrap();
+    std::fs::write(root.join("d (2).bin"), b"old2").unwrap();
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, None));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(
+        &engine,
+        &mut events,
+        TransferJob {
+            direction: Direction::Download,
+            source: "/remote/d.bin".to_owned(),
+            target: target.display().to_string(),
+            recursive: false,
+            peer: None,
+        },
+    )
+    .await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(
+        std::fs::read(root.join("d (3).bin")).unwrap(),
+        vec![b'R'; 400]
+    );
+    assert_eq!(std::fs::read(root.join("d (2).bin")).unwrap(), b"old2");
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn a_hand_typed_name_that_is_taken_fails_with_a_clear_message() {
+    let root = temp_root("manual-name-taken");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/h.bin", vec![b'O'; 100]);
+    endpoints.put_remote("/remote/mine.bin", vec![b'M'; 100]);
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, Some("mine.bin")));
+    let (engine, mut events) = engine_with(&endpoints, Arc::clone(&resolver), 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "h.bin", b'N')).await;
+    match &report.state {
+        TransferState::Failed(text) => assert!(
+            text.contains("新名字 mine.bin 也已存在"),
+            "错误信息要点明是新名字被占：{text}"
+        ),
+        other => panic!("手动输入的名字被占用应该失败，实际 {other:?}"),
+    }
+    assert_eq!(resolver.count(), 1);
+    assert_eq!(
+        endpoints.remote_contents("/remote/mine.bin"),
+        vec![b'M'; 100]
+    );
+    assert_eq!(endpoints.remote_contents("/remote/h.bin"), vec![b'O'; 100]);
+    assert!(
+        !endpoints.remote_exists("/remote/h (2).bin"),
+        "不能悄悄换成自动名字"
+    );
+}
+
+#[tokio::test]
+async fn a_hand_typed_name_equal_to_the_conflicting_target_is_rejected() {
+    let root = temp_root("manual-name-same");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/s.bin", vec![b'O'; 100]);
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, Some("s.bin")));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "s.bin", b'N')).await;
+    assert!(
+        matches!(&report.state, TransferState::Failed(text) if text.contains("新名字 s.bin 也已存在")),
+        "{report:?}"
+    );
+    assert_eq!(endpoints.remote_contents("/remote/s.bin"), vec![b'O'; 100]);
+}
+
+#[tokio::test]
+async fn a_free_hand_typed_name_is_used_as_is() {
+    let root = temp_root("manual-name-free");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/k.bin", vec![b'O'; 100]);
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, Some("fresh.bin")));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "k.bin", b'N')).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert_eq!(
+        endpoints.remote_contents("/remote/fresh.bin"),
+        vec![b'N'; 512]
+    );
+}
+
+#[tokio::test]
+async fn the_suggested_name_in_the_prompt_skips_taken_names() {
+    let root = temp_root("suggest-free");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    for name in ["a.bin", "a (2).bin"] {
+        endpoints.put_remote(&format!("/remote/{name}"), vec![b'O'; 100]);
+    }
+    endpoints.put_remote("/src/c.txt", vec![b'S'; 300]);
+    for name in ["c.txt", "c - 副本.txt"] {
+        endpoints.put_remote(&format!("/dst/{name}"), vec![b'D'; 50]);
+    }
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Skip, false, None));
+    let (engine, mut events) = engine_with(&endpoints, Arc::clone(&resolver), 1);
+    run_one(&engine, &mut events, upload_job(&root, "a.bin", b'N')).await;
+    run_one(
+        &engine,
+        &mut events,
+        TransferJob {
+            direction: Direction::RemoteCopy,
+            source: "/src/c.txt".to_owned(),
+            target: "/dst/c.txt".to_owned(),
+            recursive: false,
+            peer: None,
+        },
+    )
+    .await;
+    let asked = resolver.asked.lock().unwrap();
+    assert_eq!(asked[0].suggested_target, "/remote/a (3).bin");
+    assert_eq!(asked[1].suggested_target, "/dst/c - 副本 2.txt");
+}
+
+#[tokio::test]
+async fn running_out_of_names_fails_clearly_and_the_prompt_falls_back() {
+    let root = temp_root("rename-exhausted");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/z.bin", vec![b'O'; 10]);
+    // 从 (2) 起 1000 个名字全占上。
+    for index in 2..=1001 {
+        endpoints.put_remote(&format!("/remote/z ({index}).bin"), vec![b'O'; 10]);
+    }
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, None));
+    let (engine, mut events) = engine_with(&endpoints, Arc::clone(&resolver), 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "z.bin", b'N')).await;
+    match &report.state {
+        TransferState::Failed(text) => assert!(
+            text.contains("自动改名") && text.contains("都已被占用"),
+            "错误信息要说清是名字用光了：{text}"
+        ),
+        other => panic!("名字用光应该失败，实际 {other:?}"),
+    }
+    assert!(
+        !endpoints.remote_exists("/remote/z (1002).bin"),
+        "不能超过上限继续试"
+    );
+    assert_eq!(
+        resolver.asked.lock().unwrap()[0].suggested_target,
+        "/remote/z (2).bin",
+        "找不到空名字时建议名退回固定的第一个"
+    );
+}
+
+#[tokio::test]
+async fn auto_rename_leaves_alone_a_name_another_task_is_about_to_write() {
+    // 另一个任务已经占了「f (2).bin」这个名字的目标锁，但文件还没写出来：
+    // 只看「现在有没有这个文件」会误选它，上锁之后就能避开。
+    let root = temp_root("rename-locked-name");
+    let identity = "tester@rename-lock:22";
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote").with_identity(identity));
+    endpoints.put_remote("/remote/f.bin", vec![b'O'; 100]);
+    let held = lock::TargetLocks::remote()
+        .try_acquire_remote(identity, "/remote/f (2).bin")
+        .unwrap();
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, None));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 1);
+    let report = run_one(&engine, &mut events, upload_job(&root, "f.bin", b'N')).await;
+    assert_eq!(report.state, TransferState::Done, "{report:?}");
+    assert!(!endpoints.remote_exists("/remote/f (2).bin"));
+    assert_eq!(
+        endpoints.remote_contents("/remote/f (3).bin"),
+        vec![b'N'; 512]
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn concurrent_auto_renames_never_end_up_on_the_same_name() {
+    // 四个任务（各自的源内容不同）同时往同一个已存在的目标上传、都选自动改名。
+    // 目标锁是 try 式的：撞上原目标锁的任务会直接报「另一个任务正在写」，这是已有行为；
+    // 没撞上的必须各拿一个不同的新名字，谁也不能盖掉谁、不能盖掉原文件。
+    let root = temp_root("rename-concurrent");
+    let endpoints = Arc::new(MemoryEndpoints::new("/remote"));
+    endpoints.put_remote("/remote/p.bin", vec![b'O'; 100]);
+    let resolver = Scripted::new(|_, _| answer(ConflictAction::Rename, false, None));
+    let (engine, mut events) = engine_with(&endpoints, resolver, 4);
+    let mut ids = Vec::new();
+    for (index, fill) in b"1234".iter().copied().enumerate() {
+        let dir = root.join(format!("src{index}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("p.bin");
+        std::fs::write(&source, vec![fill; 512]).unwrap();
+        ids.push((
+            fill,
+            engine.submit(TransferJob {
+                direction: Direction::Upload,
+                source: source.display().to_string(),
+                target: "/remote/p.bin".to_owned(),
+                recursive: false,
+                peer: None,
+            }),
+        ));
+    }
+    // 任务的结束事件是交错到达的：一边收一边按任务号归位，不能按提交顺序一个个等。
+    let mut finals: HashMap<TransferId, TransferState> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while finals.len() < ids.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Some(TransferEvent::Finished(report))) => {
+                finals.insert(report.id, report.state);
+            }
+            Ok(Some(_)) => {}
+            other => panic!("等不到全部任务的终态：{other:?}"),
+        }
+    }
+    let mut done = Vec::new();
+    for (fill, id) in ids {
+        match &finals[&id] {
+            TransferState::Done => done.push(fill),
+            TransferState::Failed(text) => assert!(
+                text.contains("另一个传输任务正在写"),
+                "只允许因为目标锁被占而失败：{text}"
+            ),
+            other => panic!("意外的终态 {other:?}"),
+        }
+    }
+    assert!(!done.is_empty(), "至少要有一个任务成功");
+    assert_eq!(endpoints.remote_contents("/remote/p.bin"), vec![b'O'; 100]);
+    // 每个成功的任务都在自己独有的名字上，内容是自己的源。
+    let mut landed: Vec<u8> = Vec::new();
+    for index in 2..=5 {
+        let path = format!("/remote/p ({index}).bin");
+        if endpoints.remote_exists(&path) {
+            let contents = endpoints.remote_contents(&path);
+            assert_eq!(contents.len(), 512);
+            landed.push(contents[0]);
+        }
+    }
+    landed.sort_unstable();
+    done.sort_unstable();
+    assert_eq!(landed, done, "成功的任务和落地的文件一一对应");
+}
