@@ -18,7 +18,8 @@
 //!   解除关联，这时 SendMessageTimeoutW 照样有返回，但没有作用对象，写进去等于没写。
 //!   所以写完再读一次，读回的（中英文相关的）位和要写的不一致、或读回失败，都按失败处理：
 //!   恢复失败就保留记录、仍算处于终端焦点，前端等焦点进了输入框再补一次；
-//!   切英文失败就不算改过，离开时不用恢复；
+//!   切英文时只在读回确认仍是原模式时判成没改过；写已送达但读回失败时结果不确定，
+//!   必须保留恢复义务，不能把可能已切成英文的状态留给 AI 等输入框；
 //! - **只恢复自己改过的**：进终端时本来就是英文（或者切换没成功），离开时什么都不写。
 //!   否则会把读到的"英文"主动写回去——刚启动、输入法还没激活时读到的常常就是英文，
 //!   写回去以后 AI 输入框等别的地方也被强制成了英文（用户 2026-10-21 反馈的现象）。
@@ -52,7 +53,7 @@ fn write_verified(ime: &mut impl ImeControl, mode: usize) -> bool {
 }
 
 /// 终端输入法状态：`saved` 为 `Some` 就是"处于终端焦点"，里面是进终端前的模式；
-/// `switched` 是进终端时有没有真的把中文切成英文（没切过，离开时就不用恢复）。
+/// `switched` 表示需要恢复：已确认改过，或写已送达但读回失败、不能排除已改过。
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Default)]
 struct TerminalIme {
@@ -83,8 +84,14 @@ impl TerminalIme {
         };
         self.saved = Some(mode);
         let english = mode & !CMODE_MANAGED;
-        // 本来就是英文就不写；切换没生效（含读回核对不过）也不算改过，离开时同样不用恢复
-        self.switched = english != mode && write_verified(ime, english);
+        // 写已送达后读回失败不代表没有生效。只有读回确认仍是原模式时才能免去恢复；
+        // 结果未知也保留原模式，等离开终端、能确认恢复成功后再清掉。
+        self.switched = english != mode && ime.write_mode(english);
+        if self.switched {
+            self.switched = ime
+                .read_mode()
+                .is_none_or(|actual| actual & CMODE_MANAGED != mode & CMODE_MANAGED);
+        }
         true
     }
 
@@ -464,15 +471,38 @@ mod tests {
     }
 
     #[test]
-    fn enter_with_failed_readback_is_not_marked_switched() {
+    fn enter_with_failed_readback_keeps_restore_pending() {
         let mut ime = FakeIme::new(CHINESE);
         ime.readback_fails = true;
         let mut state = TerminalIme::default();
         assert!(state.apply(true, &mut ime));
-        assert!(!state.switched);
+        assert_eq!(ime.mode, ENGLISH, "写入已生效，只是读回失败");
+        assert!(state.switched, "无法排除已切换，必须保留恢复义务");
+        assert_eq!(state.saved, Some(CHINESE));
+        ime.readback_fails = false;
         ime.writes.clear();
         assert!(!state.apply(false, &mut ime));
-        assert!(ime.writes.is_empty());
+        assert_eq!(ime.writes, vec![CHINESE]);
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(state.saved, None);
+    }
+
+    #[test]
+    fn uncertain_enter_followed_by_failed_restore_still_retries() {
+        let mut ime = FakeIme::new(CHINESE);
+        ime.readback_fails = true;
+        let mut state = TerminalIme::default();
+        state.apply(true, &mut ime);
+        assert_eq!(ime.mode, ENGLISH);
+        ime.readback_fails = false;
+        ime.apply_writes = false;
+        assert!(state.apply(false, &mut ime));
+        assert_eq!(state.saved, Some(CHINESE));
+        assert_eq!(ime.mode, ENGLISH);
+        ime.apply_writes = true;
+        assert!(!state.apply(false, &mut ime));
+        assert_eq!(ime.mode, CHINESE);
+        assert_eq!(state.saved, None);
     }
 
     #[test]

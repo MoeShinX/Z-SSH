@@ -218,6 +218,25 @@ describe("离开终端后只在进了可输入元素时才恢复", () => {
     expect(sent).toEqual([true, false]);
   });
 
+  it("延迟内换到另一个输入框：从最后一次焦点变化重新等待", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    const term = makeTextarea();
+    const ai = makeTextarea();
+    const search = makeTextarea();
+    controller.attach(term);
+    term.focus();
+    ai.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 5);
+    search.focus();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(RESTORE_MS - 11);
+    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent).toEqual([true, false]);
+  });
+
   it("进输入框后在延迟内回到终端：取消，什么都不发", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);

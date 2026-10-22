@@ -177,7 +177,8 @@ export function createImeFocusController(
   };
 
   const scheduleRestore = () => {
-    if (timer !== undefined) return;
+    // 连续点进不同输入框时，每个新焦点都需要等自己的上下文关联好；不能沿用上一个的倒计时。
+    cancelTimer();
     timer = setTimeout(() => {
       timer = undefined;
       // 等的这段时间里焦点回了终端、或又离开了输入框：不恢复，由之后的焦点变化接手
