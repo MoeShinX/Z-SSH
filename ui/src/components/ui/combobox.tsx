@@ -72,7 +72,11 @@ export function Combobox({ value, onChange, options, placeholder, className, "ar
                   return;
                 }
                 const step = event.key === "ArrowDown" ? 1 : -1;
-                setActive((current) => (current + step + shown.length) % shown.length);
+                if (shown.length === 0) return;
+                // 还没选中任何一项（-1）：↓ 到第一项、↑ 到最后一项；之后首尾循环
+                setActive((current) =>
+                  current < 0 ? (step > 0 ? 0 : shown.length - 1) : (current + step + shown.length) % shown.length,
+                );
               } else if (event.key === "Enter" && visible && active >= 0 && shown[active] !== undefined) {
                 event.preventDefault();
                 pick(shown[active]);

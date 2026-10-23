@@ -197,6 +197,14 @@ describe("分组输入框（可输入的下拉）", () => {
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 
+  it("键盘：还没选中时第一下 ↑ 落到最后一项（不跳过它）", async () => {
+    setup(LIST, { initialEditId: "new" });
+    await act(async () => fireEvent.focus(groupInput()));
+    await act(async () => fireEvent.keyDown(groupInput(), { key: "ArrowUp" }));
+    await act(async () => fireEvent.keyDown(groupInput(), { key: "Enter" }));
+    expect(groupInput().value).toBe("乙");
+  });
+
   it("编辑已有命令：当前分组在列表里打勾；没有任何分组时没有下拉箭头", async () => {
     const view = setup(LIST, { initialEditId: "a" });
     expect(groupInput().value).toBe("甲");
