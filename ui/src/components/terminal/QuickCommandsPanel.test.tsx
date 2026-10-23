@@ -108,6 +108,16 @@ describe("搜索", () => {
     fireEvent.click(screen.getByLabelText("清空搜索"));
     expect(rows()).toEqual(["x", "y"]);
   });
+
+  it("搜索时分组标题不能折叠（点了没反应，清空搜索后也不会突然折起来）", () => {
+    setup();
+    fireEvent.change(search(), { target: { value: "run a" } });
+    const header = group("甲").querySelector("button") as HTMLButtonElement;
+    expect(header.disabled).toBe(true);
+    fireEvent.click(header);
+    fireEvent.click(screen.getByLabelText("清空搜索"));
+    expect(group("甲").querySelector("button")?.getAttribute("aria-expanded")).toBe("true");
+  });
 });
 
 describe("上移 / 下移只在分组内", () => {

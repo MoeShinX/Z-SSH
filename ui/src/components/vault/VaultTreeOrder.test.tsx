@@ -316,6 +316,24 @@ describe("拖动调整顺序", () => {
     expect(reorderGroups).toHaveBeenCalledWith([2, 1]);
   });
 
+  it("从分组的展开箭头上拖动：松手后紧跟的那次 click 不展开 / 收起", async () => {
+    render(<VaultView {...props()} />);
+    const arrow = groupBtn(2).querySelector('[data-section="tree-toggle"]') as HTMLElement;
+    const before = arrow.getAttribute("aria-label");
+    const restore = await dragOver(arrow, groupBtn(1), 105);
+    try {
+      // 浏览器里 click 紧跟着 pointerup 同步到来（中间没有别的任务）
+      await act(async () => {
+        window.dispatchEvent(new MouseEvent("pointerup", { clientX: 40, clientY: 0 }));
+        fireEvent.click(arrow);
+      });
+    } finally {
+      restore();
+    }
+    expect(reorderGroups).toHaveBeenCalledWith([2, 1]);
+    expect(arrow.getAttribute("aria-label")).toBe(before);
+  });
+
   it("分组不能拖进别的层：子分组拖到根分组上没有反应", async () => {
     render(<VaultView {...props()} />);
     const restore = await dragOver(groupBtn(3), groupBtn(2), 105);

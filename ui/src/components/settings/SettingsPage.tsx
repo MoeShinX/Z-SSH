@@ -840,7 +840,7 @@ export function AISection() {
         description="发现方式：自动按 数据目录 tools → PATH → 常见安装位置 的顺序找；手动只用指定路径（坏了就报错，不回退）。"
         pathKey="ai_opencode_path"
         recheckSignal={opencodeRecheck}
-        placeholder="C:\\path\\to\\opencode.exe"
+        placeholder={"C:\\path\\to\\opencode.exe"}
         renderExtra={
           <Button size="sm" disabled={downloading} onClick={startDownload}>
             {downloading ? "下载中…" : "下载 opencode"}
@@ -866,13 +866,13 @@ export function AISection() {
         agent="codex"
         description="codex 不提供一键下载：先 `npm i -g @openai/codex`，或在这里手动指定路径。发现方式同上；模型和登录用 codex 自己的配置。"
         pathKey="ai_codex_path"
-        placeholder="C:\\path\\to\\codex.exe"
+        placeholder={"C:\\path\\to\\codex.exe"}
       />
       <AgentBlock
         agent="claude"
         description="Claude Code 不提供一键下载：先 `npm i -g @anthropic-ai/claude-code`（或官方安装脚本，装到 ~/.local/bin），也可以在这里手动指定路径。发现方式同上；登录和模型用 Claude Code 自己的配置（不改 CLAUDE_CONFIG_DIR / HOME）。"
         pathKey="ai_claude_path"
-        placeholder="C:\\path\\to\\claude.exe"
+        placeholder={"C:\\path\\to\\claude.exe"}
       />
 
       {/* 下载确认：来源 + 大小（卡片 §4）。 */}
@@ -942,9 +942,17 @@ function AgentBlock({
   const [guard, setGuard] = useState<string | null>(null);
   const [manual, setManual] = useState(path);
   const [probing, setProbing] = useState(false);
+  /**
+   * 开关拨到「手动」但还没保存路径：先显示输入框，点「检测并保存」通过了才存。
+   * 以前手动模式只看「存没存过路径」，没存过时开关拨不过去、输入框也出不来（issue #3）。
+   */
+  const [manualPending, setManualPending] = useState(false);
 
-  // 手动指定了路径就是手动模式；留空是自动（默认）。
-  const isManual = path.trim() !== "";
+  // 设置读回来（或别处改了）路径：输入框跟着显示存着的值
+  useEffect(() => setManual(path), [path]);
+
+  // 存了手动路径，或者刚拨到「手动」还没保存，都算手动模式；留空是自动（默认）。
+  const isManual = path.trim() !== "" || manualPending;
 
   const refresh = () => {
     setDetected(undefined);
@@ -996,12 +1004,17 @@ function AgentBlock({
           <span className={isManual ? "text-muted-foreground" : "font-medium"}>自动</span>
           <Switch
             checked={isManual}
+            aria-label={`${label} 手动指定路径`}
             onCheckedChange={(checked) => {
-              // 切回自动就清空手动路径；切手动保留已有输入。
-              if (!checked) {
-                setManual("");
-                void update(pathKey, "").then(refresh);
+              if (checked) {
+                // 拨到手动：先出输入框，检测通过才保存
+                setManualPending(true);
+                return;
               }
+              // 切回自动就清空手动路径
+              setManualPending(false);
+              setManual("");
+              if (path.trim() !== "") void update(pathKey, "").then(refresh);
             }}
           />
           <span className={isManual ? "font-medium" : "text-muted-foreground"}>手动指定</span>
@@ -1062,6 +1075,7 @@ function AgentBlock({
               void aiAgentProbePath(agent, manual)
                 .then((install) => {
                   toast.success(`可用：${install.version}`);
+                  setManualPending(false);
                   void update(pathKey, manual).then(refresh);
                 })
                 .catch((error: unknown) => toast.error(String(error)))

@@ -668,7 +668,8 @@ function GroupRow({
           data-section="tree-toggle"
           onClick={(event) => {
             event.stopPropagation();
-            onToggle();
+            // 拖分组松手时接着来的那次 click 不算点箭头（不然排序的同时还展开 / 收起）
+            if (!dragJustEnded()) onToggle();
           }}
           onDoubleClick={(event) => event.stopPropagation()}
           className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-foreground/10"

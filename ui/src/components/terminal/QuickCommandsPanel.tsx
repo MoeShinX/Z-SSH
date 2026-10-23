@@ -255,8 +255,11 @@ export default function QuickCommandsPanel({
                   <button
                     type="button"
                     aria-expanded={open}
+                    // 搜索时分组一律展开、不能折：点了也看不到变化，清空搜索后才突然生效会让人困惑
+                    disabled={searching}
+                    title={searching ? "搜索时分组都展开，清空搜索后可以折叠" : undefined}
                     onClick={() => toggleSection(section.group)}
-                    className="flex w-full cursor-pointer items-center gap-1 rounded px-1 py-1 text-left text-xs font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+                    className="flex w-full cursor-pointer items-center gap-1 rounded px-1 py-1 text-left text-xs font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
                   >
                     {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                     <span className="truncate">{section.group || "未分组"}</span>
