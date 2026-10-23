@@ -118,7 +118,7 @@ export default function SftpContextMenu({
         tabIndex={-1}
         data-testid="sftp-context-menu"
         onKeyDown={onKeyDown}
-        className="fixed z-50 min-w-48 overflow-y-auto rounded-md border border-border bg-popover p-1 text-[13px] shadow-lg outline-none"
+        className="fixed z-50 min-w-48 overflow-y-auto rounded-md border border-border bg-popover p-1 text-xs shadow-lg outline-none"
         style={{
           left: placement?.left ?? x,
           top: placement?.top ?? y,
@@ -188,7 +188,7 @@ function MenuRow({
         onMouseEnter={onHover}
         onClick={onActivate}
         className={cn(
-          "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left",
+          "flex w-full items-center gap-2 rounded-sm px-2 py-1 text-left",
           node.disabled
             ? "cursor-not-allowed text-muted-foreground/40"
             : active
@@ -278,7 +278,7 @@ function Submenu({
       tabIndex={-1}
       data-testid="sftp-context-submenu"
       onKeyDown={onKeyDown}
-      className="fixed z-50 min-w-40 overflow-y-auto rounded-md border border-border bg-popover p-1 text-[13px] shadow-lg outline-none"
+      className="fixed z-50 min-w-40 overflow-y-auto rounded-md border border-border bg-popover p-1 text-xs shadow-lg outline-none"
       style={{
         left: placement?.left ?? 0,
         top: placement?.top ?? 0,
@@ -298,7 +298,7 @@ function Submenu({
             onMouseEnter={() => setActive(index)}
             onClick={() => !node.disabled && onSelect(node.id)}
             className={cn(
-              "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left",
+              "flex w-full items-center gap-2 rounded-sm px-2 py-1 text-left",
               node.disabled
                 ? "cursor-not-allowed text-muted-foreground/40"
                 : active === index
