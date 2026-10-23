@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/zssh-core", "crates/zssh-mcp", "src-tauri"]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 # 允许移植 Netcatty（GPL-3.0-or-later）的代码，整个项目随同一许可证发布。
 license = "GPL-3.0-or-later"
