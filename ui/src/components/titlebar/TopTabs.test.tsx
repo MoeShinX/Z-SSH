@@ -97,8 +97,10 @@ describe("标题栏拖动区（M1-09）", () => {
     for (const button of buttons) {
       expect(button.getAttribute("data-tauri-drag-region")).toBe("false");
     }
-    // "主机"标签也不能拖
-    const hostTab = container.querySelector('[data-section="top-tabs-left"] > div');
+    // "主机"（对齐主机树时是按钮，否则是标签）也不能拖
+    const hostTab = container.querySelector(
+      '[data-section="host-page-button"], [data-section="top-tabs-left"] > div',
+    );
     expect(hostTab?.getAttribute("data-tauri-drag-region")).toBe("false");
   });
 });
@@ -303,6 +305,21 @@ describe("顶栏左侧块和主机树对齐（UI-5）", () => {
     themeMock.overrides = { "layout.host_tree_width": "wide" };
     const second = renderWithView("terminal");
     expect(left(second.container)?.style.width).toBe("224px");
+  });
+
+  it("对齐主机树时「主机」是撑满的按钮：主机页点亮，终端界面不点亮；左侧块带分隔线", () => {
+    for (const [view, active] of [["vault", "true"], ["terminal", "false"]] as const) {
+      const { container, unmount } = renderWithView(view);
+      const button = container.querySelector<HTMLElement>('[data-section="host-page-button"]');
+      expect(button?.dataset.active).toBe(active);
+      expect(left(container)?.className).toContain("border-r");
+      unmount();
+    }
+    // 收起主机树时还是原来的标签
+    themeMock.overrides = { "layout.vault_sidebar_collapsed": true };
+    const { container } = renderWithView("terminal");
+    expect(container.querySelector('[data-section="host-page-button"]')).toBeNull();
+    expect(left(container)?.className).not.toContain("border-r");
   });
 
   it("主机树收起：不设固定宽度，标签紧挨着排", () => {

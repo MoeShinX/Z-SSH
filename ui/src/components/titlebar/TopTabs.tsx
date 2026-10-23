@@ -223,12 +223,17 @@ export default function TopTabs({
         className="relative z-20 flex h-9 w-full shrink-0 items-end gap-1 bg-background select-none"
         style={{ color: "hsl(var(--foreground))" }}
       >
-        {/* 左侧块：logo、主机树开关、「主机」标签。主机树展开时宽度 = 主机树宽度
-            （-mr-1 抵掉条上 gap-1 的 4px，让终端标签正好从主机树右边缘起排）。 */}
+        {/* 左侧块：logo、主机树开关、「主机」。主机树展开时它是主机树的「抬头」：宽度 = 主机树宽度，
+            右边那条分隔线和主机树的分隔线连成一条；「主机」是撑满的小胶囊按钮（主机页实底，
+            终端界面只有细边框），终端标签从分隔线右边隔 4px（条上的 gap-1）起排。
+            主机树收起或在设置页时，「主机」照旧是一个标签。 */}
         <div
           data-section="top-tabs-left"
           data-aligned={alignToHostTree ? "true" : "false"}
-          className={cn("flex h-9 shrink-0 items-end gap-1 pl-3", alignToHostTree && "-mr-1 min-w-0")}
+          className={cn(
+            "flex h-9 shrink-0 gap-1 pl-3",
+            alignToHostTree ? "min-w-0 items-center border-r border-border/60 pr-2" : "items-end",
+          )}
           style={alignToHostTree ? { width: hostTreeWidth } : undefined}
         >
           <img
@@ -236,19 +241,38 @@ export default function TopTabs({
             alt="Z-SSH"
             draggable={false}
             data-tauri-drag-region
-            className="mb-2 h-[18px] w-[18px] shrink-0"
+            className={cn("h-[18px] w-[18px] shrink-0", !alignToHostTree && "mb-2")}
           />
           {/* 主机树侧栏开关（主机页和终端界面共用一个开关） */}
-          <SidebarToggle />
-          {/* 固定最左：主机页。和主机树对齐时撑满左侧块剩下的宽度（右边缘对齐主机树的分隔线），文字居中 */}
-          <TabShape
-            active={view === "vault"}
-            onClick={onShowVault}
-            className={cn("rounded-md", alignToHostTree && "min-w-0 max-w-none flex-1 shrink justify-center")}
-            centered={alignToHostTree}
-            label="主机"
-            icon={<LayoutGrid size={14} />}
-          />
+          <SidebarToggle aligned={alignToHostTree} />
+          {alignToHostTree ? (
+            <button
+              type="button"
+              data-tauri-drag-region={false}
+              data-section="host-page-button"
+              data-active={view === "vault" ? "true" : "false"}
+              onClick={onShowVault}
+              title="主机"
+              className={cn(
+                "ml-1 flex h-6 min-w-0 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border text-[13px] transition-colors duration-100",
+                view === "vault"
+                  ? "border-transparent bg-foreground/10 text-foreground"
+                  : "border-border/60 text-muted-foreground hover:bg-foreground/5 hover:text-foreground",
+              )}
+            >
+              <LayoutGrid size={14} className="shrink-0" />
+              <span className="truncate">主机</span>
+            </button>
+          ) : (
+            /* 固定最左：主机页 */
+            <TabShape
+              active={view === "vault"}
+              onClick={onShowVault}
+              className="rounded-md"
+              label="主机"
+              icon={<LayoutGrid size={14} />}
+            />
+          )}
         </div>
 
         {/* 终端标签 */}
@@ -479,8 +503,6 @@ export default function TopTabs({
 }
 
 interface TabShapeProps {
-  /** 图标和文字在标签里居中（标签被撑宽时用），默认靠左。 */
-  centered?: boolean;
   label: string;
   active: boolean;
   onClick: () => void;
@@ -522,7 +544,6 @@ function TabShape({
   onPointerDown,
   dragging,
   dockTarget,
-  centered = false,
 }: TabShapeProps) {
   // 当前终端标签借终端的底色，和下面的终端连成一块；主机名始终是界面的文字色（换终端配色不变色）。
   // 界面和终端一明一暗时不借：标签整块用界面配色，和终端之间就是自然的分界。
@@ -558,7 +579,7 @@ function TabShape({
       {dotClass && (
         <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotClass)} title={dotTitle} />
       )}
-      <span className={cn("min-w-0 truncate", centered ? "flex-initial" : "flex-1")}>{label}</span>
+      <span className="min-w-0 flex-1 truncate">{label}</span>
       {aiBadge && (
         <span
           data-ai-badge={aiBadge}
@@ -593,7 +614,7 @@ function TabShape({
 }
 
 /** 标题栏最左的主机树开关：展开时主机页和终端界面左边都有主机树。 */
-function SidebarToggle() {
+function SidebarToggle({ aligned = false }: { aligned?: boolean }) {
   const collapsed = useSettings((state) => state["layout.vault_sidebar_collapsed"]);
   const update = useSettings((state) => state.update);
   return (
@@ -603,7 +624,10 @@ function SidebarToggle() {
       data-action="toggle-host-sidebar"
       title={collapsed ? "展开侧边栏" : "收起侧边栏"}
       onClick={() => void update("layout.vault_sidebar_collapsed", !collapsed)}
-      className="mb-1 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+      className={cn(
+        "flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground",
+        !aligned && "mb-1",
+      )}
     >
       {collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
     </button>
