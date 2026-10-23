@@ -59,6 +59,8 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("keepalive_interval_secs", SyncMode::LocalOnly),
     // 快捷命令（终端底部的命令栏）：换电脑也想用同一套；栏开不开、当前看哪一组是本机偏好
     ("quick_commands", SyncMode::Synced),
+    // 主机树里「未分组」改过名之后，不分组的主机直接排在根层（UI-14）：树的结构几台电脑应该一致
+    ("vault_ungrouped_flat", SyncMode::Synced),
     ("terminal_highlight_enabled", SyncMode::Synced),
     ("terminal_highlight_rules", SyncMode::Synced),
     // 会话日志：目录是本机路径，开关跟着目录走，都不同步
@@ -223,6 +225,7 @@ fn rule_for(key: &str) -> Option<Rule> {
         | "terminal_right_click_paste"
         | "terminal_confirm_multiline_paste"
         | "terminal_highlight_enabled"
+        | "vault_ungrouped_flat"
         | "sftp_preserve_mtime"
         | "sftp_preserve_permissions" => Rule::Bool,
         "terminal_font_family" => Rule::FontFamily,
@@ -845,6 +848,7 @@ mod tests {
             "terminal_right_click_paste",
             "terminal_confirm_multiline_paste",
             "terminal_highlight_enabled",
+            "vault_ungrouped_flat",
             "sftp_preserve_mtime",
             "sftp_preserve_permissions",
         ] {
@@ -1153,6 +1157,7 @@ mod tests {
             "sftp_concurrency",
             "sftp_preserve_mtime",
             "sftp_preserve_permissions",
+            "vault_ungrouped_flat",
             "ai_write_backup_keep",
         ] {
             assert!(is_synced(key), "{key} 应该同步");

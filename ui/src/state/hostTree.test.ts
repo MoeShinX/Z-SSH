@@ -262,3 +262,42 @@ describe("手动顺序（UI-9）", () => {
     expect(stepInLayer([1, 2, 3], 9, 1)).toBeNull();
   });
 });
+
+describe("平铺模式（UI-14，「未分组」改过名之后）", () => {
+  it("「未分组」这个名字不再能被搜到；关着时照旧", () => {
+    expect(treeFilterFor(groups, hosts, "未分")!.ungrouped).toBe(true);
+    const flat = treeFilterFor(groups, hosts, "未分", true)!;
+    expect(flat.ungrouped).toBe(false);
+    expect([...flat.hostIds]).toEqual([]);
+    expect(flat.total).toBe(0);
+  });
+
+  it("根层主机照常按名字 / 地址 / 标签匹配，filter.ungrouped 表示有没有显示的根层主机", () => {
+    const filter = treeFilterFor(groups, hosts, "loose", true)!;
+    expect([...filter.hostIds]).toEqual([4]);
+    expect(filter.ungrouped).toBe(true);
+    expect([...filter.groupIds]).toEqual([]);
+    expect([...treeFilterFor(groups, hosts, "example.internal", true)!.hostIds].sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("搜索 ↑ ↓ 的顺序：根分组（含子分组）里的主机在前，根层主机排在最后", () => {
+    const filter = treeFilterFor(groups, hosts, "e", true)!;
+    expect(filteredHostOrder(groups, hosts, filter).map((h) => h.name)).toEqual([
+      "HK2 PVE",
+      "CA1 PVE",
+      "DE1 PVE",
+      "loose",
+    ]);
+  });
+
+  it("根层主机按 UI-9 的同一层规则：sort > 0 在前（从小到大），其余按名字", () => {
+    const root = [
+      { ...host(10, "zeta", null), sort: 2 },
+      { ...host(11, "alpha", null), sort: 0 },
+      { ...host(12, "mid", null), sort: 1 },
+      { ...host(13, "beta", null), sort: 0 },
+      host(14, "in-group", 1),
+    ] as Host[];
+    expect(hostsUnder(root, null, null).map((h) => h.name)).toEqual(["mid", "zeta", "alpha", "beta"]);
+  });
+});

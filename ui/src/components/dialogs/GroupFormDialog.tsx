@@ -3,6 +3,7 @@
 import { useState } from "react";
 
 import type { Group } from "../../api/vault";
+import { useSettings } from "../../stores/settings";
 import { useVault } from "../../stores/vault";
 import { Button } from "../ui/button";
 import {
@@ -82,6 +83,9 @@ export default function GroupFormDialog({
         sort: group?.sort ?? 0,
       });
       if (adoptUngrouped && ungroupedIds.length > 0) await moveHosts(ungroupedIds, saved.id);
+      // 「未分组」改名成功：树里不再有「未分组」这一行，之后不分组的主机直接排在树的根层（UI-14）。
+      // 设置写失败 update 自己会提示并回滚，分组已经建好了，不影响关窗口
+      if (adoptUngrouped) await useSettings.getState().update("vault_ungrouped_flat", true);
       onClose();
     } catch (error: unknown) {
       onError(String(error));

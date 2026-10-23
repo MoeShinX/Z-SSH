@@ -114,6 +114,8 @@ export const SETTING_DEFAULTS = {
   quick_commands: "[]",
   quick_commands_bar: false,
   quick_commands_group: "",
+  // 「未分组」改过名之后，不分组的主机直接排在主机树根层（UI-14）；跟着同步，树的结构几台电脑一致
+  vault_ungrouped_flat: false,
 } as const;
 
 export type TerminalCursorStyle = "block" | "underline" | "bar";
@@ -179,6 +181,7 @@ export interface SettingValues {
   quick_commands: string;
   quick_commands_bar: boolean;
   quick_commands_group: string;
+  vault_ungrouped_flat: boolean;
 }
 
 /** 主题：跟随系统 / 浅色 / 深色。 */

@@ -53,6 +53,7 @@ import {
   UNGROUPED_KEY,
   type TreeFilter,
 } from "../../state/hostTree";
+import { ungroupedLabel, ungroupedMoveLabel, useUngroupedFlat } from "../../state/ungroupedFlat";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import {
@@ -153,7 +154,10 @@ export default function VaultView({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [selectedGroup, setSelectedGroup] = useState<number | null | "all">("all");
+  const [pickedGroup, setSelectedGroup] = useState<number | null | "all">("all");
+  // 「未分组」改名后树里没有那一行了：之前停在它上面的就当成「全部主机」
+  const flat = useUngroupedFlat();
+  const selectedGroup = flat && pickedGroup === null ? "all" : pickedGroup;
   const [selectedHostId, setSelectedHostId] = useState<number | null>(null);
   // 卡片 / 列表记在设置里（本机布局），重启后保持上次选的
   const mode: ViewMode = useSettings((state) => state["layout.vault_view_mode"]) === "list" ? "list" : "grid";
@@ -419,7 +423,10 @@ export function HostTreeAside({
   const [search, setSearch] = useState("");
   const [activeId, setActiveId] = useState<number | null>(null);
   const asideRef = useRef<HTMLElement>(null);
-  const filter = useMemo(() => treeFilterFor(groups, hosts, search), [groups, hosts, search]);
+  const flat = useUngroupedFlat();
+  const filter = useMemo(() => treeFilterFor(groups, hosts, search, flat), [groups, hosts, search, flat]);
+  // 平铺模式（UI-14）：拖到树的空白处 = 移到顶层，拖着时整块空白区域高亮
+  const rootDropping = useIsDropTarget(null);
   const order = useMemo(
     () => (filter ? filteredHostOrder(groups, hosts, filter) : []),
     [groups, hosts, filter],
@@ -521,7 +528,10 @@ export function HostTreeAside({
             if (target) treeActions.connect(target);
           }}
         />
-        <ScrollArea className="min-h-0 flex-1">
+        <ScrollArea
+          data-drop-blank={flat ? "none" : undefined}
+          className={cn("min-h-0 flex-1", flat && rootDropping && "bg-primary/10 ring-1 ring-inset ring-primary/40")}
+        >
           <div className="px-2 pb-2">
             {filter !== null && filter.total === 0 && filter.groupIds.size === 0 && !filter.ungrouped ? (
               <div data-section="tree-search-empty" className="px-2 py-6 text-center text-[13px] text-muted-foreground">
@@ -558,7 +568,7 @@ export function HostTreeAside({
                   hostActions={treeActions}
                 />
               ))}
-            {(filter === null || filter.ungrouped) && (
+            {!flat && (filter === null || filter.ungrouped) && (
             <GroupRow
               label={filter ? <Highlight text="未分组" term={filter.text} /> : "未分组"}
               count={hostsUnder(hosts, null, filter).length}
@@ -583,7 +593,8 @@ export function HostTreeAside({
               onToggle={() => toggle(UNGROUPED_KEY)}
             />
             )}
-            {(filter === null || filter.ungrouped) &&
+            {!flat &&
+              (filter === null || filter.ungrouped) &&
               isExpanded(UNGROUPED_KEY) &&
               hostsUnder(hosts, null, filter).map((host, index, list) => (
                 <HostLeaf
@@ -591,6 +602,19 @@ export function HostTreeAside({
                   host={host}
                   depth={1}
                   guide={{ trail: [], last: index === list.length - 1, kind: "host" }}
+                  selected={selectedHostId === host.id}
+                  actions={treeActions}
+                  term={filter?.text}
+                  searchActive={activeHostId === host.id}
+                />
+              ))}
+            {/* 平铺模式：不分组的主机直接排在所有根分组下面，和根分组同一缩进，没有连接线 */}
+            {flat &&
+              hostsUnder(hosts, null, filter).map((host) => (
+                <HostLeaf
+                  key={host.id}
+                  host={host}
+                  depth={0}
                   selected={selectedHostId === host.id}
                   actions={treeActions}
                   term={filter?.text}
@@ -964,8 +988,8 @@ function HostLeaf({
 }: {
   host: Host;
   depth: number;
-  /** 在父分组下的连接线信息。 */
-  guide: TreeGuide;
+  /** 在父分组下的连接线信息；根层的主机（平铺模式）没有。 */
+  guide?: TreeGuide;
   selected: boolean;
   actions: HostActions;
   /** 树搜索框里的词（小写）；用来高亮，没在搜索不传。 */
@@ -988,7 +1012,7 @@ function HostLeaf({
           onDoubleClick={() => actions.connect(host)}
           title={`${host.username}@${host.host}:${host.port}（双击连接）`}
           {...guideAttrs(guide)}
-          style={{ paddingLeft: 4 + depth * 14 + 16, ...treeGuideStyle(depth, guide) }}
+          style={{ paddingLeft: 4 + depth * 14 + 16, ...(guide ? treeGuideStyle(depth, guide) : null) }}
           className={cn(
             "relative flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[13px] transition-colors",
             selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
@@ -1189,6 +1213,7 @@ function HostRow({
   onInstallKey: () => void;
   onForwards: () => void;
 }) {
+  const flat = useUngroupedFlat();
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
@@ -1211,7 +1236,7 @@ function HostRow({
           <span className="truncate font-mono text-xs text-muted-foreground">
             {host.username}@{host.host}:{host.port}
           </span>
-          <span className="truncate text-xs text-muted-foreground">{groupName ?? "未分组"}</span>
+          <span className="truncate text-xs text-muted-foreground">{groupName ?? ungroupedLabel(flat)}</span>
           <div className="flex shrink-0 items-center gap-2">
             <EditButton onEdit={onEdit} />
             <Button
@@ -1259,6 +1284,7 @@ export function flattenGroups(groups: Group[]): { group: Group; depth: number }[
 /** 右键「移动到分组」：列出未分组和全部分组，当前所在的打勾、点不了。 */
 function MoveToGroupMenu({ host }: { host: Host }) {
   const groups = useVault((state) => state.groups);
+  const flat = useUngroupedFlat();
   const item = (groupId: number | null, label: string, depth: number) => {
     const current = host.group_id === groupId;
     return (
@@ -1280,7 +1306,7 @@ function MoveToGroupMenu({ host }: { host: Host }) {
         <FolderInput className="mr-2 h-3.5 w-3.5" /> 移动到分组
       </ContextMenuSubTrigger>
       <ContextMenuSubContent className="max-h-80 w-48 overflow-y-auto">
-        {item(null, "未分组", 0)}
+        {item(null, ungroupedMoveLabel(flat), 0)}
         {groups.length > 0 && <ContextMenuSeparator />}
         {flattenGroups(groups).map(({ group, depth }) => item(group.id, group.name, depth))}
       </ContextMenuSubContent>
@@ -1291,6 +1317,7 @@ function MoveToGroupMenu({ host }: { host: Host }) {
 /** 右键「上移 / 下移」（树里的主机）：第一个的上移、最后一个的下移置灰；搜索时过滤后的列表不连续，全部置灰。 */
 function HostOrderItems({ host, locked }: { host: Host; locked: boolean }) {
   const hosts = useVault((state) => state.hosts);
+  const flat = useUngroupedFlat();
   const [canUp, canDown] = canStepHost(hosts, host);
   return (
     <>
@@ -1300,6 +1327,12 @@ function HostOrderItems({ host, locked }: { host: Host; locked: boolean }) {
       <ContextMenuItem disabled={locked || !canDown} data-order-action="down" onSelect={() => void stepHost(host, 1)}>
         <ArrowDown className="mr-2 h-3.5 w-3.5" /> 下移
       </ContextMenuItem>
+      {/* 平铺模式：根层主机的「按名字重新排序」原来挂在「未分组」行上，现在挂在它们自己的右键菜单里 */}
+      {flat && host.group_id === null && (
+        <ContextMenuItem data-order-action="reset" onSelect={() => void resetLayerOrder(null)}>
+          <ArrowDownAZ className="mr-2 h-3.5 w-3.5" /> 按名字重新排序（顶层主机）
+        </ContextMenuItem>
+      )}
     </>
   );
 }

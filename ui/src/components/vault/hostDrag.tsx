@@ -8,6 +8,8 @@
 //! - 调整顺序：树里的主机行带 `data-order-host`、分组行带 `data-order-group` /
 //!   `data-order-parent`。指针在主机行上：上半部分 = 插到它前面、下半部分 = 插到它后面，画一条
 //!   插入线，松手就调整（目标在别的分组里就同时换过去）；分组只能在同一个父分组下调整。
+//! - 平铺模式（UI-14，「未分组」改过名）：树里没有「未分组」行，滚动区域带 `data-drop-blank="none"`：
+//!   拖到树的空白处（不在任何一行上）= 移到顶层；拖到根层主机之间 = 移到顶层并插在那个位置。
 //!   树的根元素带 `data-order-locked="true"`（搜索框里有字）时不响应排序拖动，换分组照旧。
 
 import { Folder, Server } from "lucide-react";
@@ -16,6 +18,7 @@ import { create } from "zustand";
 import { draftOfHost, type Group, type Host } from "../../api/vault";
 import { cn } from "../../lib/utils";
 import { insertInLayer } from "../../state/hostTree";
+import { isUngroupedFlat, ungroupedLabel, useUngroupedFlat } from "../../state/ungroupedFlat";
 import { useVault } from "../../stores/vault";
 import { toast } from "../ui/toast";
 import { errorText, groupLayerIds, hostLayerIds } from "./treeOrder";
@@ -64,7 +67,7 @@ function parseTarget(value: string | null | undefined): DropGroup | undefined {
 export async function moveHostToGroup(host: Host, groupId: DropGroup): Promise<boolean> {
   if (host.group_id === groupId) return false;
   const { groups, saveHost } = useVault.getState();
-  const label = groupId === null ? "未分组" : `「${groups.find((g) => g.id === groupId)?.name ?? "分组"}」`;
+  const label = groupId === null ? ungroupedLabel(isUngroupedFlat()) : `「${groups.find((g) => g.id === groupId)?.name ?? "分组"}」`;
   try {
     await saveHost({ ...draftOfHost(host), group_id: groupId });
     toast.success(`「${host.name}」已移到${label}`);
@@ -186,7 +189,9 @@ export function startHostDrag(host: Host, event: React.PointerEvent) {
       id: host.id,
       label: host.name,
       probe: (el, y) => {
-        const over = parseTarget(el?.closest("[data-drop-group]")?.getAttribute("data-drop-group"));
+        let over = parseTarget(el?.closest("[data-drop-group]")?.getAttribute("data-drop-group"));
+        // 平铺模式：树的空白处（不在任何一行 / 按钮上）= 顶层
+        if (over === undefined && el && !el.closest("button") && el.closest("[data-drop-blank]")) over = null;
         const row = el?.closest("[data-order-host]");
         const targetId = Number(row?.getAttribute("data-order-host"));
         if (!row || isLocked(row) || !Number.isFinite(targetId) || targetId === host.id) {
@@ -272,7 +277,9 @@ export function HostDragGhost() {
   const drag = useHostDrag((state) => state.drag);
   const groups = useVault((state) => state.groups);
   const hosts = useVault((state) => state.hosts);
+  const flat = useUngroupedFlat();
   if (!drag) return null;
+  const rootLabel = ungroupedLabel(flat);
   const Icon = drag.kind === "group" ? Folder : Server;
   let text: string;
   if (drag.kind === "group") {
@@ -282,14 +289,14 @@ export function HostDragGhost() {
     const target = hosts.find((host) => host.id === drag.insert?.id);
     const moved = target !== undefined && hosts.find((host) => host.id === drag.id)?.group_id !== target.group_id;
     const groupName =
-      target?.group_id == null ? "未分组" : (groups.find((g) => g.id === target.group_id)?.name ?? "分组");
+      target?.group_id == null ? rootLabel : (groups.find((g) => g.id === target.group_id)?.name ?? "分组");
     text = moved ? `${drag.label} → ${groupName}` : `${drag.label}（调整顺序）`;
   } else {
     const name =
       drag.over === undefined
         ? null
         : drag.over === null
-          ? "未分组"
+          ? rootLabel
           : (groups.find((group) => group.id === drag.over)?.name ?? null);
     text = name ? `${drag.label} → ${name}` : `${drag.label}（拖到左边的分组上）`;
   }

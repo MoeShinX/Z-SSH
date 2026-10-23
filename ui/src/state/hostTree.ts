@@ -121,7 +121,7 @@ export interface TreeFilter {
   text: string;
   hostIds: Set<number>;
   groupIds: Set<number>;
-  /** 「未分组」行要不要显示（有显示的未分组主机，或它的名字匹配）。 */
+  /** 「未分组」行要不要显示（有显示的未分组主机，或它的名字匹配）；flat 模式下没有这一行，表示有没有显示的根层主机。 */
   ungrouped: boolean;
   /** 每个显示的分组（含子分组）里显示的主机数。 */
   counts: Map<number, number>;
@@ -129,7 +129,16 @@ export interface TreeFilter {
   total: number;
 }
 
-export function treeFilterFor(groups: Group[], hosts: Host[], rawText: string): TreeFilter | null {
+/**
+ * `flat` = 「未分组」改过名、不分组的主机直接排在树根层（UI-14）：树里没有「未分组」这一行，
+ * 它的名字也不再能被搜到；根层主机照常按自己的名字 / 地址 / 用户名 / 标签匹配。
+ */
+export function treeFilterFor(
+  groups: Group[],
+  hosts: Host[],
+  rawText: string,
+  flat = false,
+): TreeFilter | null {
   const text = rawText.trim().toLowerCase();
   if (text === "") return null;
   const parentOf = new Map(groups.map((group) => [group.id, group.parent_id]));
@@ -145,7 +154,7 @@ export function treeFilterFor(groups: Group[], hosts: Host[], rawText: string): 
     return ids;
   };
   const nameHit = (groupId: number): boolean => chain(groupId).some((id) => nameOf.get(id)?.includes(text));
-  const ungroupedNameHit = UNGROUPED_LABEL.includes(text);
+  const ungroupedNameHit = !flat && UNGROUPED_LABEL.includes(text);
 
   const hostIds = new Set<number>();
   const groupIds = new Set<number>();
@@ -209,7 +218,7 @@ export function stepInLayer(ids: number[], id: number, delta: -1 | 1): number[] 
 
 /**
  * 搜索结果里的主机，按树里从上到下的显示顺序排（先分组及其子分组、再其中的主机，
- * 最后是未分组），↑ ↓ 就是在这个顺序里移动。
+ * 最后是未分组 / flat 模式下的根层主机），↑ ↓ 就是在这个顺序里移动。
  */
 export function filteredHostOrder(groups: Group[], hosts: Host[], filter: TreeFilter): Host[] {
   const order: Host[] = [];

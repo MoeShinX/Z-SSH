@@ -25,6 +25,7 @@ import { Label } from "../ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import { normalizeHostInput } from "../../state/hostAddress";
+import { ungroupedOptionLabel, useUngroupedFlat } from "../../state/ungroupedFlat";
 
 const AUTH_LABELS: Record<AuthMethod, string> = {
   password: "密码",
@@ -52,6 +53,7 @@ export default function HostDetailsPanel({
   onError,
 }: HostDetailsPanelProps) {
   const groups = useVault((state) => state.groups);
+  const flat = useUngroupedFlat();
   const hosts = useVault((state) => state.hosts);
   const identities = useVault((state) => state.identities);
   const proxies = useVault((state) => state.proxies);
@@ -227,7 +229,7 @@ export default function HostDetailsPanel({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="none">未分组</SelectItem>
+                <SelectItem value="none">{ungroupedOptionLabel(flat)}</SelectItem>
                 {groups.map((item) => (
                   <SelectItem key={item.id} value={String(item.id)}>
                     {item.name}

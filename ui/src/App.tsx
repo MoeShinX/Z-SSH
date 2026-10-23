@@ -72,6 +72,7 @@ import {
 } from "./state/editorModel";
 import { useHostTreeWidth, useWindowWidth } from "./components/ui/resize-handle";
 import { computeDockLayout } from "./state/dockLayout";
+import { deleteGroupMessage, isUngroupedFlat } from "./state/ungroupedFlat";
 import { canDockOnto, carryPaths, newDockSessionDefaults, OTHER_HOST_NOTICE } from "./state/dock";
 import { useTerminalCwd } from "./state/followCwd";
 import { sessionCwd, termWrite } from "./api/session";
@@ -2834,7 +2835,7 @@ export default function App() {
     (group: Group) => {
       setConfirm({
         title: `删除分组「${group.name}」？`,
-        message: "分组下的主机会变成未分组，不会被删。",
+        message: deleteGroupMessage(isUngroupedFlat()),
         confirmLabel: "删除",
         destructive: true,
         onConfirm: () => {
