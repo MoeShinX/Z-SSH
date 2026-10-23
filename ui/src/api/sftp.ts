@@ -398,6 +398,115 @@ export function onSftpPasteProgress(
   });
 }
 
+// ---------- 远端压缩 / 解压（UI-13） ----------
+
+/** 这台主机上压缩 / 解压能做什么（后端第一次问时探测，按会话缓存）。 */
+export interface ArchiveCaps {
+  /** 登录 shell 是 POSIX；不是的话压缩 / 解压菜单整个不显示。 */
+  posix: boolean;
+  tar: boolean;
+  zip: boolean;
+  unzip: boolean;
+}
+
+export function sftpArchiveCaps(sftpId: string): Promise<ArchiveCaps> {
+  return invoke("sftp_archive_caps", { sftpId });
+}
+
+export type CompressFormat = "tar_gz" | "zip";
+
+export interface CompressRequest {
+  /** 这次操作的任务号（取消、进度都按它配对；取消沿用 `sftpPasteCancel`）。 */
+  op_id: string;
+  /** 当前目录（绝对路径）。 */
+  dir: string;
+  /** 选中的条目名（当前目录下的名字）。 */
+  names: string[];
+  format: CompressFormat;
+}
+
+export interface CompressResult {
+  state: "ok" | "cancelled";
+  name?: string | null;
+  path?: string | null;
+  warning?: string | null;
+}
+
+export function sftpCompress(sftpId: string, request: CompressRequest): Promise<CompressResult> {
+  return invoke("sftp_compress", { sftpId, request });
+}
+
+/** 压缩包的大小和修改时间：检查之后、解压之前它被换掉就拒绝。 */
+export interface ArchiveFingerprint {
+  size: number | null;
+  mtime: number | null;
+}
+
+/** 解压前的检查结果。 */
+export interface ExtractPlan {
+  format: "tar_gz" | "tar" | "tar_xz" | "tar_bz2" | "zip";
+  total_entries: number;
+  total_files: number;
+  /** 目标里已经存在的同名文件个数。 */
+  conflict_count: number;
+  /** 前几个已存在的文件名。 */
+  conflict_sample: string[];
+  /** 目标文件夹现在已经存在。 */
+  dest_exists: boolean;
+  fingerprint: ArchiveFingerprint;
+}
+
+export interface ExtractPlanRequest {
+  op_id: string;
+  archive: string;
+  dest: string;
+}
+
+/** 检查压缩包（拒绝指向目录外的路径、数同名文件）；用户取消返回 null。 */
+export function sftpExtractPlan(
+  sftpId: string,
+  request: ExtractPlanRequest,
+): Promise<ExtractPlan | null> {
+  return invoke("sftp_extract_plan", { sftpId, request });
+}
+
+export type ConflictPolicy = "overwrite" | "skip_existing";
+
+export interface ExtractRequest {
+  op_id: string;
+  archive: string;
+  dest: string;
+  policy: ConflictPolicy;
+  /** 检查结果里解压时要核对的部分，原样带回来。 */
+  plan: {
+    fingerprint: ArchiveFingerprint;
+    dest_exists: boolean;
+    total_files: number;
+    conflict_count: number;
+  };
+}
+
+export interface ExtractResult {
+  state: "ok" | "cancelled";
+  extracted: number;
+  skipped: number;
+  warning?: string | null;
+}
+
+export function sftpExtract(sftpId: string, request: ExtractRequest): Promise<ExtractResult> {
+  return invoke("sftp_extract", { sftpId, request });
+}
+
+/** 压缩进度：临时压缩包已经写了多少字节（读不到时是 null）。 */
+export function onSftpArchiveProgress(
+  handler: (sftpId: string, opId: string, bytes?: number) => void,
+): Promise<UnlistenFn> {
+  return listen<[string, string, number | null]>("sftp_archive_progress", (event) => {
+    const [sftpId, opId, bytes] = event.payload;
+    handler(sftpId, opId, bytes ?? undefined);
+  });
+}
+
 // ---------- 属性：计算大小（M3-5 第 4 节） ----------
 
 export interface SizeTotals {

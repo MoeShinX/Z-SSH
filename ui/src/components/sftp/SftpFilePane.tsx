@@ -100,6 +100,9 @@ export interface SftpFilePaneProps {
   onCopySelection?: (entries: SftpEntry[]) => void;
   onPasteHere?: () => void;
   onShowProperties?: (entries: SftpEntry[]) => void;
+  /** 要求选中这些路径（压缩 / 解压完成后选中新生成的文件）：等它们出现在列表里再选，
+   *  同一个 `nonce` 只生效一次。 */
+  selectRequest?: { paths: string[]; nonce: number } | null;
   /** 选择变化（父层要拿"选中了哪些"去拖动 / 右键）。 */
   /** 选中的条目（按当前显示顺序；被过滤掉的不在里面）。 */
   onSelectionChange?: (entries: SftpEntry[]) => void;
@@ -205,6 +208,7 @@ export default function SftpFilePane({
   onShowProperties,
   onRenameSelection,
   onSelectionChange,
+  selectRequest,
   onBrowse,
   compact = false,
   canBack = false,
@@ -229,6 +233,16 @@ export default function SftpFilePane({
   const [anchorPath, setAnchorPath] = useState<string | null>(null);
   const [focusedPath, setFocusedPath] = useState<string | null>(null);
   const selection = useMemo(() => indicesOf(rows, selectedPaths), [rows, selectedPaths]);
+  const appliedSelectNonce = useRef<number | null>(null);
+  useEffect(() => {
+    if (!selectRequest || appliedSelectNonce.current === selectRequest.nonce) return;
+    const present = rows.filter((entry) => selectRequest.paths.includes(entry.path));
+    if (present.length === 0) return;
+    appliedSelectNonce.current = selectRequest.nonce;
+    setSelectedPaths(new Set(present.map((entry) => entry.path)));
+    setAnchorPath(present[0].path);
+    setFocusedPath(present[0].path);
+  }, [selectRequest, rows]);
   const rowIndexOf = useCallback(
     (target: string | null): number | null => {
       if (target === null) return null;

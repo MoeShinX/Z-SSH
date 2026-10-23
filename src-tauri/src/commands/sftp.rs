@@ -262,6 +262,8 @@ pub struct SftpTab {
     jobs: Mutex<HashMap<u64, TransferJob>>,
     /// 远端登录 shell 的类型（第一次要决定能不能用 cp 时探测一次，之后缓存）。
     pub(crate) shell_kind: tokio::sync::Mutex<Option<zssh_core::ai::shell_kind::ShellKind>>,
+    /// 远端压缩 / 解压能做什么（第一次右键时探测一次，之后缓存；探测没跑成不缓存）。
+    pub(crate) archive_caps: tokio::sync::Mutex<Option<zssh_core::sftp::archive::ArchiveCaps>>,
     /// 这个标签发起的、还在跑的删除（sftp_delete_cancel 用）。
     deletes: Mutex<HashMap<u64, Arc<CancelSignal>>>,
 }
@@ -754,6 +756,7 @@ pub async fn sftp_open(
         sizes: Mutex::new(HashMap::new()),
         jobs: Mutex::new(HashMap::new()),
         shell_kind: tokio::sync::Mutex::new(None),
+        archive_caps: tokio::sync::Mutex::new(None),
         deletes: Mutex::new(HashMap::new()),
     };
     registry.insert(sftp_id.clone(), tab);

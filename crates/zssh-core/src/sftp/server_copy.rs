@@ -1143,7 +1143,7 @@ async fn remove_cp_temp(runner: &dyn CpRunner, ops: &dyn CopyDataOps, temp: &str
 }
 
 /// 远端写锁：服务器端复制写一个目标之前先拿锁（M3-5b 第 2 项）。
-fn lock_target(
+pub(crate) fn lock_target(
     server: &str,
     path: &str,
 ) -> Result<crate::sftp::transfer::lock::TargetGuard, SftpError> {
@@ -1151,7 +1151,7 @@ fn lock_target(
 }
 
 /// 递归删掉一棵树（失败只记日志；清理自己的临时文件时用）。
-async fn remove_tree(ops: &dyn CopyDataOps, path: &str) {
+pub(crate) async fn remove_tree(ops: &dyn CopyDataOps, path: &str) {
     let attrs = match ops.lstat(path).await {
         Ok(attrs) => attrs,
         Err(_) => return,

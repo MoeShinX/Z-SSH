@@ -54,6 +54,9 @@ vi.mock("../../api/sftp", async (importOriginal) => {
     onSftpConflict: vi.fn(async () => () => {}),
     onSftpDelete: vi.fn(async () => () => {}),
     onSftpPasteProgress: vi.fn(async () => () => {}),
+    onSftpArchiveProgress: vi.fn(async () => () => {}),
+    // 一直在检测：菜单里的「压缩为」保持置灰（检测完的几种情况在 SftpTabViewArchive.test.tsx）
+    sftpArchiveCaps: vi.fn(() => new Promise(() => {})),
     sftpPasteCancel: vi.fn(async () => {}),
     onSftpEdit: vi.fn(async () => () => {}),
   };
@@ -172,6 +175,7 @@ describe("远端面板的右键菜单", () => {
       "edit-builtin",
       "transfer",
       "download-to",
+      "compress",
       "copy",
       "paste",
       "copy-path",
@@ -182,6 +186,9 @@ describe("远端面板的右键菜单", () => {
       "refresh",
       "properties",
     ]);
+    // 第一次右键，服务器上的压缩工具还在检测：「压缩为」先置灰
+    expect(isDisabled("compress")).toBe(true);
+    expect(menuItem("compress").getAttribute("title")).toBe("正在检测服务器上的压缩工具…");
     expect(menuItem("transfer").textContent).toContain("下载到本地");
     expect(isDisabled("rename")).toBe(false);
     expect(isDisabled("edit-builtin")).toBe(false);

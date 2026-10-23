@@ -3,7 +3,14 @@
 //! 菜单长什么样由一个纯函数按「哪一栏、点在文件 / 文件夹 / 空白处、选了几项、剪贴板里有什么」算出来，
 //! 组件（`SftpContextMenu`）只负责画和键盘导航；每种情形都可以直接单元测试。
 
-import type { SftpEntry, SftpTransfer } from "../api/sftp";
+import type { ArchiveCaps, SftpEntry, SftpTransfer } from "../api/sftp";
+import {
+  archiveFormatOf,
+  compressToolReason,
+  extractFolderName,
+  extractToolReason,
+  isExtractable,
+} from "./sftpArchive";
 
 export type MenuSide = "local" | "remote";
 
@@ -26,6 +33,11 @@ export type MenuActionId =
   | "permissions"
   | "refresh"
   | "properties"
+  // 远端压缩 / 解压（UI-13）
+  | "compress-tar-gz"
+  | "compress-zip"
+  | "extract-folder"
+  | "extract-here"
   // 传输队列里一行的右键菜单（和这一行右边的图标按钮一一对应）
   | "transfer-retry"
   | "transfer-pause"
@@ -66,6 +78,11 @@ export interface MenuFeatures {
   properties: boolean;
 }
 
+/** 远端压缩 / 解压的能力：`pending` = 第一次右键，还在探测服务器上有没有 tar / zip / unzip。 */
+export type ArchiveMenuState = ArchiveCaps | "pending";
+
+export const ARCHIVE_PENDING_REASON = "正在检测服务器上的压缩工具…";
+
 export interface MenuContext {
   side: MenuSide;
   /** `items`：右键点在条目上（`entries` 是选中的）；`blank`：点在空白处。 */
@@ -75,6 +92,8 @@ export interface MenuContext {
   currentDir: string;
   clipboard: MenuClipboard | null;
   features: MenuFeatures;
+  /** 远端压缩 / 解压的能力；不给（或登录 shell 不是 POSIX）就不显示这一组。 */
+  archive?: ArchiveMenuState | null;
 }
 
 export const NOT_UTF8_REASON = "文件名编码不是 UTF-8，暂不支持操作";
@@ -205,6 +224,44 @@ export function transferIsLive(state: SftpTransfer["state"]): boolean {
   return !["done", "failed", "cancelled", "skipped"].includes(state);
 }
 
+/**
+ * 压缩 / 解压那一组（只有远端、点在条目上才有）：压缩包上先给「解压到「同名文件夹」」「解压到当前目录」，
+ * 然后是「压缩为」子菜单。服务器上缺命令的项置灰并写明原因；登录 shell 不是 POSIX 整组不显示。
+ */
+function archiveNodes(context: MenuContext): MenuNode[] {
+  const { side, entries, archive } = context;
+  if (side !== "remote" || !archive) return [];
+  if (archive !== "pending" && !archive.posix) return [];
+  const caps = archive === "pending" ? null : archive;
+  const nodes: MenuNode[] = [];
+
+  if (entries.length === 1 && isExtractable(entries[0])) {
+    const name = entries[0].name;
+    const format = archiveFormatOf(name);
+    if (format) {
+      const reason = caps ? extractToolReason(format, caps) : ARCHIVE_PENDING_REASON;
+      const folder = extractFolderName(name);
+      if (folder) nodes.push(item("extract-folder", `解压到「${folder}」`, reason));
+      nodes.push(item("extract-here", "解压到当前目录", reason));
+    }
+  }
+
+  const selection = selectionReason(entries, "some", { forbidDrives: true });
+  const submenuReason = selection ?? (caps ? null : ARCHIVE_PENDING_REASON);
+  nodes.push({
+    kind: "submenu",
+    id: "compress",
+    label: "压缩为",
+    disabled: submenuReason !== null,
+    reason: submenuReason ?? undefined,
+    children: [
+      item("compress-tar-gz", ".tar.gz", caps ? compressToolReason("tar_gz", caps) : submenuReason),
+      item("compress-zip", ".zip", caps ? compressToolReason("zip", caps) : submenuReason),
+    ],
+  });
+  return nodes;
+}
+
 export function buildMenu(context: MenuContext): MenuNode[] {
   const { side, entries, features } = context;
   const blank = context.target === "blank";
@@ -263,6 +320,8 @@ export function buildMenu(context: MenuContext): MenuNode[] {
     SEPARATOR,
     item("transfer", isRemote ? "下载到本地" : "上传到远端", transferReason),
     ...(isRemote ? [item("download-to", "下载到…", transferReason)] : []),
+    SEPARATOR,
+    ...archiveNodes(context),
     SEPARATOR,
     item("copy", "复制", copyReason, "Ctrl+C"),
     paste,

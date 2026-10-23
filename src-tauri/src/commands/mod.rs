@@ -9,6 +9,7 @@ pub mod ime;
 pub mod session;
 pub mod settings;
 pub mod sftp;
+pub mod sftp_archive;
 pub mod sftp_edit;
 pub mod sftp_paste;
 pub mod sftp_size;

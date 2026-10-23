@@ -589,3 +589,106 @@ describe("传输队列一行的右键菜单", () => {
     }
   });
 });
+
+describe("远端压缩 / 解压（UI-13）", () => {
+  const FULL = { posix: true, tar: true, zip: true, unzip: true };
+  const archiveFile = entry({ name: "site.tar.gz" });
+  const zipFile = entry({ name: "pack.ZIP" });
+
+  it("没给能力（本地栏、或还没接上）：菜单里没有这一组", () => {
+    const nodes = buildMenu(context());
+    expect(flatten(nodes).has("compress")).toBe(false);
+    expect(flatten(nodes).has("extract-here")).toBe(false);
+    const local = buildMenu(context({ side: "local", archive: FULL }));
+    expect(flatten(local).has("compress")).toBe(false);
+  });
+
+  it("登录 shell 不是 POSIX：整组不显示", () => {
+    const nodes = buildMenu(
+      context({ entries: [archiveFile], archive: { posix: false, tar: false, zip: false, unzip: false } }),
+    );
+    expect(flatten(nodes).has("compress")).toBe(false);
+    expect(flatten(nodes).has("extract-folder")).toBe(false);
+  });
+
+  it("普通文件：只有「压缩为」子菜单，.tar.gz 在前、.zip 在后，都可用", () => {
+    const nodes = buildMenu(context({ archive: FULL }));
+    expect(shape(nodes)).toContain("compress[compress-tar-gz,compress-zip]");
+    expect(enabled(nodes, "compress")).toBe(true);
+    expect(enabled(nodes, "compress-tar-gz")).toBe(true);
+    expect(enabled(nodes, "compress-zip")).toBe(true);
+    expect(flatten(nodes).has("extract-here")).toBe(false);
+    const compress = flatten(nodes).get("compress");
+    expect(compress && compress.kind === "submenu" && compress.label).toBe("压缩为");
+  });
+
+  it("多选和文件夹也能压缩", () => {
+    expect(enabled(buildMenu(context({ entries: [file, folder], archive: FULL })), "compress")).toBe(true);
+    expect(enabled(buildMenu(context({ entries: [folder], archive: FULL })), "compress-tar-gz")).toBe(true);
+  });
+
+  it("服务器上没有 zip：.zip 置灰并写明原因，.tar.gz 仍可用", () => {
+    const nodes = buildMenu(context({ archive: { ...FULL, zip: false } }));
+    expect(enabled(nodes, "compress-zip")).toBe(false);
+    expect(reason(nodes, "compress-zip")).toBe("服务器上没有 zip 命令");
+    expect(enabled(nodes, "compress-tar-gz")).toBe(true);
+  });
+
+  it("服务器上没有 tar：.tar.gz 置灰，且 tar 系压缩包不能解压", () => {
+    const caps = { ...FULL, tar: false };
+    const nodes = buildMenu(context({ entries: [archiveFile], archive: caps }));
+    expect(enabled(nodes, "compress-tar-gz")).toBe(false);
+    expect(reason(nodes, "compress-tar-gz")).toBe("服务器上没有 tar 命令");
+    expect(enabled(nodes, "extract-folder")).toBe(false);
+    expect(reason(nodes, "extract-here")).toBe("服务器上没有 tar 命令");
+    expect(enabled(nodes, "compress-zip")).toBe(true);
+  });
+
+  it("压缩包：先给「解压到「同名文件夹」」和「解压到当前目录」，再是「压缩为」", () => {
+    const nodes = buildMenu(context({ entries: [archiveFile], archive: FULL }));
+    expect(shape(nodes)).toContain("extract-folder extract-here compress[compress-tar-gz,compress-zip]");
+    const folderItem = flatten(nodes).get("extract-folder");
+    expect(folderItem && folderItem.kind === "item" && folderItem.label).toBe("解压到「site」");
+    expect(enabled(nodes, "extract-folder")).toBe(true);
+    expect(enabled(nodes, "extract-here")).toBe(true);
+  });
+
+  it("zip 包解压要 unzip：没有就置灰；后缀不分大小写", () => {
+    const withUnzip = buildMenu(context({ entries: [zipFile], archive: FULL }));
+    const label = flatten(withUnzip).get("extract-folder");
+    expect(label && label.kind === "item" && label.label).toBe("解压到「pack」");
+    const noUnzip = buildMenu(context({ entries: [zipFile], archive: { ...FULL, unzip: false } }));
+    expect(enabled(noUnzip, "extract-here")).toBe(false);
+    expect(reason(noUnzip, "extract-here")).toBe("服务器上没有 unzip 命令");
+    expect(enabled(noUnzip, "compress-zip")).toBe(true);
+  });
+
+  it("只对单个压缩包文件出现解压：多选、文件夹、其它后缀都没有", () => {
+    const has = (entries: SftpEntry[]) =>
+      flatten(buildMenu(context({ entries, archive: FULL }))).has("extract-here");
+    expect(has([archiveFile, file])).toBe(false);
+    expect(has([entry({ name: "site.tar.gz", kind: "dir" })])).toBe(false);
+    expect(has([entry({ name: "notes.gz" })])).toBe(false);
+    expect(has([entry({ name: "x.tgz", kind: "symlink", target_kind: "file" })])).toBe(true);
+    expect(has([entry({ name: "x.tgz", kind: "symlink", target_kind: "dir" })])).toBe(false);
+  });
+
+  it("还在检测服务器上的工具：全部置灰，写明「正在检测」", () => {
+    const nodes = buildMenu(context({ entries: [archiveFile], archive: "pending" }));
+    for (const id of ["compress", "compress-tar-gz", "compress-zip", "extract-folder", "extract-here"]) {
+      expect(enabled(nodes, id)).toBe(false);
+      expect(reason(nodes, id)).toBe("正在检测服务器上的压缩工具…");
+    }
+  });
+
+  it("文件名不是 UTF-8 的条目不能压缩", () => {
+    const nodes = buildMenu(context({ entries: [entry({ name: "bad", name_is_utf8: false })], archive: FULL }));
+    expect(enabled(nodes, "compress")).toBe(false);
+    expect(reason(nodes, "compress")).toBe(NOT_UTF8_REASON);
+  });
+
+  it("空白处右键不出现这一组", () => {
+    const nodes = buildMenu(context({ target: "blank", entries: [], archive: FULL }));
+    expect(flatten(nodes).has("compress")).toBe(false);
+  });
+});

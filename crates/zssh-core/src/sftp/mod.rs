@@ -2,6 +2,7 @@
 //!
 //! - [`session`]：在连接池已有的连接上开 `sftp` 子系统通道（不重新认证），
 //!   协商出来的能力（扩展、`limits@openssh.com`）都在 [`session::SftpCaps`] 里。
+//! - [`archive`]：远端压缩 / 解压（服务器上跑 tar / zip / unzip）。
 //! - [`fs`]：文件操作（列目录、属性、建目录、重命名、删除、权限、小文本读写）。
 //! - [`path`]：远端 POSIX 路径的拼接与规范化。
 //! - [`local`]：Windows 本地这一侧的兼容（非法名字、长路径、大小写冲突、联接）。
@@ -10,6 +11,7 @@
 //! 错误类型见 [`error::SftpError`]：没权限 / 不存在 / 已存在 / 磁盘满 / 连接断了各有各的
 //! 说法，不笼统地报"失败"。
 
+pub mod archive;
 pub mod edit;
 pub mod error;
 pub mod fs;

@@ -23,13 +23,18 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 
 import {
+  onSftpArchiveProgress,
   onSftpDelete,
   onSftpEdit,
   onSftpPasteProgress,
   onSftpTransfer,
+  sftpArchiveCaps,
+  sftpCompress,
   sftpCreateFile,
   sftpDelete,
   sftpDeleteCancel,
+  sftpExtract,
+  sftpExtractPlan,
   sftpList,
   sftpLocalCreateFile,
   sftpLocalDefaultDir,
@@ -47,6 +52,10 @@ import {
   sftpTransferSubmit,
   sftpTransfers,
   sftpTransfersClear,
+  type ArchiveCaps,
+  type CompressFormat,
+  type ConflictPolicy,
+  type ExtractPlan,
   type PasteRequest,
   type SftpDeleteEvent,
   type SftpEntry,
@@ -81,6 +90,13 @@ import {
   relayRetryRequest,
 } from "../../state/sftpPaste";
 import { sftpPaste, sftpPasteCancel } from "../../api/sftp";
+import {
+  archiveBusyText,
+  compressNotice,
+  extractFolderName,
+  extractNotice,
+  type BusyKind,
+} from "../../state/sftpArchive";
 import { Button } from "../ui/button";
 import {
   SftpDeleteConfirm,
@@ -90,6 +106,7 @@ import {
   SftpPermissionsDialog,
 } from "./SftpDialogs";
 import SftpContextMenu from "./SftpContextMenu";
+import SftpExtractConflictDialog from "./SftpExtractConflictDialog";
 import SftpFilePane, { type PaneMenuRequest } from "./SftpFilePane";
 import {
   buildMenu,
@@ -97,6 +114,7 @@ import {
   pasteReason,
   transferCanPause,
   transferCanRetry,
+  type ArchiveMenuState,
   type MenuActionId,
   type MenuFeatures,
 } from "../../state/sftpMenu";
@@ -122,6 +140,17 @@ let pasteSerial = 0;
 function nextPasteId(): string {
   pasteSerial += 1;
   return `paste-${Date.now().toString(36)}-${pasteSerial}`;
+}
+
+/** 解压前检查完、等用户在冲突对话框里选「覆盖 / 跳过已有文件」的那一次。 */
+interface ExtractAsk {
+  archive: string;
+  archiveName: string;
+  dest: string;
+  destName: string;
+  plan: ExtractPlan;
+  /** 解到了「同名文件夹」（完成后选中它）；false = 解到当前目录。 */
+  selectDest: boolean;
 }
 
 const DIRECTION_LABELS: Record<SftpTransfer["direction"], string> = {
@@ -301,6 +330,11 @@ export default function SftpTabView({
       if (id !== sftpId) return;
       if (pasteBusyRef.current?.pasteId !== pasteId) return;
       setPasteProgress({ doneFiles });
+    }));
+    track(onSftpArchiveProgress((id, opId, bytes) => {
+      if (id !== sftpId) return;
+      if (pasteBusyRef.current?.pasteId !== opId) return;
+      setArchiveBytes(bytes ?? null);
     }));
     track(onSftpDelete((id, event: SftpDeleteEvent) => {
       if (id !== sftpId) return;
@@ -692,7 +726,11 @@ export default function SftpTabView({
     startedAt: number;
     pasteId: string;
     side: "local" | "remote";
+    /** 复制 / 压缩 / 检查压缩包 / 解压共用这一条「服务器上处理中 · 取消」提示条。 */
+    kind: BusyKind;
   } | null>(null);
+  /** 压缩时临时压缩包已经写了多少字节。 */
+  const [archiveBytes, setArchiveBytes] = useState<number | null>(null);
   const [pasteElapsed, setPasteElapsed] = useState(0);
   /** 服务器端复制的进度（第 N 个文件）。 */
   const [pasteProgress, setPasteProgress] = useState<{ doneFiles: number } | null>(null);
@@ -727,7 +765,17 @@ export default function SftpTabView({
   const runPasteRef = useRef<(request: PasteRequest) => void>(() => {});
   const runPaste = useCallback(
     (request: PasteRequest) => {
-      setPasteBusy({ startedAt: Date.now(), pasteId: request.paste_id, side: request.side });
+      if (pasteBusyRef.current && pasteBusyRef.current.kind !== "paste") {
+        // 提示条只有一条：服务器上正在压缩 / 解压时不开始复制，免得盖掉它的取消按钮。
+        toast.info("服务器上已有一个任务在进行，请等它结束再试");
+        return;
+      }
+      setPasteBusy({
+        startedAt: Date.now(),
+        pasteId: request.paste_id,
+        side: request.side,
+        kind: "paste",
+      });
       setPasteProgress(null);
       setPasteCancelling(false);
       void sftpPaste(sftpId, request)
@@ -792,6 +840,146 @@ export default function SftpTabView({
     [pasteInto, remotePath, localPath],
   );
 
+  // ---------- 远端压缩 / 解压（UI-13） ----------
+  // 服务器上有没有 tar / zip / unzip 第一次右键时问后端（后端按会话缓存）；问的时候菜单里先显示
+  // 置灰的「检测中」，没问成（失败）下次右键再问。
+  const [archiveCaps, setArchiveCaps] = useState<
+    { status: "idle" | "loading" | "failed" } | { status: "ready"; caps: ArchiveCaps }
+  >({ status: "idle" });
+  const archiveCapsRef = useRef(archiveCaps);
+  archiveCapsRef.current = archiveCaps;
+  const ensureArchiveCaps = useCallback(() => {
+    const current = archiveCapsRef.current.status;
+    if (current === "ready" || current === "loading") return;
+    setArchiveCaps({ status: "loading" });
+    void sftpArchiveCaps(sftpId)
+      .then((caps) => setArchiveCaps({ status: "ready", caps }))
+      .catch(() => setArchiveCaps({ status: "failed" }));
+  }, [sftpId]);
+  const archiveMenu: ArchiveMenuState | null =
+    archiveCaps.status === "ready"
+      ? archiveCaps.caps
+      : archiveCaps.status === "loading"
+        ? "pending"
+        : null;
+
+  const [extractAsk, setExtractAsk] = useState<ExtractAsk | null>(null);
+  /** 压缩 / 解压完成后要选中的新文件（路径 + 序号，同一个序号只生效一次）。 */
+  const [remoteSelect, setRemoteSelect] = useState<{ paths: string[]; nonce: number } | null>(
+    null,
+  );
+  const selectSerial = useRef(0);
+  const selectAfterRefresh = (paths: string[]) => {
+    selectSerial.current += 1;
+    setRemoteSelect({ paths, nonce: selectSerial.current });
+  };
+
+  /** 开始一次压缩 / 检查 / 解压：同一时间只做一件（提示条只有一条）。返回任务号，已有任务在跑返回 null。 */
+  const beginArchiveBusy = (kind: Exclude<BusyKind, "paste">): string | null => {
+    if (pasteBusyRef.current) {
+      toast.info("服务器上已有一个任务在进行，请等它结束再试");
+      return null;
+    }
+    const opId = nextPasteId();
+    const busy = { startedAt: Date.now(), pasteId: opId, side: "remote" as const, kind };
+    pasteBusyRef.current = busy;
+    setPasteBusy(busy);
+    setPasteProgress(null);
+    setArchiveBytes(null);
+    setPasteCancelling(false);
+    return opId;
+  };
+  const endArchiveBusy = () => {
+    pasteBusyRef.current = null;
+    setPasteBusy(null);
+    setArchiveBytes(null);
+    setPasteCancelling(false);
+  };
+
+  const runCompress = (entries: SftpEntry[], format: CompressFormat) => {
+    const names = entries.filter((entry) => entry.name_is_utf8).map((entry) => entry.name);
+    if (names.length === 0 || !remotePath) return;
+    const opId = beginArchiveBusy("compress");
+    if (!opId) return;
+    void sftpCompress(sftpId, { op_id: opId, dir: remotePath, names, format })
+      .then((result) => {
+        const notice = compressNotice(result);
+        if (notice.type === "success") toast.success(notice.text);
+        else toast.info(notice.text);
+        if (result.state === "ok" && result.path) selectAfterRefresh([result.path]);
+        refreshRemoteRef.current();
+      })
+      .catch((error) => {
+        toast.error(`压缩失败：${String(error)}`);
+        refreshRemoteRef.current();
+      })
+      .finally(endArchiveBusy);
+  };
+
+  /** 真正解压（检查过、冲突也问过了）。 */
+  const startExtract = (ask: ExtractAsk, policy: ConflictPolicy) => {
+    const opId = beginArchiveBusy("extract");
+    if (!opId) return;
+    void sftpExtract(sftpId, {
+      op_id: opId,
+      archive: ask.archive,
+      dest: ask.dest,
+      policy,
+      plan: {
+        fingerprint: ask.plan.fingerprint,
+        dest_exists: ask.plan.dest_exists,
+        total_files: ask.plan.total_files,
+        conflict_count: ask.plan.conflict_count,
+      },
+    })
+      .then((result) => {
+        const notice = extractNotice(result, ask.destName, ask.plan.dest_exists);
+        if (notice.type === "success") toast.success(notice.text);
+        else toast.info(notice.text);
+        if (result.state === "ok" && ask.selectDest) selectAfterRefresh([ask.dest]);
+        refreshRemoteRef.current();
+      })
+      .catch((error) => {
+        toast.error(`解压失败：${String(error)}`);
+        refreshRemoteRef.current();
+      })
+      .finally(endArchiveBusy);
+  };
+
+  /** 解压：先让服务器检查压缩包（拒绝指向目录外的路径、数同名文件），有同名文件再问用户。 */
+  const runExtract = (entry: SftpEntry, mode: "folder" | "here") => {
+    if (!remotePath) return;
+    const folder = extractFolderName(entry.name);
+    if (mode === "folder" && !folder) return;
+    const base = remotePath.replace(/\/+$/, "");
+    const dest = mode === "folder" ? `${base}/${folder}` : remotePath;
+    const destName = mode === "folder" ? (folder as string) : (base.split("/").pop() || "/");
+    const opId = beginArchiveBusy("scan");
+    if (!opId) return;
+    void sftpExtractPlan(sftpId, { op_id: opId, archive: entry.path, dest })
+      .then((plan) => {
+        endArchiveBusy();
+        if (!plan) {
+          toast.info("已取消解压");
+          return;
+        }
+        const ask: ExtractAsk = {
+          archive: entry.path,
+          archiveName: entry.name,
+          dest,
+          destName,
+          plan,
+          selectDest: mode === "folder",
+        };
+        if (plan.conflict_count > 0) setExtractAsk(ask);
+        else startExtract(ask, "overwrite");
+      })
+      .catch((error) => {
+        endArchiveBusy();
+        toast.error(`没有解压：${String(error)}`);
+      });
+  };
+
   // ---------- 属性（M3-5 第 4 节） ----------
   const [propertiesRequest, setPropertiesRequest] = useState<{
     side: "local" | "remote";
@@ -821,6 +1009,7 @@ export default function SftpTabView({
         currentDir: menuRequest.side === "remote" ? remotePath : localPath,
         clipboard: menuClipboard,
         features: MENU_FEATURES,
+        archive: menuRequest.side === "remote" ? archiveMenu : null,
       })
     : [];
 
@@ -911,6 +1100,18 @@ export default function SftpTabView({
       case "properties":
         showProperties(side, entries);
         break;
+      case "compress-tar-gz":
+        if (side === "remote") runCompress(entries, "tar_gz");
+        break;
+      case "compress-zip":
+        if (side === "remote") runCompress(entries, "zip");
+        break;
+      case "extract-folder":
+        if (side === "remote" && entries.length === 1) runExtract(entries[0], "folder");
+        break;
+      case "extract-here":
+        if (side === "remote" && entries.length === 1) runExtract(entries[0], "here");
+        break;
     }
   };
 
@@ -973,7 +1174,11 @@ export default function SftpTabView({
       onRefresh={() => void loadRemote(remotePath, true, "refresh")}
       onFocusPane={() => setFocusedSide("remote")}
       onActivate={activateRemote}
-      onContextMenu={(request) => setMenuRequest({ ...request, side: "remote" })}
+      onContextMenu={(request) => {
+        ensureArchiveCaps();
+        setMenuRequest({ ...request, side: "remote" });
+      }}
+      selectRequest={remoteSelect}
       onDropInto={(target) => handleDropInto("remote", target)}
       onDragStart={handlePaneDragStart}
       onDragEnd={handlePaneDragEnd}
@@ -1117,13 +1322,33 @@ export default function SftpTabView({
           onClose={() => setPropertiesRequest(null)}
         />
       )}
+      {extractAsk && (
+        <SftpExtractConflictDialog
+          archiveName={extractAsk.archiveName}
+          destName={extractAsk.destName}
+          plan={extractAsk.plan}
+          onChoose={(policy) => {
+            const ask = extractAsk;
+            setExtractAsk(null);
+            startExtract(ask, policy);
+          }}
+          onCancel={() => {
+            setExtractAsk(null);
+            toast.info("已取消解压");
+          }}
+        />
+      )}
       {pasteBusy && !conflictPending && (
         <div
           role="status"
           data-testid="paste-busy"
           className="absolute bottom-2 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs text-foreground shadow"
         >
-          <span>{copyingText(pasteElapsed, pasteProgress?.doneFiles)}</span>
+          <span>
+            {pasteBusy.kind === "paste"
+              ? copyingText(pasteElapsed, pasteProgress?.doneFiles)
+              : archiveBusyText(pasteBusy.kind, pasteElapsed, archiveBytes)}
+          </span>
           {pasteBusy.side === "remote" && (
             <Button
               variant="outline"

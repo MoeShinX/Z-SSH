@@ -24,6 +24,7 @@ vi.mock("../../api/sftp", async (importOriginal) => {
     onSftpConflict: vi.fn(async () => () => {}),
     onSftpDelete: vi.fn(async () => () => {}),
     onSftpPasteProgress: vi.fn(async () => () => {}),
+    onSftpArchiveProgress: vi.fn(async () => () => {}),
     onSftpEdit: vi.fn(async () => () => {}),
   };
 });
