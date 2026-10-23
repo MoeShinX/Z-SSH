@@ -55,8 +55,10 @@ export function reduceActivity(
       };
     }
     case "retarget": {
-      // 结束时没有位置的调用（当时没有回报，没点过灯）不补点：晚到的回报不亮灯
-      if (!(event.callId in state.ended)) return state;
+      // 还在跑的调用由 start 管；这里只处理已经结束的。结束时还没有位置（回报比结束晚到，
+      // 或者回合已经结束、记账清过了）的调用，纠正之后同样要在实际执行的标签上标「有新输出」，
+      // 不然卡片位置对了，标签上却没有提示。
+      if (event.callId in state.running) return state;
       const { [event.callId]: _old, ...unseen } = state.unseen;
       const target =
         event.targetId === null

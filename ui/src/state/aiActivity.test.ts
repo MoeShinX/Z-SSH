@@ -128,20 +128,37 @@ describe("位置被纠正以后点跟着挪（AI-SCOPE-3）", () => {
     expect(unseenTabs(again)).toEqual(["tab-web"]);
   });
 
-  it("结束时没点过灯的调用（当时没有回报）：晚到的回报不补点", () => {
+  it("结束时还没有位置的调用（回报比结束晚到）：拿到位置后在实际执行的标签上补「有新输出」", () => {
     const state = run([
       { kind: "retarget", callId: "c9", targetId: "host-y", sessionId: "s-web" },
     ]);
-    expect(state).toBe(EMPTY_ACTIVITY);
+    expect(unseenTabs(state)).toEqual(["tab-web"]);
   });
 
-  it("回合结束之后的纠正被忽略", () => {
+  it("回合已经结束、回报才到：卡片位置纠正了，点也跟着挪到正确的标签", () => {
     const state = run([
       start("c1", "s-db"),
       { kind: "end", callId: "c1" },
       { kind: "reset" },
       { kind: "retarget", callId: "c1", targetId: "host-y", sessionId: "s-web" },
     ]);
-    expect(unseenTabs(state)).toEqual(["tab-db"]);
+    expect(unseenTabs(state)).toEqual(["tab-web"]);
+  });
+
+  it("回合结束后才到的回报、而且没有位置：不标点", () => {
+    const state = run([
+      { kind: "reset" },
+      { kind: "retarget", callId: "c9", targetId: null, sessionId: null },
+    ]);
+    expect(unseenTabs(state)).toEqual([]);
+  });
+
+  it("还在跑的调用收到纠正：不当成结束（由 start 管）", () => {
+    const state = run([
+      start("c1", "s-db"),
+      { kind: "retarget", callId: "c1", targetId: "host-y", sessionId: "s-web" },
+    ]);
+    expect(unseenTabs(state)).toEqual([]);
+    expect(Object.keys(state.running)).toEqual(["c1"]);
   });
 });

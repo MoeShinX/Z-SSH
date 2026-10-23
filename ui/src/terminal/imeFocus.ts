@@ -111,6 +111,8 @@ export function createImeFocusController(
   let seq = 0;
   /** 已发出、还没有回答的请求数：回答之前不知道是否还欠着一次恢复。 */
   let inFlight = 0;
+  /** 收到过几次「后端欠恢复」通知：请求发出之后才到的通知，不能被这次请求的（较旧的）回答抹掉。 */
+  let owedNotices = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let listening = false;
 
@@ -187,6 +189,7 @@ export function createImeFocusController(
 
   const request = (focused: boolean) => {
     const mine = ++seq;
+    const noticesAtSend = owedNotices;
     lastSent = focused;
     inFlight++;
     chain = chain
@@ -194,7 +197,8 @@ export function createImeFocusController(
       .then(
         (inEnglish) => {
           inFlight--;
-          backendInEnglish = inEnglish === true;
+          // 这次请求发出之后又收到了欠恢复的通知：后端的回答比通知旧，仍按欠着算
+          backendInEnglish = inEnglish === true || owedNotices > noticesAtSend;
           // 进入没被后端接受（比如窗口还没拿到前台）：下次进入要重发
           if (focused && !backendInEnglish && mine === seq) lastSent = null;
           stopListeningIfIdle();
@@ -244,6 +248,7 @@ export function createImeFocusController(
   return {
     markRestoreOwed() {
       if (!listening) return;
+      owedNotices++;
       backendInEnglish = true;
       // 用户此刻就停在 AI 输入框里：不会再有焦点变化，现在就开始等
       const zone = imeZoneOf(document.activeElement);

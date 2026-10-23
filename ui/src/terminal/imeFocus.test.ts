@@ -812,6 +812,21 @@ describe("imeZoneOf / isEditableElement", () => {
 });
 
 describe("别的窗口被关掉、恢复没成功：markRestoreOwed", () => {
+  it("通知比在途请求的回答晚发、早到：较旧的回答不能抹掉欠恢复", async () => {
+    const { sent, send, release } = manualSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeTextarea().focus(); // 进英文区：发出「进入」，回答还没回来
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true]);
+    makeButton().focus();
+    controller.markRestoreOwed(); // 这时另一个窗口被关、恢复失败
+    await release(false); // 较旧的回答：说「不在英文区」
+    makeNative().focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS);
+    expect(sent).toEqual([true, false]);
+  });
+
   it("没进过英文区，收到通知后进跟随区：延迟 40ms 后补发一次离开", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
