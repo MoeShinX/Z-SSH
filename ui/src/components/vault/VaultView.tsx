@@ -1124,7 +1124,7 @@ function HostCard({
               ))}
               {host.legacy_algorithms && <Badge variant="outline">旧算法</Badge>}
             </div>
-            <div className="flex shrink-0 items-center gap-1">
+            <div className="flex shrink-0 items-center gap-2">
               <EditButton onEdit={onEdit} />
               <Button
                 size="icon-sm"
@@ -1212,7 +1212,7 @@ function HostRow({
             {host.username}@{host.host}:{host.port}
           </span>
           <span className="truncate text-xs text-muted-foreground">{groupName ?? "未分组"}</span>
-          <div className="flex shrink-0 items-center gap-1">
+          <div className="flex shrink-0 items-center gap-2">
             <EditButton onEdit={onEdit} />
             <Button
               size="sm"
