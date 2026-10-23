@@ -1864,6 +1864,9 @@ export default function App() {
     );
   }, []);
 
+  /** 每台主机正在打开的那一次停靠会话：打开结果回来时对不上（条目已被清理、或清理后又重开了）就作废。 */
+  const dockOpening = useRef(new Map<number, symbol>());
+
   const ensureDock = useCallback(
     (hostId: number) => {
       if (docksRef.current[hostId]) return;
@@ -1875,11 +1878,25 @@ export default function App() {
       };
       docksRef.current = { ...docksRef.current, [hostId]: entry };
       setDocks(docksRef.current);
+      const token = Symbol(hostId);
+      dockOpening.current.set(hostId, token);
+      const current = () =>
+        dockOpening.current.get(hostId) === token && docksRef.current[hostId] !== undefined;
       void sftpOpen(hostId)
-        .then((sftpId) => patchDock(hostId, { sftpId, phase: "ready", status: "" }))
-        .catch((error: unknown) =>
-          patchDock(hostId, { phase: "failed", status: errorText(error) }),
-        );
+        .then((sftpId) => {
+          if (!current()) {
+            // 连接中这台主机的终端就都关了：会话没人用，直接关掉，不写回（否则成了看不见的连接）
+            void sftpClose(sftpId).catch(() => {});
+            return;
+          }
+          dockOpening.current.delete(hostId);
+          patchDock(hostId, { sftpId, phase: "ready", status: "" });
+        })
+        .catch((error: unknown) => {
+          if (!current()) return;
+          dockOpening.current.delete(hostId);
+          patchDock(hostId, { phase: "failed", status: errorText(error) });
+        });
     },
     [patchDock],
   );
@@ -2013,6 +2030,8 @@ export default function App() {
         // 停靠要保留两栏当前的目录（用户在标签里自己选的），所以先不跟随终端；想跟随再勾上。
         follow: false,
       };
+      // 原来那个还在连接中：它的打开结果作废（回来时会自己关掉，不覆盖这次停靠的会话）
+      dockOpening.current.delete(hostId);
       docksRef.current = { ...docksRef.current, [hostId]: next };
       setDocks(docksRef.current);
       setWs((state) => {
@@ -2269,7 +2288,8 @@ export default function App() {
     }
     for (const [key, dock] of Object.entries(docksRef.current)) {
       const hostId = Number(key);
-      if (alive.has(hostId) || dock.phase === "connecting") continue;
+      // 还在连接中的也收掉：打开结果回来时发现条目没了，会自己把会话关掉（见 ensureDock）
+      if (alive.has(hostId)) continue;
       if (dock.sftpId && (sftpActive.current.get(dock.sftpId) ?? 0) > 0) continue;
       if (dock.sftpId && (editDirty.current.get(dock.sftpId)?.size ?? 0) > 0) continue;
       // 这台主机还开着内置编辑器：连接留着，保存才有地方写。
@@ -2283,6 +2303,7 @@ export default function App() {
         sftpActive.current.delete(dock.sftpId);
         void sftpClose(dock.sftpId).catch(() => {});
       }
+      dockOpening.current.delete(hostId);
       const next = { ...docksRef.current };
       delete next[hostId];
       docksRef.current = next;

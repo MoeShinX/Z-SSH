@@ -140,12 +140,21 @@ vi.mock("./api/fileWindow", async (importOriginal) => {
     },
   };
 });
-// 顶栏只留打开停靠文件面板的按钮；停靠 SFTP 打开即就绪，面板本身用替身。
+// 顶栏只留打开停靠文件面板、关掉第一个标签的按钮；停靠 SFTP 打开即就绪，面板本身用替身。
 vi.mock("./components/titlebar/TopTabs", () => ({
-  default: (props: { onToggleSftp: () => void }) => (
-    <button data-testid="toggle-sftp" onClick={props.onToggleSftp}>
-      SFTP
-    </button>
+  default: (props: {
+    tabs: { id: string }[];
+    onToggleSftp: () => void;
+    onCloseTab: (tabId: string) => void;
+  }) => (
+    <>
+      <button data-testid="toggle-sftp" onClick={props.onToggleSftp}>
+        SFTP
+      </button>
+      <button data-testid="close-tab" onClick={() => props.onCloseTab(props.tabs[0].id)}>
+        关闭
+      </button>
+    </>
   ),
 }));
 vi.mock("./api/sftp", async (importOriginal) => ({
@@ -661,5 +670,39 @@ describe("退出判断用等转发查询之后的状态；停靠文件面板也�
     const event = await requestClose();
     expect(event.prevented, "停靠的 SFTP 不能因为终端断了就漏数").toBe(true);
     expect(document.body.textContent).toContain("还有 1 个连接（1 个 SFTP 连接），退出会全部断开。");
+  });
+
+  it("停靠面板还在连接中就关掉这台主机的终端：连上后会话随即关掉，不留看不见的连接", async () => {
+    mocks.settings.set("close_action", JSON.stringify("quit"));
+    await mountApp();
+    const { sftpOpen, sftpClose } = await import("./api/sftp");
+    let finishOpen!: (sftpId: string) => void;
+    vi.mocked(sftpOpen).mockImplementationOnce(
+      () => new Promise((resolve) => (finishOpen = resolve)),
+    );
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="open-host"]')!.click();
+    });
+    await waitFor(() => expect(mocks.ready.size).toBe(1));
+    await act(async () => {
+      [...mocks.ready.values()][0](100, 30);
+    });
+    await act(async () => {
+      for (const handler of mocks.stateHandlers) handler({ session_id: "s", state: "connected" });
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="toggle-sftp"]')!.click();
+    });
+    await waitFor(() => expect(finishOpen).toBeTypeOf("function"));
+    // 面板还在连接中，关掉这台主机唯一的终端标签
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="close-tab"]')!.click();
+    });
+    await act(async () => {
+      finishOpen("late-sftp");
+    });
+    await waitFor(() => expect(vi.mocked(sftpClose)).toHaveBeenCalledWith("late-sftp"));
+    const event = await requestClose();
+    expect(event.prevented, "关掉的会话不能再算成活动连接").toBe(false);
   });
 });

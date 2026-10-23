@@ -46,7 +46,7 @@ export const SETTING_DEFAULTS = {
   terminal_cursor_style: "block",
   terminal_cursor_blink: true,
   terminal_copy_on_select: false,
-  // 焦点进终端时把输入法切到英文（离开终端恢复）；只是切模式，按 Shift 照样能打中文
+  // 焦点进终端时关闭输入法（直接打英文），离开终端重新打开；在终端里要打中文按 Ctrl+空格
   terminal_ime_english: true,
   terminal_right_click_paste: false,
   terminal_confirm_multiline_paste: true,
