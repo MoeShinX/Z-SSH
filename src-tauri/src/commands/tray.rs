@@ -14,6 +14,12 @@ pub fn tray_show_hint(app: AppHandle) {
     crate::tray::show_first_hide_hint(&app);
 }
 
+/// 把主窗口叫到前面：托盘「退出」不再事先叫出窗口，前端发现有东西要确认时自己来叫。
+#[tauri::command]
+pub fn tray_show_main(app: AppHandle) {
+    crate::focus_main_window(&app);
+}
+
 /// 前端告诉后端：能回答托盘「退出」的确认了（`true`），或者不能了（`false`）。
 #[tauri::command]
 pub fn tray_ui_ready(app: AppHandle, ready: bool) {

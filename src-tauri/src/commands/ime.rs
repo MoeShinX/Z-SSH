@@ -1,12 +1,11 @@
-//! 焦点进入「英文区」（终端、搜索框、表单等除 AI 对话输入框以外的可输入元素，由前端判断，
-//! 见 ui/src/terminal/imeFocus.ts）时把输入法切到英文模式，离开英文区时恢复原来的中英文状态。
-//! 命令和状态机里仍沿用 "terminal" 这个名字，只表示「英文区」。
+//! 焦点进入「英文区」（只有终端，由前端判断，见 ui/src/terminal/imeFocus.ts）时让输入法打英文，
+//! 离开终端、进别的输入框时恢复原来的状态。命令和状态机里沿用 "terminal" / "mode" 这些名字。
 //!
-//! 不是禁止中文：效果等于替用户按了一下 Shift，要打中文照样按 Shift 切回去。
-//! 做法是给当前焦点窗口的默认输入法窗口发 `WM_IME_CONTROL`（读 / 设"转换模式"，
-//! 去掉 `IME_CMODE_NATIVE` 就是英文），和 im-select 一类工具用的是同一个办法。
-//! 微软拼音 / 五笔认这个消息；第三方输入法（百度、搜狗……）认不认看各家实现，
-//! 不认的就什么都不发生，不影响输入。
+//! 做法：给当前焦点窗口的默认输入法窗口发 `WM_IME_CONTROL`，**关闭**输入法（关闭后按键直接是
+//! 英文），离开时**打开**回去。以前改的是"转换模式"（去掉中文位），微软拼音认、百度拼音等
+//! 第三方输入法不认（2026-10-23 实测：转换模式读回来是写进去的值，百度的工具栏仍是「英」），
+//! 打开 / 关闭两家都认，所以换成了它（映射见 `imp::Win32Ime`）。
+//! 不是禁止中文：要在终端里打中文按 Ctrl+空格（或点输入法图标）打开输入法即可。
 //!
 //! 键盘焦点在 WebView2 的子窗口里（别的进程），所以按"前台线程的焦点窗口"找，
 //! 并且只在前台窗口属于本进程时才动手，绝不碰别的程序的输入法。
@@ -233,13 +232,14 @@ mod imp {
         GUITHREADINFO, SMTO_ABORTIFHUNG,
     };
 
-    use super::{ImeControl, SharedIme};
+    use super::{ImeControl, SharedIme, CMODE_NATIVE};
 
     const WM_IME_CONTROL: u32 = 0x0283;
-    const IMC_GETCONVERSIONMODE: usize = 0x0001;
-    const IMC_SETCONVERSIONMODE: usize = 0x0002;
-    /// 输入法窗口卡住时最多等这么久（毫秒），不让界面线程跟着卡。
-    const TIMEOUT_MS: u32 = 200;
+    const IMC_GETOPENSTATUS: usize = 0x0005;
+    const IMC_SETOPENSTATUS: usize = 0x0006;
+    /// 输入法窗口最多等这么久（毫秒）。百度拼音等第三方输入法实测偶尔要两三百毫秒才回，
+    /// 200ms 时会被当成失败；这里在后台线程里等，不卡界面，给到 1 秒。
+    const TIMEOUT_MS: u32 = 1000;
 
     static STATE: Mutex<Option<SharedIme>> = Mutex::new(None);
 
@@ -263,14 +263,24 @@ mod imp {
 
     struct Win32Ime;
 
+    /// 实际操作的是输入法的**打开 / 关闭**，不是转换模式：
+    /// 百度拼音等第三方输入法自己管中 / 英，不理会 `IMC_SETCONVERSIONMODE`（读回来是写进去的值，
+    /// 工具栏照样是「英」或「中」，2026-10-23 实测）；但都认打开 / 关闭——关闭后按键直接是英文，
+    /// 重新打开回到中文。微软拼音同样适用。
+    ///
+    /// 状态机按「转换模式」写的（去掉中文位 = 英文），这里把打开状态映射到中文位上：
+    /// 打开 = `CMODE_NATIVE`，关闭 = 0。这样「进终端记下原状态、关掉；离开时打开回去、读回核对」
+    /// 的整套逻辑和重试原样不变。
     impl ImeControl for Win32Ime {
         fn read_mode(&mut self) -> Option<usize> {
-            send(focused_ime_window()?, IMC_GETCONVERSIONMODE, 0)
+            let open = send(focused_ime_window()?, IMC_GETOPENSTATUS, 0)?;
+            Some(if open != 0 { CMODE_NATIVE } else { 0 })
         }
 
         fn write_mode(&mut self, mode: usize) -> bool {
+            let open = usize::from(mode & CMODE_NATIVE != 0);
             focused_ime_window()
-                .and_then(|ime| send(ime, IMC_SETCONVERSIONMODE, mode))
+                .and_then(|ime| send(ime, IMC_SETOPENSTATUS, open))
                 .is_some()
         }
     }

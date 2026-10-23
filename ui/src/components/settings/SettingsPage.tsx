@@ -273,7 +273,7 @@ function AppearanceSection() {
       </SectionCard>
       <SectionCard
         title="应用皮肤"
-        description="浅色和深色皮肤分别保存，随明暗模式生效。终端配色默认跟随皮肤，单独选择的终端配色会保留。"
+        description="浅色和深色皮肤分别保存，随明暗模式生效。终端配色默认是 Tokyo Night，也可以改成跟随皮肤或固定为某一套，单独选择的终端配色会保留。"
       >
         <p className="pb-2 text-xs font-medium text-muted-foreground">浅色皮肤</p>
         <SkinGrid mode="light" />
@@ -407,8 +407,8 @@ function TerminalSection() {
           />
         </SettingRow>
         <SettingRow
-          title="默认使用英文输入"
-          description="除 AI 对话输入框外，输入焦点处默认切到英文输入；AI 对话框保持你原来的中英文状态。要打中文按 Shift 切换。微软拼音、五笔支持；部分第三方输入法可能不响应。"
+          title="终端里自动切到英文输入"
+          description="焦点进终端时把输入法切成英文，离开终端回到其他输入框（AI 对话框、搜索框、编辑器等）时恢复你原来的中英文状态；要在终端里打中文按 Shift 切换。微软拼音、五笔支持；部分第三方输入法可能不响应。"
         >
           <Switch
             checked={settings.terminal_ime_english}

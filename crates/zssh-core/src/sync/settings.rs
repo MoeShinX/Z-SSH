@@ -1101,6 +1101,16 @@ mod tests {
         accepts("terminal_theme", json!("system-catppuccin-dark"));
     }
 
+    /// 0.2.7 起新装的默认外观（深色 / Dracula / 终端 Tokyo Night）和默认开着的关键词高亮：
+    /// 界面把这些值同步出去时，对端的校验必须收（默认值本身不存在后端，只在界面的 settings.ts）。
+    #[test]
+    fn the_default_look_and_highlight_values_pass_sync_validation() {
+        accepts("ui_theme_mode", json!("dark"));
+        accepts("ui_skin_dark", json!("dracula"));
+        accepts("terminal_theme", json!("tokyo-night"));
+        accepts("terminal_highlight_enabled", json!(true));
+    }
+
     #[test]
     fn machine_specific_settings_are_not_synced() {
         for key in [

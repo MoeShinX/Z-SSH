@@ -1,4 +1,4 @@
-//! 常用规则：默认只开前两条；最早两条示例原样没改过时升级成整组，改过的不动。
+//! 常用规则：默认总开关和整组五条都开；最早两条示例原样没改过时升级成整组，改过的不动。
 
 import { describe, expect, it } from "vitest";
 
@@ -11,11 +11,11 @@ const legacy = [
 ];
 
 describe("常用高亮规则", () => {
-  it("新装默认带整组，只有错误、警告开着", () => {
+  it("新装默认带整组，总开关和五条规则都开着", () => {
     const rules = JSON.parse(SETTING_DEFAULTS.terminal_highlight_rules) as { id: string; enabled: boolean }[];
     expect(rules.map((rule) => rule.id)).toEqual(SAMPLE_RULES.map((rule) => rule.id));
-    expect(rules.map((rule) => rule.enabled)).toEqual([true, true, false, false, false]);
-    expect(SETTING_DEFAULTS.terminal_highlight_enabled).toBe(false);
+    expect(rules.map((rule) => rule.enabled)).toEqual([true, true, true, true, true]);
+    expect(SETTING_DEFAULTS.terminal_highlight_enabled).toBe(true);
   });
 
   it("最早两条示例原样：升级成整组", () => {

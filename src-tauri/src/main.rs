@@ -468,6 +468,7 @@ fn main() {
             commands::vault::proxy_delete,
             commands::tray::tray_hide_main,
             commands::tray::tray_show_hint,
+            commands::tray::tray_show_main,
             commands::tray::tray_ui_ready,
             commands::update::update_status,
             commands::update::update_check,

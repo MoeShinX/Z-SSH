@@ -108,6 +108,8 @@ export interface UnsavedFile {
 export function unsavedPrompt(
   files: UnsavedFile[],
   reason: "close-tab" | "close-tabs" | "close-connection" | "quit",
+  /** 退出时顺带要说明的其他后果（一条一行），接在询问后面。 */
+  extra?: string,
 ): { title: string; message: string } {
   const count = files.length;
   const what =
@@ -118,10 +120,11 @@ export function unsavedPrompt(
         : reason === "close-connection"
         ? "关闭这台主机的连接"
         : "退出程序";
+  const tail = extra ? `\n\n${extra}\n选「保存」或「不保存」都会继续退出，选「取消」留下。` : "";
   if (count === 1) {
     return {
       title: `「${files[0].fileName}」的修改还没有保存`,
-      message: `${what}之前要先保存吗？选「不保存」会丢掉这次的修改。`,
+      message: `${what}之前要先保存吗？选「不保存」会丢掉这次的修改。${tail}`,
     };
   }
   const names = files
@@ -131,7 +134,7 @@ export function unsavedPrompt(
   const more = count > 6 ? `等 ${count} 个文件` : `${count} 个文件`;
   return {
     title: `${more}的修改还没有保存`,
-    message: `${names}${count > 6 ? "……" : ""}。${what}之前要先保存吗？选「不保存」会丢掉这些修改。`,
+    message: `${names}${count > 6 ? "……" : ""}。${what}之前要先保存吗？选「不保存」会丢掉这些修改。${tail}`,
   };
 }
 

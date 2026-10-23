@@ -16,6 +16,7 @@ import {
   paletteToXterm,
   skinFor,
   skinTokens,
+  DEFAULT_TERMINAL_THEME,
   TERMINAL_FOLLOW_SKIN,
   type Skin,
 } from "../state/skins";
@@ -31,11 +32,12 @@ import type { ITheme } from "@xterm/xterm";
 
 /** 每项设置的名字、默认值和类型（类型也用来校验从库里读回来的值）。 */
 export const SETTING_DEFAULTS = {
-  // 外观：主题（系统 / 浅色 / 深色）+ 浅色、深色各一个皮肤；终端配色默认跟随皮肤
-  ui_theme_mode: "system",
+  // 外观：主题（系统 / 浅色 / 深色）+ 浅色、深色各一个皮肤。0.2.7 起新装默认 深色 / Dracula /
+  // 终端 Tokyo Night（只影响没改过这些设置的人：库里存过的值照旧）
+  ui_theme_mode: "dark",
   ui_skin_light: DEFAULT_LIGHT_SKIN,
   ui_skin_dark: DEFAULT_DARK_SKIN,
-  terminal_theme: TERMINAL_FOLLOW_SKIN,
+  terminal_theme: DEFAULT_TERMINAL_THEME,
   // 终端
   terminal_font_family: "JetBrains Mono, Cascadia Mono, Consolas, monospace",
   terminal_font_size: 12,
@@ -48,9 +50,9 @@ export const SETTING_DEFAULTS = {
   terminal_ime_english: true,
   terminal_right_click_paste: false,
   terminal_confirm_multiline_paste: true,
-  // 关键词 / 正则高亮：默认关；规则是 JSON 数组字符串（terminal/highlight.ts）
-  terminal_highlight_enabled: false,
-  // 新装默认带常用规则（只有错误、警告两条开着），总开关仍然默认关
+  // 关键词 / 正则高亮：0.2.7 起默认开；规则是 JSON 数组字符串（terminal/highlight.ts）
+  terminal_highlight_enabled: true,
+  // 新装默认带整组常用规则（错误、警告、成功、IP、网址），五条默认都开着
   terminal_highlight_rules: JSON.stringify(SAMPLE_RULES),
   // 会话日志：默认关；目录留空 = 数据目录下的 session-logs
   session_log_enabled: false,
@@ -379,7 +381,7 @@ systemDarkQuery?.addEventListener("change", (event) => {
   applyAppearance(useSettings.getState());
 });
 
-// 设置还没从库里读回来之前先按默认值（跟随系统）套一次，启动时不会先闪一下没有颜色的白底
+// 设置还没从库里读回来之前先按默认值（深色）套一次，启动时不会先闪一下没有颜色的白底
 if (typeof document !== "undefined") applyAppearance(useSettings.getState());
 
 /**

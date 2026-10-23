@@ -62,6 +62,9 @@ import { useSettings } from "../stores/settings";
 import { useImeDefaultEnglish } from "../terminal/useImeDefaultEnglish";
 import TerminalView from "./TerminalView";
 
+// 关键词高亮默认开着，假终端没有它要的 onScroll / buffer 等钩子；这里测的不是高亮，关掉
+useSettings.setState({ terminal_highlight_enabled: false });
+
 beforeEach(() => {
   vi.useFakeTimers();
   ime.calls.length = 0;

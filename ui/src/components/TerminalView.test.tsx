@@ -17,6 +17,9 @@ import { useSettings } from "../stores/settings";
 import type { TerminalLinkHandlers } from "../terminal/links";
 import TerminalView, { type TerminalHandle } from "./TerminalView";
 
+// 关键词高亮默认开着，假终端没有它要的 onScroll / buffer 等钩子；这里测的不是高亮，关掉
+useSettings.setState({ terminal_highlight_enabled: false });
+
 /** 单格像素尺寸（测试自定；行为只取决于宽高和它的比例）。 */
 const CELL_WIDTH = 8;
 const CELL_HEIGHT = 17;

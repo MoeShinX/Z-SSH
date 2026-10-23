@@ -473,7 +473,7 @@ export const SKINS: Skin[] = [
 export const LIGHT_SKINS = SKINS.filter((skin) => skin.mode === "light");
 export const DARK_SKINS = SKINS.filter((skin) => skin.mode === "dark");
 export const DEFAULT_LIGHT_SKIN = "paper";
-export const DEFAULT_DARK_SKIN = "graphite";
+export const DEFAULT_DARK_SKIN = "dracula";
 
 /** 某个明暗下的皮肤；id 不认识（或明暗对不上）就用这个明暗的默认皮肤。 */
 export function skinFor(mode: UiThemeMode, id: string): Skin {
@@ -613,3 +613,6 @@ export const LEGACY_UI_THEME_MODES: Record<string, UiThemeMode> = {
 
 /** 终端配色设置的特殊值：跟随当前皮肤。 */
 export const TERMINAL_FOLLOW_SKIN = "skin";
+
+/** 终端配色的默认值：Tokyo Night（深色）。设置页下拉里叫「Tokyo Night（深色）」的那一项。 */
+export const DEFAULT_TERMINAL_THEME = "tokyo-night";

@@ -110,4 +110,19 @@ describe("editorModel", () => {
     expect(many.title).toContain("8");
     expect(many.message).toContain("退出程序");
   });
+
+  it("退出时带上其他后果：写在同一个询问里，单个文件和多个文件都一样", () => {
+    const extra = "还有 2 个连接（2 个终端），退出会全部断开。";
+    const one = unsavedPrompt([{ editId: 1, fileName: "a.txt", path: "/a.txt" }], "quit", extra);
+    expect(one.message).toContain(extra);
+    expect(one.message).toContain("继续退出");
+    const many = unsavedPrompt(
+      Array.from({ length: 3 }, (_, i) => ({ editId: i, fileName: `f${i}`, path: `/f${i}` })),
+      "quit",
+      extra,
+    );
+    expect(many.message).toContain(extra);
+    // 没有其他后果：文案不变
+    expect(unsavedPrompt([{ editId: 1, fileName: "a.txt", path: "/a.txt" }], "quit").message).not.toContain("继续退出");
+  });
 });

@@ -18,6 +18,15 @@ const mocks = vi.hoisted(() => ({
   closeHandler: null as ((event: CloseEvent) => void | Promise<void>) | null,
   close: vi.fn(),
   trayHideMain: vi.fn(async () => true),
+  trayShowMain: vi.fn(async () => {}),
+  /** 后端的端口转发状态（phase 字符串）；默认没有转发。 */
+  forwardPhases: [] as string[],
+  /** App 订阅的会话状态回调：测试手动推事件。 */
+  stateHandlers: [] as ((event: unknown) => void)[],
+  /** 每个 pane 的 onReady：测试手动触发，模拟终端量到尺寸、开会话。 */
+  ready: new Map<string, (cols: number, rows: number) => void>(),
+  /** Z-SFTP 文件窗口报上来的会话。 */
+  fileSessionsHandler: null as ((sessions: { sftp_id: string; host_id: number }[]) => void) | null,
   trayShowHint: vi.fn(async () => {}),
   trayUiReady: vi.fn(async (_ready: boolean) => {}),
   trayQuitHandler: null as (() => void) | null,
@@ -37,6 +46,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 
 vi.mock("./api/tray", () => ({
   trayHideMain: mocks.trayHideMain,
+  trayShowMain: mocks.trayShowMain,
   trayShowHint: mocks.trayShowHint,
   trayUiReady: mocks.trayUiReady,
   onTrayQuit: async (handler: () => void) => {
@@ -70,12 +80,15 @@ vi.mock("./api/session", () => ({
   sessionOpen: vi.fn(async () => "s"),
   sessionOpenQuick: vi.fn(async () => "s"),
   sessionDuplicate: vi.fn(async () => "s"),
-  sessionClose: vi.fn(async () => {}),
+  sessionClose: vi.fn(async (_sessionId: string) => {}),
   termWrite: vi.fn(async () => {}),
   termResize: vi.fn(async () => {}),
   termAck: vi.fn(async () => {}),
   sessionsReset: vi.fn(async () => 0),
-  onSessionState: vi.fn(async () => () => {}),
+  onSessionState: vi.fn(async (handler: (event: unknown) => void) => {
+    mocks.stateHandlers.push(handler);
+    return () => {};
+  }),
   onServerStats: vi.fn(async () => () => {}),
   statsSubscribe: vi.fn(async () => 0),
   statsUnsubscribe: vi.fn(async () => {}),
@@ -87,11 +100,46 @@ vi.mock("./api/auth", () => ({
   answerHostKey: vi.fn(async () => {}),
   answerAuth: vi.fn(async () => {}),
 }));
+// 主机页：点一下就让 App 开一个终端标签（再手动触发 onReady 开会话）
 vi.mock("./components/vault/VaultView", () => ({
   HostTreeAside: () => null,
-  default: () => null,
+  default: (props: { onOpenHost: (host: { id: number; name: string }) => void }) => (
+    <button data-testid="open-host" onClick={() => props.onOpenHost({ id: 7, name: "web-1" })}>
+      打开 web-1
+    </button>
+  ),
 }));
-vi.mock("./components/PaneView", () => ({ default: () => null }));
+vi.mock("./components/PaneView", () => ({
+  default: (props: { paneId: string; onReady: (paneId: string, cols: number, rows: number) => void }) => {
+    mocks.ready.set(props.paneId, (cols, rows) => props.onReady(props.paneId, cols, rows));
+    return null;
+  },
+}));
+vi.mock("./api/forwards", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api/forwards")>();
+  return {
+    ...actual,
+    forwardStatuses: vi.fn(async () =>
+      mocks.forwardPhases.map((phase, index) => ({
+        id: index + 1,
+        phase,
+        error: null,
+        listening_port: null,
+        counters: { active: 0, total: 0, bytes_sent: 0, bytes_received: 0 },
+      })),
+    ),
+  };
+});
+vi.mock("./api/fileWindow", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api/fileWindow")>();
+  return {
+    ...actual,
+    onFileSessions: async (handler: (sessions: { sftp_id: string; host_id: number }[]) => void) => {
+      mocks.fileSessionsHandler = handler;
+      return () => {};
+    },
+  };
+});
 vi.mock("./components/titlebar/TopTabs", () => ({ default: () => null }));
 vi.mock("./components/settings/SettingsPage", () => ({ default: () => null }));
 
@@ -131,6 +179,11 @@ beforeEach(() => {
   mocks.close.mockClear();
   mocks.trayHideMain.mockClear();
   mocks.trayHideMain.mockResolvedValue(true);
+  mocks.trayShowMain.mockClear();
+  mocks.forwardPhases = [];
+  mocks.stateHandlers.length = 0;
+  mocks.ready.clear();
+  mocks.fileSessionsHandler = null;
   mocks.trayShowHint.mockClear();
   mocks.trayUiReady.mockClear();
   mocks.closeHandler = null;
@@ -319,5 +372,208 @@ describe("有未保存的编辑器内容时的退出确认（和 UI-4 之前一�
     const after = await requestClose();
     expect(after.prevented).toBe(true);
     expect(mocks.trayHideMain).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("退出时有活动连接要确认（托盘「退出」和 × 退出同一套判断）", () => {
+  const emitState = (event: Record<string, unknown>) =>
+    act(async () => {
+      for (const handler of mocks.stateHandlers) handler(event);
+    });
+
+  /** 开一个终端标签并让它开出会话（id 是 s）。 */
+  async function openTerminal() {
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="open-host"]')!.click();
+    });
+    await waitFor(() => expect(mocks.ready.size).toBe(1));
+    await act(async () => {
+      [...mocks.ready.values()][0](100, 30);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  const dialogs = () => document.querySelectorAll('[role="dialog"]');
+  const buttonByText = (text: string) =>
+    [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === text,
+    );
+  const click = (text: string) =>
+    act(async () => {
+      const button = buttonByText(text);
+      expect(button, `按钮「${text}」`).toBeDefined();
+      button!.click();
+    });
+
+  it("有连着的终端：托盘「退出」叫出窗口并弹确认；取消不退出，确认才退出", async () => {
+    await mountApp();
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connected" });
+
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+    const first = await requestClose();
+    expect(first.prevented).toBe(true);
+    expect(mocks.trayShowMain).toHaveBeenCalledTimes(1);
+    expect(dialogs()).toHaveLength(1);
+    expect(document.body.textContent).toContain("还有 1 个连接（1 个终端），退出会全部断开。");
+    expect(buttonByText("退出")).toBeDefined();
+
+    // 取消：窗口留着，没有再次关闭
+    await click("取消");
+    expect(dialogs()).toHaveLength(0);
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+
+    // 再点托盘「退出」又问；这次确认
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    const second = await requestClose();
+    expect(second.prevented).toBe(true);
+    await click("退出");
+    await waitFor(() => expect(mocks.close).toHaveBeenCalledTimes(3));
+    // 确认之后的那次关闭请求放行
+    const last = await requestClose();
+    expect(last.prevented).toBe(false);
+    expect(mocks.trayHideMain).not.toHaveBeenCalled();
+  });
+
+  it("正在连接的终端也算", async () => {
+    await mountApp();
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connecting" });
+
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    const event = await requestClose();
+    expect(event.prevented).toBe(true);
+    expect(document.body.textContent).toContain("1 个终端");
+  });
+
+  it("只有已断开的会话：不弹，直接放行，也不叫出窗口", async () => {
+    await mountApp();
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connected" });
+    await emitState({ session_id: "s", state: "disconnected", reason: "test" });
+
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    const event = await requestClose();
+    expect(event.prevented).toBe(false);
+    expect(mocks.trayShowMain).not.toHaveBeenCalled();
+    expect(dialogs()).toHaveLength(0);
+  });
+
+  it("没有任何事项：直接放行，不叫出主窗口", async () => {
+    await mountApp();
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    const event = await requestClose();
+    expect(event.prevented).toBe(false);
+    expect(mocks.trayShowMain).not.toHaveBeenCalled();
+    expect(dialogs()).toHaveLength(0);
+  });
+
+  it("端口转发在运行（含启动中）要确认；失败的转发不算", async () => {
+    await mountApp();
+    mocks.forwardPhases = ["failed"];
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    expect((await requestClose()).prevented).toBe(false);
+
+    mocks.forwardPhases = ["running", "starting", "failed"];
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    const event = await requestClose();
+    expect(event.prevented).toBe(true);
+    expect(mocks.trayShowMain).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("还有 2 个连接（2 个端口转发），退出会全部断开。");
+  });
+
+  it("Z-SFTP 文件窗口里打开着的 SFTP 连接也算，几类一起列出", async () => {
+    await mountApp();
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connected" });
+    mocks.forwardPhases = ["running"];
+    await act(async () => {
+      mocks.fileSessionsHandler?.([{ sftp_id: "f1", host_id: 7 }]);
+    });
+
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    await requestClose();
+    expect(document.body.textContent).toContain(
+      "还有 3 个连接（1 个终端、1 个端口转发、1 个 SFTP 连接），退出会全部断开。",
+    );
+  });
+
+  it("点 × 退出（close_action = quit）也走同一个确认", async () => {
+    mocks.settings.set("close_action", JSON.stringify("quit"));
+    await mountApp();
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connected" });
+
+    const event = await requestClose();
+    expect(event.prevented).toBe(true);
+    expect(mocks.trayHideMain).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("1 个终端");
+  });
+
+  it("缩到托盘模式点 ×：有连接也不问，直接隐藏（连接都还在）", async () => {
+    await mountApp();
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connected" });
+
+    const event = await requestClose();
+    expect(event.prevented).toBe(true);
+    expect(mocks.trayHideMain).toHaveBeenCalledTimes(1);
+    expect(mocks.trayShowMain).not.toHaveBeenCalled();
+    expect(dialogs()).toHaveLength(0);
+  });
+
+  it("和未保存的编辑同时存在：只弹一个对话框，两类都列在里面", async () => {
+    await mountApp();
+    const { useEditors } = await import("./stores/editors");
+    useEditors.setState({
+      docs: {
+        1: {
+          editId: 1,
+          fileName: "notes.txt",
+          path: "/tmp/notes.txt",
+          side: "local",
+          hostId: 0,
+          dirty: true,
+        } as never,
+      },
+    });
+    await openTerminal();
+    await emitState({ session_id: "s", state: "connected" });
+
+    await act(async () => {
+      mocks.trayQuitHandler?.();
+    });
+    const event = await requestClose();
+    expect(event.prevented).toBe(true);
+    expect(mocks.trayShowMain).toHaveBeenCalledTimes(1);
+    expect(dialogs()).toHaveLength(1);
+    expect(document.querySelector('[data-action="unsaved-cancel"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("notes.txt");
+    expect(document.body.textContent).toContain("还有 1 个连接（1 个终端），退出会全部断开。");
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-action="unsaved-cancel"]')!.click();
+    });
+    expect(dialogs()).toHaveLength(0);
+    expect(mocks.close).toHaveBeenCalledTimes(1); // 只有托盘退出那一次主动 close()
   });
 });

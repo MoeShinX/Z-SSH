@@ -9,8 +9,10 @@
 //!   **不碰主窗口的 `CloseRequested`**，免得两边同时处理互相打架；JS 要缩到托盘时调
 //!   [`hide_main_window`]（`tray_hide_main` 命令）。
 //! - **托盘图标本身、菜单、左键叫出窗口**：这里。
-//! - **托盘「退出」**：这里只负责把主窗口叫到前面，再通知前端走和点 × 退出同一套确认
-//!   （`tray://quit`）；确认后由前端关主窗口，主窗口销毁 → `app.exit(0)` → 正常的
+//! - **托盘「退出」**：这里只通知前端走和点 × 退出同一套确认（`tray://quit`），**不先叫出主窗口**：
+//!   前端数过未保存修改、传输、活动连接（终端、端口转发、SFTP），没有要确认的就直接关窗口退出，
+//!   窗口不会闪一下；有要确认的才调 `tray_show_main` 叫出窗口再弹对话框。
+//!   确认后由前端关主窗口，主窗口销毁 → `app.exit(0)` → 正常的
 //!   `RunEvent::Exit`（见 `file_window::on_window_destroyed`），清理一项不少。
 //!   前端还没就绪（页面没加载出来）时没人能问确认，直接退出，免得托盘里点了「退出」没反应。
 
@@ -30,7 +32,7 @@ const ID_SHOW: &str = "tray-show";
 const ID_UPDATE: &str = "tray-update";
 const ID_QUIT: &str = "tray-quit";
 
-/// 托盘「退出」→ 前端：走退出确认（未保存修改 / 传输中），确认后退出。
+/// 托盘「退出」→ 前端：走退出确认（未保存修改 / 传输中 / 活动连接），没有要确认的就直接退出。
 pub const QUIT_EVENT: &str = "tray://quit";
 /// 托盘「重启安装」→ 前端：打开已经下载好的更新对话框（由用户在对话框里点「立即重启安装」）。
 pub const OPEN_UPDATE_EVENT: &str = "tray://open-update";
@@ -198,9 +200,8 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>, status: &UpdateStatus) {
     }
 }
 
-/// 托盘「退出」：先把主窗口叫出来（确认对话框要让用户看见），再按 [`quit_route`] 走。
+/// 托盘「退出」：按 [`quit_route`] 走。主窗口留给前端决定要不要叫出来（有确认要问才叫）。
 fn request_quit<R: Runtime>(app: &AppHandle<R>) {
-    crate::focus_main_window(app);
     let ready = app
         .try_state::<TrayState>()
         .is_some_and(|state| state.ui_ready.load(Ordering::SeqCst));
@@ -402,6 +403,45 @@ mod tests {
         assert_eq!(quit_route(true, false), QuitRoute::ExitNow);
         assert_eq!(quit_route(false, true), QuitRoute::ExitNow);
         assert_eq!(quit_route(false, false), QuitRoute::ExitNow);
+    }
+
+    /// 托盘「退出」且界面能回答时：只给前端发 `tray://quit`，不替它把主窗口叫出来
+    /// （没有要确认的事就直接退出，不能先闪一下窗口）；叫出窗口是前端有事要问时自己调的 `tray_show_main`。
+    #[test]
+    fn quit_asks_the_ui_without_showing_the_main_window() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        use tauri::Listener;
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock app");
+        let handle = app.handle();
+        setup(handle, &UpdateStatus::Idle).expect("建托盘");
+        let window = tauri::WebviewWindowBuilder::new(
+            handle,
+            crate::MAIN_LABEL,
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .visible(false)
+        .build()
+        .expect("建主窗口");
+        let visible_before = window.is_visible().ok();
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = received.clone();
+        window.listen(QUIT_EVENT, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        set_ui_ready(handle, true);
+
+        request_quit(handle);
+
+        assert_eq!(received.load(Ordering::SeqCst), 1, "前端收到一次退出请求");
+        assert_eq!(
+            window.is_visible().ok(),
+            visible_before,
+            "后端不先把主窗口叫出来"
+        );
     }
 
     /// 模拟运行时里建托盘（不会在桌面上出现真图标）：状态变成 Ready 时菜单项跟着变，

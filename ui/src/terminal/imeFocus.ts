@@ -1,10 +1,9 @@
-// 输入法默认英文：整个程序里焦点进可输入的地方一律切到英文，只有标了 data-ime="native"
-// 的输入框（AI 对话框）跟随用户自己的中英文状态。请求排成一条队列发给后端。
+// 终端里默认英文：焦点进终端时切到英文，离开终端、进了别的可输入的地方时恢复用户自己的
+// 中英文状态。请求排成一条队列发给后端。
 //
 // 两个区：
-// - 英文区：所有可输入元素（终端、搜索框、路径框、表单、编辑器……），除了跟随区；
-// - 跟随区：自己或祖先带 `data-ime="native"` 的可输入元素。以后别处要跟随用户的输入法，
-//   只要加这个标记，不靠类名或层级去猜。
+// - 英文区：只有终端（xterm 的输入框）；
+// - 跟随区：其余所有可输入元素（AI 对话框、搜索框、路径框、表单、编辑器……），保持用户自己的状态。
 // 不可输入的元素（按钮、空白处、标签……）不属于任何区：焦点落上去什么都不发，保持当前状态。
 //
 // 为什么要自己管：每次焦点变化各发一次 IPC，后端各自在线程池里跑，快速切换时
@@ -73,10 +72,18 @@ export const NON_TEXT_INPUT_TYPES = new Set([
 
 export type ImeZone = "english" | "native";
 
-/** 元素属于哪个区；不可输入的元素（按钮、空白处）返回 null。 */
+/** 终端（xterm）的输入框：只有它算英文区。 */
+const TERMINAL_SELECTOR = ".xterm";
+
+/**
+ * 元素属于哪个区；不可输入的元素（按钮、空白处）返回 null。
+ * 英文区**只有终端**；其余可输入的地方（AI 对话框、搜索框、表单、编辑器……）都跟随用户自己的
+ * 输入法状态（用户 2026-10-23 再次明确）。`data-ime="native"` 标记保留：显式标了的一律算跟随区。
+ */
 export function imeZoneOf(element: Element | null): ImeZone | null {
   if (!element || !isEditableElement(element)) return null;
-  return element.closest(NATIVE_SELECTOR) ? "native" : "english";
+  if (element.closest(NATIVE_SELECTOR)) return "native";
+  return element.closest(TERMINAL_SELECTOR) ? "english" : "native";
 }
 
 export interface ImeFocusController {

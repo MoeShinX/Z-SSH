@@ -3,8 +3,8 @@
 import type { HighlightRule } from "./highlight";
 
 /**
- * 常用规则：新装默认就有这一整组（总开关默认关），只有前两条（错误、警告）默认开着，
- * 后三条（成功、IP、网址）放着但默认关，用户自己按需打开。点「添加常用规则」只补还没有的（按 id 认）。
+ * 常用规则：新装默认就有这一整组，总开关默认开，五条规则（错误、警告、成功、IP、网址）也都默认开着，
+ * 用户自己按需关。点「添加常用规则」只补还没有的（按 id 认）。
  * 前两条沿用最早的示例规则的 id，早先加过示例的用户不会多出重复的两条。
  * 顺序就是优先级：前面的规则标过的地方，后面的不再重叠着标。
  */
@@ -34,7 +34,7 @@ export const SAMPLE_RULES: HighlightRule[] = [
     caseSensitive: false,
     color: "#22c55e",
     background: false,
-    enabled: false,
+    enabled: true,
   },
   {
     id: "sample-ipv4",
@@ -43,7 +43,7 @@ export const SAMPLE_RULES: HighlightRule[] = [
     caseSensitive: false,
     color: "#a855f7",
     background: false,
-    enabled: false,
+    enabled: true,
   },
   {
     id: "sample-url",
@@ -52,7 +52,7 @@ export const SAMPLE_RULES: HighlightRule[] = [
     caseSensitive: false,
     color: "#3b82f6",
     background: false,
-    enabled: false,
+    enabled: true,
   },
 ];
 

@@ -119,12 +119,21 @@ import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import SyncStatusBar from "./components/sync/SyncStatusBar";
 import UpdateBar from "./components/sync/UpdateBar";
 import { startUpdaterEvents, useUpdater } from "./stores/updater";
-import { decideClose, quitVerdict } from "./state/closeBehavior";
+import {
+  countConnections,
+  decideClose,
+  quitConfirmText,
+  quitNotes,
+  quitVerdict,
+  type QuitState,
+} from "./state/closeBehavior";
+import { forwardStatuses } from "./api/forwards";
 import {
   onTrayOpenUpdate,
   onTrayQuit,
   trayHideMain,
   trayShowHint,
+  trayShowMain,
   trayUiReady,
 } from "./api/tray";
 import { startSyncEvents } from "./stores/sync";
@@ -1058,16 +1067,18 @@ export default function App() {
     files: UnsavedFile[];
     reason: UnsavedReason;
     proceed: () => void;
+    /** 退出时除未保存文件外还会发生的事（断开连接、取消传输），写在同一个对话框里。 */
+    extra?: string;
     busy: boolean;
     error: string | null;
   } | null>(null);
   const askUnsaved = useCallback(
-    (files: UnsavedFile[], reason: UnsavedReason, proceed: () => void) => {
+    (files: UnsavedFile[], reason: UnsavedReason, proceed: () => void, extra?: string) => {
       if (files.length === 0) {
         proceed();
         return;
       }
-      setUnsavedAsk({ files, reason, proceed, busy: false, error: null });
+      setUnsavedAsk({ files, reason, proceed, extra, busy: false, error: null });
     },
     [],
   );
@@ -2682,41 +2693,65 @@ export default function App() {
           for (const count of sftpActive.current.values()) total += count;
           let dirtyTotal = 0;
           for (const set of editDirty.current.values()) dirtyTotal += set.size;
-          const verdict = quitVerdict({
+          // 点 × 退出和托盘「退出」都走这里：活动连接（终端、端口转发、SFTP）也算要确认的事。
+          const forwardPhases = exitConfirmed.current
+            ? []
+            : await forwardStatuses()
+                .then((list) => list.map((item) => item.phase))
+                .catch(() => []);
+          const state: QuitState = {
             unsavedDocs: unsaved.length,
             transfers: total,
             dirtyEdits: dirtyTotal,
+            connections: countConnections({
+              tabs: wsRef.current.tabs,
+              panes: wsRef.current.panes,
+              fileWindowSessions: fileSessionsRef.current.size,
+              forwardPhases,
+            }),
             confirmed: exitConfirmed.current,
-          });
+          };
+          const verdict = quitVerdict(state);
           if (verdict.type === "go") return;
           event.preventDefault();
+          // 有事要问：主窗口可能缩在托盘里，先叫出来让用户看见。没事要问时不会走到这里，不会闪一下。
+          void trayShowMain().catch(() => {});
+          /** 用户确认退出：取消传输、关掉所有 SFTP，再真的关窗口。 */
+          const confirmedQuit = () => {
+            exitConfirmed.current = true;
+            if (total > 0) toast.info("正在取消传输并退出…");
+            const closing = [
+              ...wsRef.current.tabs
+                .filter((tab) => tab.sftp?.sftpId)
+                .map((tab) => tab.sftp!.sftpId),
+              ...Object.values(docksRef.current)
+                .filter((dock) => dock.sftpId)
+                .map((dock) => dock.sftpId),
+            ].map((id) => sftpClose(id).catch(() => {}));
+            // 取消传输最多等 12 秒（后端自己最多等 10 秒），再关窗口。
+            void Promise.race([
+              Promise.allSettled(closing),
+              new Promise((resolve) => setTimeout(resolve, 12000)),
+            ]).then(() => getCurrentWindow().close());
+          };
           if (verdict.type === "ask-unsaved") {
-            askUnsavedRef.current(unsaved, "quit", closeToQuit);
+            // 其余原因（连接、传输……）写进同一个对话框；选保存或不保存后一并确认退出。
+            const notes = quitNotes(state);
+            askUnsavedRef.current(
+              unsaved,
+              "quit",
+              notes.length > 0 ? confirmedQuit : closeToQuit,
+              notes.length > 0 ? notes.join("\n") : undefined,
+            );
             return;
           }
-          const text = editConfirmMessage(total, dirtyTotal, "退出程序");
+          const text = quitConfirmText(state);
           setConfirm({
             title: text.title,
             message: text.message,
-            confirmLabel: dirtyTotal > 0 ? "退出并放弃" : "退出并取消",
+            confirmLabel: text.confirmLabel,
             destructive: true,
-            onConfirm: () => {
-              exitConfirmed.current = true;
-              toast.info("正在取消传输并退出…");
-              const closing = [
-                ...wsRef.current.tabs
-                  .filter((tab) => tab.sftp?.sftpId)
-                  .map((tab) => tab.sftp!.sftpId),
-                ...Object.values(docksRef.current)
-                  .filter((dock) => dock.sftpId)
-                  .map((dock) => dock.sftpId),
-              ].map((id) => sftpClose(id).catch(() => {}));
-              // 取消传输最多等 12 秒（后端自己最多等 10 秒），再关窗口。
-              void Promise.race([
-                Promise.allSettled(closing),
-                new Promise((resolve) => setTimeout(resolve, 12000)),
-              ]).then(() => getCurrentWindow().close());
-            },
+            onConfirm: confirmedQuit,
           });
         })
         .then(async (stop) => {
@@ -3328,7 +3363,7 @@ export default function App() {
       )}
       {unsavedAsk && (
         <UnsavedDialog
-          {...unsavedPrompt(unsavedAsk.files, unsavedAsk.reason)}
+          {...unsavedPrompt(unsavedAsk.files, unsavedAsk.reason, unsavedAsk.extra)}
           busy={unsavedAsk.busy}
           error={unsavedAsk.error}
           onSave={() => void answerUnsaved("save")}

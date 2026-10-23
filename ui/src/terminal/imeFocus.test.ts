@@ -50,8 +50,18 @@ function autoSend(answer?: (focused: boolean) => boolean) {
 const makeController = (send: (focused: boolean) => Promise<boolean>) =>
   createImeFocusController(send, RESTORE_MS, LEAVE_MS);
 
-/** 英文区：终端的 textarea、搜索框、表单输入框…… */
+/** 英文区：终端（xterm）里的 textarea。只有终端算英文区。 */
 const makeTextarea = (): HTMLTextAreaElement => {
+  const terminal = document.createElement("div");
+  terminal.className = "xterm";
+  const element = document.createElement("textarea");
+  terminal.appendChild(element);
+  document.body.appendChild(terminal);
+  return element;
+};
+
+/** 不在终端里的普通文本框（AI 输入框以外的跟随区：搜索框、表单……）。 */
+const makePlainTextarea = (): HTMLTextAreaElement => {
   const element = document.createElement("textarea");
   document.body.appendChild(element);
   return element;
@@ -95,21 +105,44 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-describe("英文区：所有可输入的地方（跟随区除外）", () => {
+describe("英文区只有终端，其余可输入的地方跟随用户自己的状态", () => {
+  it("焦点进终端：立即发进入", async () => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeTextarea().focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([true]);
+  });
+
   it.each([
-    ["终端的 textarea", () => makeTextarea()],
     ["主机页搜索框 / 路径框（text input）", () => makeInput("text")],
     ["搜索类输入框", () => makeInput("search")],
     ["表单里的密码框", () => makeInput("password")],
     ["数字框", () => makeInput("number")],
     ["编辑器（可编辑区域）", () => makeEditor()],
-  ])("焦点进 %s：立即发进入", async (_name, make) => {
+    ["终端外的普通文本框", () => makePlainTextarea()],
+  ])("没进过终端，焦点进 %s：什么都不发（保持用户自己的状态）", async (_name, make) => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
     controller.enable();
     make().focus();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(sent).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toEqual([]);
+  });
+
+  it.each([
+    ["搜索框", () => makeInput("search")],
+    ["表单输入框", () => makeInput("text")],
+    ["编辑器", () => makeEditor()],
+  ])("从终端到 %s：延迟后恢复用户自己的状态", async (_name, make) => {
+    const { sent, send } = autoSend();
+    const controller = makeController(send);
+    controller.enable();
+    makeTextarea().focus();
+    make().focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS);
+    expect(sent).toEqual([true, false]);
   });
 
   it("从终端到搜索框：已在英文区，不再发", async () => {
@@ -117,7 +150,7 @@ describe("英文区：所有可输入的地方（跟随区除外）", () => {
     const controller = makeController(send);
     controller.enable();
     const term = makeTextarea();
-    const search = makeInput();
+    const search = makeTextarea();
     term.focus();
     search.focus();
     await vi.advanceTimersByTimeAsync(500);
@@ -130,7 +163,7 @@ describe("英文区：所有可输入的地方（跟随区除外）", () => {
     controller.enable();
     const a = makeTextarea();
     const b = makeTextarea();
-    const search = makeInput();
+    const search = makeTextarea();
     const editor = makeEditor();
     a.focus();
     search.focus();
@@ -146,7 +179,7 @@ describe("英文区：所有可输入的地方（跟随区除外）", () => {
     const controller = makeController(send);
     controller.enable();
     const a = makeTextarea();
-    const b = makeInput();
+    const b = makeTextarea();
     a.focus();
     makeButton().focus();
     await vi.advanceTimersByTimeAsync(300);
@@ -206,7 +239,7 @@ describe("跟随区：data-ime=native", () => {
     ai.focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false]);
-    makeInput().focus();
+    makeTextarea().focus();
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual([true, false, true]);
   });
@@ -226,7 +259,7 @@ describe("跟随区：data-ime=native", () => {
     expect(sent).toEqual([true, false]);
   });
 
-  it("只认标记，不看类名 / 位置：长得像 AI 的输入框没有标记就是英文区", async () => {
+  it("终端里的输入框不看类名：只要在终端里、没有跟随标记，就是英文区", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
     controller.enable();
@@ -403,7 +436,7 @@ describe("请求串行、快速切换不乱序", () => {
     const m = manualSend();
     const controller = makeController(m.send);
     controller.enable();
-    const search = makeInput();
+    const search = makeTextarea();
     const ai = makeNative();
     search.focus();
     ai.focus();
@@ -425,7 +458,7 @@ describe("请求串行、快速切换不乱序", () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
     controller.enable();
-    const search = makeInput();
+    const search = makeTextarea();
     const ai = makeNative();
     for (let i = 0; i < 4; i++) {
       search.focus();
@@ -487,7 +520,7 @@ describe("窗口失去焦点（切到别的程序）", () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
     controller.enable();
-    makeInput().focus();
+    makeTextarea().focus();
     window.dispatchEvent(new Event("blur"));
     await vi.advanceTimersByTimeAsync(LEAVE_MS + 10);
     expect(sent).toEqual([true, false]);
@@ -634,7 +667,7 @@ describe("后端没成功", () => {
     const controller = makeController(send);
     controller.enable();
     const term = makeTextarea();
-    const search = makeInput();
+    const search = makeTextarea();
     term.focus();
     await vi.advanceTimersByTimeAsync(0);
     accept = true;
@@ -656,7 +689,7 @@ describe("后端没成功", () => {
     });
     controller.enable();
     const a = makeTextarea();
-    const b = makeInput();
+    const b = makeTextarea();
     a.focus();
     await vi.advanceTimersByTimeAsync(0);
     b.focus();
@@ -671,7 +704,7 @@ describe("设置开关", () => {
     makeController(send);
     makeTextarea().focus();
     makeNative().focus();
-    makeInput().focus();
+    makeTextarea().focus();
     window.dispatchEvent(new Event("blur"));
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([]);
@@ -680,7 +713,7 @@ describe("设置开关", () => {
   it("打开时焦点已经在英文区：立即进入", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
-    makeInput().focus();
+    makeTextarea().focus();
     controller.enable();
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual([true]);
@@ -709,7 +742,7 @@ describe("设置开关", () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
     const disable = controller.enable();
-    makeInput().focus();
+    makeTextarea().focus();
     makeButton().focus();
     disable();
     await vi.advanceTimersByTimeAsync(0);
@@ -733,10 +766,10 @@ describe("设置开关", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual([true, false]);
     // 开关关着：英文区的输入框也只负责补恢复，不会再切英文
-    makeInput().focus();
+    makeTextarea().focus();
     await vi.advanceTimersByTimeAsync(RESTORE_MS + 10);
     expect(sent).toEqual([true, false, false]);
-    makeInput().focus();
+    makeTextarea().focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true, false, false]);
   });
@@ -761,7 +794,7 @@ describe("设置开关", () => {
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([]);
     controller.enable();
-    makeInput().focus();
+    makeTextarea().focus();
     await vi.advanceTimersByTimeAsync(0);
     expect(sent).toEqual([true]);
   });
@@ -784,10 +817,14 @@ describe("设置开关", () => {
 
 describe("imeZoneOf / isEditableElement", () => {
   it("可输入元素分英文区和跟随区，不可输入的是 null", () => {
-    const input = makeInput();
+    const input = makeTextarea();
     const native = makeNative();
     expect(imeZoneOf(input)).toBe("english");
     expect(imeZoneOf(native)).toBe("native");
+    // 终端外面的可输入元素都跟随用户自己的状态
+    expect(imeZoneOf(makePlainTextarea())).toBe("native");
+    expect(imeZoneOf(makeInput("search"))).toBe("native");
+    expect(imeZoneOf(makeEditor())).toBe("native");
     expect(imeZoneOf(makeButton())).toBeNull();
     expect(imeZoneOf(null)).toBeNull();
     // 标记在不可输入的元素自己身上：它不是输入框，仍是 null
