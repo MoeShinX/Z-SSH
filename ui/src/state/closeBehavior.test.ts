@@ -182,6 +182,7 @@ describe("countConnections", () => {
         d: pane("idle"),
       },
       fileWindowSessions: 0,
+      dockPhases: [],
       forwardPhases: [],
     });
     expect(counts).toEqual({ terminals: 2, forwards: 0, sftp: 0 });
@@ -206,9 +207,21 @@ describe("countConnections", () => {
         e: pane("connected"),
       },
       fileWindowSessions: 2,
+      dockPhases: [],
       forwardPhases: [],
     });
     expect(counts).toEqual({ terminals: 0, forwards: 0, sftp: 4 });
+  });
+
+  it("终端旁停靠的文件面板：正在连、已就绪的算 SFTP，失败的不算；终端断了也照算", () => {
+    const counts = countConnections({
+      tabs: [terminalTab("a")],
+      panes: { a: pane("disconnected") },
+      fileWindowSessions: 1,
+      dockPhases: ["ready", "connecting", "failed"],
+      forwardPhases: [],
+    });
+    expect(counts).toEqual({ terminals: 0, forwards: 0, sftp: 3 });
   });
 
   it("端口转发：启动中、运行中算，失败和其他不算", () => {
@@ -216,6 +229,7 @@ describe("countConnections", () => {
       tabs: [],
       panes: {},
       fileWindowSessions: 0,
+      dockPhases: [],
       forwardPhases: ["starting", "running", "failed", "stopped"],
     });
     expect(counts.forwards).toBe(2);

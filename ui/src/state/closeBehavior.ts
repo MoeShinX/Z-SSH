@@ -92,16 +92,19 @@ export function isLiveSftpPhase(phase: string): boolean {
 
 /**
  * 数一数退出会断开的连接。终端只数终端标签里的 pane（SFTP 标签、编辑器标签里的占位 pane 不算）；
- * SFTP 数主窗口的 SFTP 标签加文件窗口里报上来的会话；转发数由调用方从后端状态里挑出活动的。
+ * SFTP 数主窗口的 SFTP 标签、终端旁停靠的文件面板（每台主机一个，终端断了它也还连着），
+ * 加文件窗口里报上来的会话；转发数由调用方从后端状态里挑出活动的。
  */
 export function countConnections(input: {
   tabs: readonly Pick<Tab, "tree" | "sftp" | "editor">[];
   panes: Readonly<Record<string, Pick<PaneSession, "phase">>>;
   fileWindowSessions: number;
+  /** 停靠文件面板的会话状态（和 SFTP 标签同一套 phase）。 */
+  dockPhases: readonly string[];
   forwardPhases: readonly string[];
 }): ActiveConnections {
   let terminals = 0;
-  let sftp = input.fileWindowSessions;
+  let sftp = input.fileWindowSessions + input.dockPhases.filter(isLiveSftpPhase).length;
   for (const tab of input.tabs) {
     if (tab.sftp) {
       if (isLiveSftpPhase(tab.sftp.phase)) sftp += 1;

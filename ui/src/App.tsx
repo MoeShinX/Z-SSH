@@ -2688,17 +2688,18 @@ export default function App() {
             return;
           }
 
-          const unsaved = unsavedDocs();
-          let total = 0;
-          for (const count of sftpActive.current.values()) total += count;
-          let dirtyTotal = 0;
-          for (const set of editDirty.current.values()) dirtyTotal += set.size;
           // 点 × 退出和托盘「退出」都走这里：活动连接（终端、端口转发、SFTP）也算要确认的事。
+          // 先问完转发状态再读其余状态：等待期间窗口还能输入，不能拿等待前的快照判断。
           const forwardPhases = exitConfirmed.current
             ? []
             : await forwardStatuses()
                 .then((list) => list.map((item) => item.phase))
                 .catch(() => []);
+          const unsaved = unsavedDocs();
+          let total = 0;
+          for (const count of sftpActive.current.values()) total += count;
+          let dirtyTotal = 0;
+          for (const set of editDirty.current.values()) dirtyTotal += set.size;
           const state: QuitState = {
             unsavedDocs: unsaved.length,
             transfers: total,
@@ -2707,6 +2708,7 @@ export default function App() {
               tabs: wsRef.current.tabs,
               panes: wsRef.current.panes,
               fileWindowSessions: fileSessionsRef.current.size,
+              dockPhases: Object.values(docksRef.current).map((dock) => dock.phase),
               forwardPhases,
             }),
             confirmed: exitConfirmed.current,

@@ -140,7 +140,22 @@ vi.mock("./api/fileWindow", async (importOriginal) => {
     },
   };
 });
-vi.mock("./components/titlebar/TopTabs", () => ({ default: () => null }));
+// 顶栏只留打开停靠文件面板的按钮；停靠 SFTP 打开即就绪，面板本身用替身。
+vi.mock("./components/titlebar/TopTabs", () => ({
+  default: (props: { onToggleSftp: () => void }) => (
+    <button data-testid="toggle-sftp" onClick={props.onToggleSftp}>
+      SFTP
+    </button>
+  ),
+}));
+vi.mock("./api/sftp", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api/sftp")>()),
+  sftpOpen: vi.fn(async () => "dock-sftp"),
+  sftpClose: vi.fn(async () => {}),
+}));
+vi.mock("./components/sftp/SftpTabView", () => ({
+  default: () => <div data-testid="active-dock-sftp">SFTP ready</div>,
+}));
 vi.mock("./components/settings/SettingsPage", () => ({ default: () => null }));
 
 function closeEvent(): CloseEvent {
@@ -575,5 +590,76 @@ describe("退出时有活动连接要确认（托盘「退出」和 × 退出同
     });
     expect(dialogs()).toHaveLength(0);
     expect(mocks.close).toHaveBeenCalledTimes(1); // 只有托盘退出那一次主动 close()
+  });
+});
+
+describe("退出判断用等转发查询之后的状态；停靠文件面板也算连接", () => {
+  it("查询转发期间刚变脏的文档也要拦下来确认", async () => {
+    mocks.settings.set("close_action", JSON.stringify("quit"));
+    await mountApp();
+    const { useEditors } = await import("./stores/editors");
+    act(() =>
+      useEditors.setState({
+        docs: {
+          99: {
+            editId: 99,
+            fileName: "late-edit.txt",
+            path: "/tmp/late-edit.txt",
+            side: "local",
+            hostId: 0,
+            dirty: false,
+            version: 0,
+          } as never,
+        },
+      }),
+    );
+    const { forwardStatuses } = await import("./api/forwards");
+    let finish!: () => void;
+    vi.mocked(forwardStatuses).mockImplementationOnce(
+      () => new Promise((resolve) => (finish = () => resolve([]))),
+    );
+    const event = closeEvent();
+    let pending!: Promise<void>;
+    act(() => {
+      pending = Promise.resolve(mocks.closeHandler!(event));
+    });
+    await waitFor(() => expect(finish).toBeTypeOf("function"));
+    // 等转发状态的这段时间里文档变脏了
+    act(() => useEditors.getState().patch(99, { dirty: true, version: 1 }));
+    await act(async () => {
+      finish();
+      await pending;
+    });
+    expect(event.prevented, "不能用查询前的空快照放行").toBe(true);
+  });
+
+  it("终端已断开、停靠的文件面板还连着：也要确认退出", async () => {
+    mocks.settings.set("close_action", JSON.stringify("quit"));
+    await mountApp();
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="open-host"]')!.click();
+    });
+    await waitFor(() => expect(mocks.ready.size).toBe(1));
+    await act(async () => {
+      [...mocks.ready.values()][0](100, 30);
+    });
+    await act(async () => {
+      for (const handler of mocks.stateHandlers) handler({ session_id: "s", state: "connected" });
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="toggle-sftp"]')!.click();
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-testid="active-dock-sftp"]')).not.toBeNull(),
+    );
+    await act(async () => {
+      for (const handler of mocks.stateHandlers) {
+        handler({ session_id: "s", state: "disconnected", reason: "shell exited" });
+      }
+    });
+    expect(document.querySelector('[data-testid="active-dock-sftp"]')).not.toBeNull();
+    const event = await requestClose();
+    expect(event.prevented, "停靠的 SFTP 不能因为终端断了就漏数").toBe(true);
+    expect(document.body.textContent).toContain("还有 1 个连接（1 个 SFTP 连接），退出会全部断开。");
   });
 });
