@@ -52,8 +52,8 @@ export default function HostInfoPanel({
     <section
       data-section="host-info"
       aria-label="主机属性"
-      // 高度固定：切换主机或有无跳板机 / 代理行时，上面的树不会跟着跳
-      className="flex h-[148px] shrink-0 flex-col border-t border-border/60 bg-background text-xs"
+      // 高度固定（放得下 7 行：基本 5 行 + 跳板机 + 代理）：切换主机或有无跳板机 / 代理行时，上面的树不会跟着跳
+      className="flex h-[184px] shrink-0 flex-col border-t border-border/60 bg-background text-xs"
     >
       <header className="flex h-6 shrink-0 items-center justify-between pl-3 pr-1 text-muted-foreground">
         <span className="font-medium">属性</span>
@@ -61,30 +61,38 @@ export default function HostInfoPanel({
           <X size={12} />
         </Button>
       </header>
-      <dl className="min-h-0 flex-1 overflow-y-auto px-3 pb-2">
-        {rows.map((row) => (
-          <div key={row.key} className="grid h-5 grid-cols-[3.5rem_1fr] items-center gap-2">
-            <dt className="truncate text-muted-foreground">{row.label}</dt>
-            <dd
-              title={row.value}
-              className={cn("flex min-w-0 items-center gap-1", row.key === "address" && "group")}
+      {/* 像 Xshell 会话管理器那块表格：外框 + 行间横线 + 标题列和值之间一条竖线，标题列带一点底色 */}
+      <div className="mx-2 mb-2 min-h-0 flex-1 overflow-y-auto">
+        <dl className="overflow-hidden rounded-sm border border-border/60">
+          {rows.map((row) => (
+            <div
+              key={row.key}
+              className="grid h-[22px] grid-cols-[4rem_1fr] items-stretch border-b border-border/60 last:border-b-0"
             >
-              <span className="truncate">{row.value}</span>
-              {row.key === "address" && (
-                <button
-                  type="button"
-                  title="复制地址"
-                  aria-label="复制地址"
-                  onClick={onCopyAddress}
-                  className="flex size-4 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground opacity-0 hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-                >
-                  <Copy size={12} />
-                </button>
-              )}
-            </dd>
-          </div>
-        ))}
-      </dl>
+              <dt className="flex items-center truncate border-r border-border/60 bg-muted/40 px-2 text-muted-foreground">
+                {row.label}
+              </dt>
+              <dd
+                title={row.value}
+                className={cn("flex min-w-0 items-center gap-1 px-2", row.key === "address" && "group")}
+              >
+                <span className="truncate">{row.value}</span>
+                {row.key === "address" && (
+                  <button
+                    type="button"
+                    title="复制地址"
+                    aria-label="复制地址"
+                    onClick={onCopyAddress}
+                    className="flex size-4 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground opacity-0 hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    <Copy size={12} />
+                  </button>
+                )}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </div>
     </section>
   );
 }

@@ -1099,7 +1099,7 @@ function HostCard({
           onDoubleClick={onConnect}
           onKeyDown={(event) => hostKeyDown(event, onConnect, onEdit)}
           className={cn(
-            "group cursor-pointer rounded-lg border bg-card p-4 shadow-sm outline-none transition-colors hover:border-ring/60 hover:bg-accent/30 focus-visible:ring-1 focus-visible:ring-ring/60",
+            "group flex cursor-pointer flex-col rounded-lg border bg-card p-4 shadow-sm outline-none transition-colors hover:border-ring/60 hover:bg-accent/30 focus-visible:ring-1 focus-visible:ring-ring/60",
             selected ? "border-ring/70 bg-accent/40" : "border-border/60",
           )}
         >
@@ -1111,16 +1111,25 @@ function HostCard({
                 {host.username}@{host.host}:{host.port}
               </div>
             </div>
+          </div>
+          {/* 底行贴着卡片底部（mt-auto）：左边标签，右下角常驻「编辑」「连接」。放这里不挤名字，
+              同一排卡片高度不一样时按钮也对齐 */}
+          <div className="mt-auto flex items-end gap-2 pt-3">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+              {groupName && <Badge variant="secondary">{groupName}</Badge>}
+              {host.tags.map((tag) => (
+                <Badge key={tag} variant="outline">
+                  {tag}
+                </Badge>
+              ))}
+              {host.legacy_algorithms && <Badge variant="outline">旧算法</Badge>}
+            </div>
             <div className="flex shrink-0 items-center gap-1">
-              <EditButton
-                onEdit={onEdit}
-                className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
-              />
+              <EditButton onEdit={onEdit} />
               <Button
                 size="icon-sm"
                 variant="secondary"
                 title="连接"
-                className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
                 onClick={(event) => {
                   event.stopPropagation();
                   onConnect();
@@ -1129,15 +1138,6 @@ function HostCard({
                 <Play size={13} />
               </Button>
             </div>
-          </div>
-          <div className="mt-3 flex flex-wrap items-center gap-1">
-            {groupName && <Badge variant="secondary">{groupName}</Badge>}
-            {host.tags.map((tag) => (
-              <Badge key={tag} variant="outline">
-                {tag}
-              </Badge>
-            ))}
-            {host.legacy_algorithms && <Badge variant="outline">旧算法</Badge>}
           </div>
         </div>
       </ContextMenuTrigger>
@@ -1157,7 +1157,7 @@ function HostCard({
   );
 }
 
-/** 主机行（列表视图）。单击选中，双击连接；右侧常显编辑按钮，悬停显示「连接」。 */
+/** 主机行（列表视图）。单击选中，双击连接；右侧常显「编辑」「连接」。 */
 function HostRow({
   host,
   groupName,
@@ -1217,7 +1217,6 @@ function HostRow({
             <Button
               size="sm"
               variant="secondary"
-              className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
               onClick={(event) => {
                 event.stopPropagation();
                 onConnect();
