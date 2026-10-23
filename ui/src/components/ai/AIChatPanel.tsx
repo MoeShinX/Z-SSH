@@ -1507,7 +1507,7 @@ export default function AIChatPanel({
             disabled={disabled}
             placeholder="让 AI 在服务器上做什么…（Enter 发送，打 @ 加主机）"
             style={{ height: inputSize.height }}
-            className="min-h-0 w-full resize-none pr-12 text-xs"
+            className="min-h-0 w-full resize-none pr-12 text-[11.5px] leading-relaxed"
           />
           {running ? (
             <Button

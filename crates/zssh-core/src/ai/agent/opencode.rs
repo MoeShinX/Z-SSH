@@ -913,9 +913,23 @@ pub fn default_label(
     )
 }
 
+/// opencode 自己的免费模型：id 带 `-free`，或者标价输入、输出都是 0（比如 big-pickle）。
+/// 只认 opencode 这家：自定义服务商没填价格时 opencode 也会给 0，不能当免费。
+fn is_free_model(provider_id: &str, model_id: &str, info: &Value) -> bool {
+    if provider_id != "opencode" {
+        return false;
+    }
+    let zero = |v: &Value| v.as_f64() == Some(0.0);
+    model_id.ends_with("-free") || (zero(&info["cost"]["input"]) && zero(&info["cost"]["output"]))
+}
+
 /// 从 `/config/providers` 的响应里展平出模型列表。
+///
+/// 排序：免费模型在前，其余在后；两组里各自按显示名 A→Z（不分大小写）。
+/// 每个模型的思考等级项紧跟在它后面，不参与排序。
 pub fn parse_providers(body: &Value) -> AgentModelCatalog {
-    let mut models = Vec::new();
+    // (是否免费, 排序用的名字, 模型本身 + 它的等级项)
+    let mut groups: Vec<(bool, String, Vec<AgentModel>)> = Vec::new();
     if let Some(providers) = body["providers"].as_array() {
         for provider in providers {
             let provider_id = provider["id"].as_str().unwrap_or("");
@@ -938,16 +952,20 @@ pub fn parse_providers(body: &Value) -> AgentModelCatalog {
                             unavailable: false,
                         })
                         .collect();
-                    models.push(AgentModel {
+                    let key = name.to_lowercase();
+                    let mut group = vec![AgentModel {
                         id,
                         name,
                         unavailable: false,
-                    });
-                    models.extend(variants);
+                    }];
+                    group.extend(variants);
+                    groups.push((is_free_model(provider_id, model_id, info), key, group));
                 }
             }
         }
     }
+    groups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let models = groups.into_iter().flat_map(|(_, _, group)| group).collect();
     AgentModelCatalog {
         models,
         default: None,
@@ -1460,6 +1478,57 @@ mod tests {
     }
 
     #[test]
+    fn free_models_first_then_a_to_z_with_variants_kept_together() {
+        let body = json!({
+            "providers": [
+                {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "models": {"gpt-5.5": {"name": "GPT-5.5", "variants": {"high": {}, "low": {}}}}
+                },
+                {
+                    "id": "deepseek",
+                    "name": "DeepSeek",
+                    "models": {"deepseek-v4-pro": {"name": "DeepSeek V4 Pro"}}
+                },
+                {
+                    "id": "opencode",
+                    "name": "OpenCode Zen",
+                    "models": {
+                        "zeta-free": {"name": "Zeta Free"},
+                        "big-pickle": {"name": "Big Pickle", "cost": {"input": 0, "output": 0}},
+                        "claude-x": {"name": "Claude X", "cost": {"input": 3, "output": 15}}
+                    }
+                },
+                {
+                    // 自定义服务商价格是 0 也不算免费
+                    "id": "local",
+                    "name": "local",
+                    "models": {"aaa": {"name": "aaa", "cost": {"input": 0, "output": 0}}}
+                }
+            ]
+        });
+        let ids: Vec<String> = parse_providers(&body)
+            .models
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "opencode/big-pickle",
+                "opencode/zeta-free",
+                "deepseek/deepseek-v4-pro",
+                "local/aaa",
+                "openai/gpt-5.5",
+                "openai/gpt-5.5/low",
+                "openai/gpt-5.5/high",
+                "opencode/claude-x",
+            ]
+        );
+    }
+
+    #[test]
     fn parses_providers_catalog() {
         let body = json!({
             "providers": [
@@ -1525,9 +1594,9 @@ mod tests {
         });
         let catalog = parse_providers(&body);
         let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
-        // 模型本身在前，等级按强弱排，自定义的 extra 放最后，disabled 的不要
+        // 免费的 x-free（连同两个等级）排最前；模型本身在前，等级按强弱排，自定义的 extra 放最后，disabled 的不要
         assert_eq!(
-            &ids[..6],
+            &ids[3..9],
             &[
                 "opus/claude-sonnet-5",
                 "opus/claude-sonnet-5/low",

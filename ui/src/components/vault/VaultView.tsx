@@ -258,14 +258,14 @@ export default function VaultView({
                 <List size={15} />
               </button>
             </div>
-            <Button variant="outline" size="sm" onClick={onOpenIdentities}>
-              <KeyRound size={14} /> 凭据
+            <Button variant="outline" size="sm" className="h-8 px-2.5 text-[13px]" onClick={onOpenIdentities}>
+              <KeyRound size={13} /> 凭据
             </Button>
-            <Button variant="outline" size="sm" onClick={onOpenProxies}>
-              <Network size={14} /> 代理
+            <Button variant="outline" size="sm" className="h-8 px-2.5 text-[13px]" onClick={onOpenProxies}>
+              <Network size={13} /> 代理
             </Button>
-            <Button variant="outline" size="sm" onClick={() => onOpenForwards(null)}>
-              <ArrowLeftRight size={14} /> 转发
+            <Button variant="outline" size="sm" className="h-8 px-2.5 text-[13px]" onClick={() => onOpenForwards(null)}>
+              <ArrowLeftRight size={13} /> 转发
             </Button>
           </div>
         </header>
