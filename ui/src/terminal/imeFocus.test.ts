@@ -55,6 +55,7 @@ const makeTextarea = (): HTMLTextAreaElement => {
   const terminal = document.createElement("div");
   terminal.className = "xterm";
   const element = document.createElement("textarea");
+  element.setAttribute("data-ime", "terminal"); // TerminalView 打开 xterm 后给它打的标记
   terminal.appendChild(element);
   document.body.appendChild(terminal);
   return element;
@@ -259,17 +260,21 @@ describe("跟随区：data-ime=native", () => {
     expect(sent).toEqual([true, false]);
   });
 
-  it("终端里的输入框不看类名：只要在终端里、没有跟随标记，就是英文区", async () => {
+  it("只认终端自己的标记，不看类名：终端的 textarea 换了类名仍是英文区，标记不对的不是", async () => {
     const { sent, send } = autoSend();
     const controller = makeController(send);
     controller.enable();
-    const lookalike = makeTextarea();
-    lookalike.className = "ai-chat-input native";
-    lookalike.setAttribute("data-ime", "english");
+    const renamed = makeTextarea();
+    renamed.className = "ai-chat-input native";
     makeTextarea().focus();
-    lookalike.focus();
+    renamed.focus();
     await vi.advanceTimersByTimeAsync(500);
     expect(sent).toEqual([true]);
+    const wrongTag = makeTextarea();
+    wrongTag.setAttribute("data-ime", "english");
+    wrongTag.focus();
+    await vi.advanceTimersByTimeAsync(RESTORE_MS);
+    expect(sent).toEqual([true, false]);
   });
 
   it("跟随区 → 按钮 / 空白处：不发，保持当前状态", async () => {
@@ -825,6 +830,10 @@ describe("imeZoneOf / isEditableElement", () => {
     expect(imeZoneOf(makePlainTextarea())).toBe("native");
     expect(imeZoneOf(makeInput("search"))).toBe("native");
     expect(imeZoneOf(makeEditor())).toBe("native");
+    // 只认终端自己那个打了标记的 textarea：同一个 .xterm 容器里别的输入框不算
+    const stray = document.createElement("textarea");
+    input.parentElement!.appendChild(stray);
+    expect(imeZoneOf(stray)).toBe("native");
     expect(imeZoneOf(makeButton())).toBeNull();
     expect(imeZoneOf(null)).toBeNull();
     // 标记在不可输入的元素自己身上：它不是输入框，仍是 null

@@ -18,6 +18,7 @@ import {
   type TerminalLinkHandlers,
 } from "../terminal/links";
 import { applyTerminalTheme, createTerminal, loadWebglRenderer } from "../terminal/terminal";
+import { TERMINAL_IME_ATTRIBUTE, TERMINAL_IME_VALUE } from "../terminal/imeFocus";
 import {
   multilinePaste,
   swallowsWithoutSelection,
@@ -207,6 +208,8 @@ export default function TerminalView({
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
     terminal.open(container);
+    // 只让 xterm 实际接收键盘输入的那个 textarea 进英文区（输入法），不靠容器类名去猜
+    terminal.textarea?.setAttribute(TERMINAL_IME_ATTRIBUTE, TERMINAL_IME_VALUE);
     loadWebglRenderer(terminal);
 
     // 选中即复制：xterm 的选区变了就把文字写进剪贴板

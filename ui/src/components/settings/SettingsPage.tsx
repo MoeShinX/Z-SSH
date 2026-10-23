@@ -408,7 +408,7 @@ function TerminalSection() {
         </SettingRow>
         <SettingRow
           title="终端里自动切到英文输入"
-          description="焦点进终端时把输入法切成英文，离开终端回到其他输入框（AI 对话框、搜索框、编辑器等）时恢复你原来的中英文状态；要在终端里打中文按 Shift 切换。微软拼音、五笔支持；部分第三方输入法可能不响应。"
+          description="焦点进终端时关闭输入法（直接打英文），离开终端回到其他输入框（AI 对话框、搜索框、编辑器等）时重新打开；要在终端里打中文，按 Ctrl+空格 或点输入法图标打开。微软拼音、百度拼音等都支持。"
         >
           <Switch
             checked={settings.terminal_ime_english}

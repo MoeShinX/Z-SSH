@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-//! 默认英文输入的接线：设置打开时，终端和别的输入框都按英文区处理，AI 输入框（带标记）跟随用户；
+//! 终端里切英文的接线：设置打开时只有终端是英文区，其余输入框（AI 输入框、搜索框……）跟随用户；
 //! 设置里关掉就什么都不做。请求排队、延迟、补恢复等细节在 terminal/imeFocus.test.ts。
 
 import { act, cleanup, render } from "@testing-library/react";
@@ -35,8 +35,12 @@ vi.mock("../terminal/terminal", () => {
       return ime.textarea ?? undefined;
     },
     open(el: HTMLElement) {
+      // 和真的 xterm 一样：输入框在 .xterm 容器里（输入法只把终端当英文区，靠的就是它）
+      const root = document.createElement("div");
+      root.className = "xterm";
       ime.textarea = document.createElement("textarea");
-      el.appendChild(ime.textarea);
+      root.appendChild(ime.textarea);
+      el.appendChild(root);
     },
     loadAddon() {},
     onData: () => ({ dispose() {} }),
@@ -170,7 +174,7 @@ describe("别的窗口被关掉、恢复没成功（ime_restore_pending）", () 
   });
 });
 
-describe("默认使用英文输入", () => {
+describe("终端里自动切到英文输入", () => {
   it("终端获得焦点切英文，焦点进了 AI 输入框才恢复", async () => {
     useSettings.setState({ terminal_ime_english: true, loaded: true });
     mount();
@@ -200,24 +204,20 @@ describe("默认使用英文输入", () => {
     expect(ime.calls).toEqual([true, false]);
   });
 
-  it("终端以外的输入框（搜索框、表单）同样是英文区；从 AI 输入框回到它们再进入", async () => {
+  it("终端以外的输入框（搜索框、表单）跟随用户：不切英文；从终端进去时恢复", async () => {
     useSettings.setState({ terminal_ime_english: true, loaded: true });
     mount();
     const search = document.createElement("input");
     document.body.appendChild(search);
-    const ai = makeAi();
     act(() => search.focus());
     await settle();
-    expect(ime.calls).toEqual([true]);
+    expect(ime.calls).toEqual([]);
     act(() => ime.textarea?.focus());
     await settle();
-    expect(ime.calls).toEqual([true]); // 已在英文区
-    act(() => ai.focus());
-    await settle();
-    expect(ime.calls).toEqual([true, false]);
+    expect(ime.calls).toEqual([true]);
     act(() => search.focus());
     await settle();
-    expect(ime.calls).toEqual([true, false, true]);
+    expect(ime.calls).toEqual([true, false]);
   });
 
   it("设置里关掉：不碰输入法", async () => {

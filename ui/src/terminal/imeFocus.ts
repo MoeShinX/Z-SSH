@@ -10,7 +10,7 @@
 // 先后顺序不保证（"恢复"先到、"切英文"后到，最后停在英文）。这里保证：
 // - 请求一个接一个发，上一个有结果才发下一个；
 // - 焦点进英文区：立即发"进入"；已经在英文区（lastSent 为 true）就什么都不发，
-//   所以英文区之间来回切换（终端 → 搜索框 → 另一个终端）不会重复发；
+//   所以两个终端之间来回切换不会重复发；
 // - 焦点进跟随区：稍等一下再发"离开"（恢复用户原来的模式）。离开英文区时焦点若落在
 //   不可输入的地方，Chromium 会把窗口的输入法上下文解除关联，这时写转换模式没有作用对象；
 //   所以只有焦点真正落在跟随区的输入框、输入法重新关联好以后才恢复；
@@ -72,8 +72,9 @@ export const NON_TEXT_INPUT_TYPES = new Set([
 
 export type ImeZone = "english" | "native";
 
-/** 终端（xterm）的输入框：只有它算英文区。 */
-const TERMINAL_SELECTOR = ".xterm";
+/** TerminalView 打开 xterm 后，给它实际接收键盘输入的 textarea 打上这个标记；只有它算英文区。 */
+export const TERMINAL_IME_ATTRIBUTE = "data-ime";
+export const TERMINAL_IME_VALUE = "terminal";
 
 /**
  * 元素属于哪个区；不可输入的元素（按钮、空白处）返回 null。
@@ -83,7 +84,10 @@ const TERMINAL_SELECTOR = ".xterm";
 export function imeZoneOf(element: Element | null): ImeZone | null {
   if (!element || !isEditableElement(element)) return null;
   if (element.closest(NATIVE_SELECTOR)) return "native";
-  return element.closest(TERMINAL_SELECTOR) ? "english" : "native";
+  return element instanceof HTMLTextAreaElement &&
+    element.getAttribute(TERMINAL_IME_ATTRIBUTE) === TERMINAL_IME_VALUE
+    ? "english"
+    : "native";
 }
 
 export interface ImeFocusController {

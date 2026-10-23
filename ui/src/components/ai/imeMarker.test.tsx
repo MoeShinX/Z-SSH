@@ -57,11 +57,14 @@ afterEach(() => {
 });
 
 describe("AI 对话输入框是输入法的跟随区", () => {
-  it("输入框带 data-ime=native 且是唯一一个；其余输入框默认英文", async () => {
+  it("输入框带 data-ime=native 且是唯一一个；只有终端切英文，搜索框等跟随用户", async () => {
     render(
       <>
         <Probe />
         <input aria-label="search" />
+        <div className="xterm">
+          <textarea aria-label="terminal" data-ime="terminal" />
+        </div>
         <AIChatPanel
           tabId="tab-1"
           sessions={[{ sessionId: "sess-1", hostId: 1, hostLabel: "web-1", username: "root" }]}
@@ -80,6 +83,12 @@ describe("AI 对话输入框是输入法的跟随区", () => {
     const search = screen.getByLabelText("search");
     await act(async () => {
       search.focus();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(ime.calls).toEqual([]);
+    const terminal = screen.getByLabelText("terminal");
+    await act(async () => {
+      terminal.focus();
       await vi.advanceTimersByTimeAsync(300);
     });
     expect(ime.calls).toEqual([true]);
