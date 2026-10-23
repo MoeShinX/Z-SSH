@@ -24,5 +24,7 @@
 }
 
 @import "tailwindcss";
+/* dark: 跟着应用自己的明暗走（uiThemes.ts 往 <html> 上加 .dark / .light），不跟系统设置：Tailwind v4 默认按 prefers-color-scheme。 */
+@custom-variant dark (&:where(.dark, .dark *));
 /* 设计基础：主题令牌和全局样式，来自 Netcatty 的 index.css */
 @import "./styles/theme.css";
