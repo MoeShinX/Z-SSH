@@ -63,6 +63,12 @@ export function clickHostInfo(hostId: number, clickCount = 1) {
   }
 }
 
+/** 直接展开这台的属性（不当成「再点一下收起」）：主机页右边的卡片 / 列表单击用（AUDIT-5 AUD-02）。 */
+export function showHostInfo(hostId: number) {
+  cancelPendingCollapse();
+  set(hostId);
+}
+
 /** 点面板右上角的 ×。 */
 export function closeHostInfo() {
   cancelPendingCollapse();

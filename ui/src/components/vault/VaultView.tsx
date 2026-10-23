@@ -87,6 +87,7 @@ import {
   cancelPendingCollapse,
   clickHostInfo,
   closeHostInfo,
+  showHostInfo,
   useHostInfoId,
 } from "../../state/hostInfoPanel";
 import HostInfoPanel from "./HostInfoPanel";
@@ -210,6 +211,12 @@ export default function VaultView({
   };
 
 
+  /** 右边卡片 / 列表单击：选中，并让左边树底部的属性面板跟着显示这台（再点不收起）。 */
+  const selectCard = (host: Host) => {
+    hostActions.select(host);
+    showHostInfo(host.id);
+  };
+
   const copyHost = (host: Host, kind: HostCopyKind) => {
     const text = hostCopyText(host, kind);
     void navigator.clipboard
@@ -304,7 +311,7 @@ export default function VaultView({
                   onConnect={() => onOpenHost(host)}
                   onOpenSftp={() => onOpenSftp(host)}
                   selected={selectedHostId === host.id}
-                  onSelect={() => hostActions.select(host)}
+                  onSelect={() => selectCard(host)}
                   onEdit={() => hostActions.edit?.(host)}
                   onDelete={() => onDeleteHost(host)}
                   onCopy={(kind) => copyHost(host, kind)}
@@ -324,7 +331,7 @@ export default function VaultView({
                   selected={selectedHostId === host.id}
                   onConnect={() => onOpenHost(host)}
                   onOpenSftp={() => onOpenSftp(host)}
-                  onSelect={() => hostActions.select(host)}
+                  onSelect={() => selectCard(host)}
                   onEdit={() => hostActions.edit?.(host)}
                   onDelete={() => onDeleteHost(host)}
                   onCopy={(kind) => copyHost(host, kind)}

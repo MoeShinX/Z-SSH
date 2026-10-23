@@ -99,6 +99,19 @@ for (const { mode, section } of cases) {
       expect(item(2).getAttribute("data-selected")).toBe("true");
     });
 
+    it("单击后左边树底部的属性面板跟着显示这台；再点同一台不收起，换一台跟着换", () => {
+      render(<VaultView {...props()} />);
+      const info = () => document.querySelector('[data-section="host-info"]');
+      expect(info()).toBeNull();
+      fireEvent.click(item(1));
+      expect(info()).not.toBeNull();
+      const first = info()?.textContent ?? "";
+      fireEvent.click(item(1));
+      expect(info()?.textContent).toBe(first);
+      fireEvent.click(item(2));
+      expect(info()?.textContent).not.toBe(first);
+    });
+
     it("和左边树共用选中：树里单击一台，右边对应的卡片 / 行也高亮；反过来树里的行也高亮", () => {
       useSettings.setState({ "layout.vault_expanded": UNGROUPED_KEY });
       const handlers = props();
