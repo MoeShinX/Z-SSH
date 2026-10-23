@@ -11,6 +11,82 @@ export interface QuickCommand {
   group?: string;
   /** 发送后自动回车（执行）；false 只填进去，让用户改完再按回车。 */
   enter?: boolean;
+  /** 预设颜色 id；不设 = 默认（无色）。 */
+  color?: QuickCommandColor;
+}
+
+/** 预设颜色的 id（固定这 8 个；存进同步配置里，别改名）。 */
+export const QUICK_COMMAND_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"] as const;
+export type QuickCommandColor = (typeof QUICK_COMMAND_COLORS)[number];
+
+export interface QuickCommandColorStyle {
+  /** 中文名（色块的 aria-label / 提示）。 */
+  label: string;
+  /** 命令栏按钮：淡底色 + 细边框（ring 不占布局，不改按钮尺寸）+ 悬停加深。文字保持正常前景色。 */
+  button: string;
+  /** 命令栏按钮左边的小图标。 */
+  icon: string;
+  /** 管理面板列表里名字前面的小圆点、编辑表单里的色块。 */
+  dot: string;
+}
+
+// Tailwind 只认完整写出来的类名，所以每个颜色逐条列全，不拼字符串。
+export const QUICK_COMMAND_COLOR_STYLES: Record<QuickCommandColor, QuickCommandColorStyle> = {
+  red: {
+    label: "红",
+    button: "bg-red-500/15 ring-1 ring-inset ring-red-500/40 hover:bg-red-500/25 active:bg-red-500/30",
+    icon: "text-red-500",
+    dot: "bg-red-500",
+  },
+  orange: {
+    label: "橙",
+    button: "bg-orange-500/15 ring-1 ring-inset ring-orange-500/40 hover:bg-orange-500/25 active:bg-orange-500/30",
+    icon: "text-orange-500",
+    dot: "bg-orange-500",
+  },
+  yellow: {
+    label: "黄",
+    button: "bg-yellow-500/15 ring-1 ring-inset ring-yellow-500/40 hover:bg-yellow-500/25 active:bg-yellow-500/30",
+    icon: "text-yellow-600 dark:text-yellow-400",
+    dot: "bg-yellow-500",
+  },
+  green: {
+    label: "绿",
+    button: "bg-green-500/15 ring-1 ring-inset ring-green-500/40 hover:bg-green-500/25 active:bg-green-500/30",
+    icon: "text-green-600 dark:text-green-500",
+    dot: "bg-green-500",
+  },
+  teal: {
+    label: "青",
+    button: "bg-teal-500/15 ring-1 ring-inset ring-teal-500/40 hover:bg-teal-500/25 active:bg-teal-500/30",
+    icon: "text-teal-600 dark:text-teal-400",
+    dot: "bg-teal-500",
+  },
+  blue: {
+    label: "蓝",
+    button: "bg-blue-500/15 ring-1 ring-inset ring-blue-500/40 hover:bg-blue-500/25 active:bg-blue-500/30",
+    icon: "text-blue-500",
+    dot: "bg-blue-500",
+  },
+  purple: {
+    label: "紫",
+    button: "bg-purple-500/15 ring-1 ring-inset ring-purple-500/40 hover:bg-purple-500/25 active:bg-purple-500/30",
+    icon: "text-purple-500",
+    dot: "bg-purple-500",
+  },
+  pink: {
+    label: "粉",
+    button: "bg-pink-500/15 ring-1 ring-inset ring-pink-500/40 hover:bg-pink-500/25 active:bg-pink-500/30",
+    icon: "text-pink-500",
+    dot: "bg-pink-500",
+  },
+};
+
+/** 未知值（比如以后新版本加的颜色）当作没设。 */
+export function normalizeQuickCommandColor(value: unknown): QuickCommandColor | undefined {
+  return typeof value === "string" && (QUICK_COMMAND_COLORS as readonly string[]).includes(value)
+    ? (value as QuickCommandColor)
+    : undefined;
 }
 
 export const NAME_MAX = 100;
@@ -30,7 +106,7 @@ export function parseQuickCommands(raw: string): QuickCommand[] {
   const out: QuickCommand[] = [];
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
-    const { id, name, command, group, enter } = item as Record<string, unknown>;
+    const { id, name, command, group, enter, color } = item as Record<string, unknown>;
     if (typeof id !== "string" || typeof name !== "string" || typeof command !== "string") continue;
     out.push({
       id,
@@ -38,6 +114,7 @@ export function parseQuickCommands(raw: string): QuickCommand[] {
       command,
       group: typeof group === "string" && group.trim() !== "" ? group.trim() : undefined,
       enter: enter !== false,
+      color: normalizeQuickCommandColor(color),
     });
   }
   return out;
@@ -45,12 +122,13 @@ export function parseQuickCommands(raw: string): QuickCommand[] {
 
 export function serializeQuickCommands(list: QuickCommand[]): string {
   return JSON.stringify(
-    list.map(({ id, name, command, group, enter }) => ({
+    list.map(({ id, name, command, group, enter, color }) => ({
       id,
       name,
       command,
       ...(group ? { group } : {}),
       enter: enter !== false,
+      ...(normalizeQuickCommandColor(color) ? { color } : {}),
     })),
   );
 }

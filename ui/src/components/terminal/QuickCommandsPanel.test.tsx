@@ -3,6 +3,7 @@
 //! 上移 / 下移只在分组内动、搜索时禁用。
 
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../api/settings", () => ({
@@ -11,6 +12,7 @@ vi.mock("../../api/settings", () => ({
 }));
 
 import type { QuickCommand } from "../../state/quickCommands";
+import QuickCommandBar from "./QuickCommandBar";
 import QuickCommandsPanel from "./QuickCommandsPanel";
 
 afterEach(cleanup);
@@ -223,5 +225,108 @@ describe("分组输入框（可输入的下拉）", () => {
     view.view.unmount();
     setup([cmd("p")], { initialEditId: "new" });
     expect(screen.queryByLabelText("展开选项")).toBeNull();
+  });
+});
+
+describe("颜色", () => {
+  const radios = () => screen.getAllByRole("radio");
+  const radio = (name: string) => screen.getByRole("radio", { name });
+  const dotOf = (id: string) => row(id).querySelector("[data-color-dot]") as HTMLElement;
+  const barButton = (id: string) => document.querySelector(`[data-quick-command="${id}"]`) as HTMLElement;
+
+  /** 面板和命令栏共用一份列表，像 App 里一样。 */
+  function Both({ initial, initialEditId }: { initial: QuickCommand[]; initialEditId?: string }) {
+    const [list, setList] = useState(initial);
+    return (
+      <>
+        <QuickCommandsPanel
+          commands={list}
+          onChange={setList}
+          initialEditId={initialEditId}
+          onClose={vi.fn()}
+          onError={vi.fn()}
+        />
+        <QuickCommandBar
+          commands={list}
+          groups={[]}
+          group=""
+          onGroupChange={vi.fn()}
+          onRun={vi.fn()}
+          onManage={vi.fn()}
+          onCreate={vi.fn()}
+          onEdit={vi.fn()}
+          onDelete={vi.fn()}
+          broadcast={false}
+          paneCount={1}
+          onToggleBroadcast={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  it("表单里一排色块：默认 + 8 个预设，radiogroup，新建时选中「默认」", () => {
+    setup(LIST, { initialEditId: "new" });
+    expect(screen.getByRole("radiogroup", { name: "颜色" })).toBeTruthy();
+    expect(radios().map((el) => el.getAttribute("aria-label"))).toEqual([
+      "默认", "红", "橙", "黄", "绿", "青", "蓝", "紫", "粉",
+    ]);
+    expect(radio("默认").getAttribute("aria-checked")).toBe("true");
+    expect(radios().filter((el) => el.getAttribute("aria-checked") === "true").length).toBe(1);
+  });
+
+  it("选颜色后保存：onChange 带上 color", () => {
+    const { onChange } = setup([cmd("a")], { initialEditId: "a" });
+    fireEvent.click(radio("蓝"));
+    expect(radio("蓝").getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(screen.getByText("保存"));
+    expect(onChange.mock.calls[0][0][0]).toMatchObject({ id: "a", color: "blue" });
+  });
+
+  it("编辑已有颜色的命令：当前色选中；改回默认保存后 color 去掉", () => {
+    const { onChange } = setup([{ ...cmd("a"), color: "blue" }], { initialEditId: "a" });
+    expect(radio("蓝").getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(radio("默认"));
+    fireEvent.click(screen.getByText("保存"));
+    expect(onChange.mock.calls[0][0][0].color).toBeUndefined();
+  });
+
+  it("保存后列表有小圆点、命令栏按钮带样式；改回默认后都去掉", () => {
+    render(<Both initial={[cmd("a"), cmd("b")]} initialEditId="a" />);
+    expect(dotOf("a").getAttribute("data-color-dot")).toBe("none");
+    expect(barButton("a").className).toContain("hover:bg-accent");
+    fireEvent.click(radio("绿"));
+    fireEvent.click(screen.getByText("保存"));
+    expect(dotOf("a").className).toContain("bg-green-500");
+    expect(dotOf("a").getAttribute("data-color-dot")).toBe("green");
+    expect(barButton("a").className).toContain("bg-green-500/15");
+    // 没改的那条不受影响
+    expect(dotOf("b").getAttribute("data-color-dot")).toBe("none");
+    expect(barButton("b").className).not.toContain("green");
+
+    fireEvent.click(row("a").querySelector('button[title="编辑"]') as HTMLElement);
+    fireEvent.click(radio("默认"));
+    fireEvent.click(screen.getByText("保存"));
+    expect(dotOf("a").getAttribute("data-color-dot")).toBe("none");
+    expect(dotOf("a").className).not.toContain("bg-green");
+    expect(barButton("a").className).not.toContain("green");
+    expect(barButton("a").className).toContain("hover:bg-accent");
+  });
+
+  it("键盘：只有选中的色块在 Tab 顺序里；方向键切换并选中（首尾循环）", () => {
+    setup([cmd("a")], { initialEditId: "a" });
+    expect(radios().filter((el) => el.tabIndex === 0).length).toBe(1);
+    expect(radio("默认").tabIndex).toBe(0);
+    radio("默认").focus();
+    fireEvent.keyDown(radio("默认"), { key: "ArrowRight" });
+    expect(radio("红").getAttribute("aria-checked")).toBe("true");
+    expect(document.activeElement).toBe(radio("红"));
+    expect(radio("红").tabIndex).toBe(0);
+    expect(radio("默认").tabIndex).toBe(-1);
+    fireEvent.keyDown(radio("红"), { key: "ArrowLeft" });
+    expect(radio("默认").getAttribute("aria-checked")).toBe("true");
+    fireEvent.keyDown(radio("默认"), { key: "ArrowLeft" });
+    expect(radio("粉").getAttribute("aria-checked")).toBe("true");
+    fireEvent.keyDown(radio("粉"), { key: "ArrowDown" });
+    expect(radio("默认").getAttribute("aria-checked")).toBe("true");
   });
 });

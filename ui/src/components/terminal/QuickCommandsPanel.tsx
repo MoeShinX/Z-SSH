@@ -1,7 +1,7 @@
 //! 管理快捷命令的侧面板（和代理、凭据面板同一种样式）：列表 + 选中后在下面编辑。
 
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Pencil, Plus, Search, Trash2, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "../../lib/utils";
 import {
@@ -10,11 +10,14 @@ import {
   groupsOf,
   moveQuickCommandInGroup,
   newQuickCommandId,
+  QUICK_COMMAND_COLOR_STYLES,
+  QUICK_COMMAND_COLORS,
   searchQuickCommands,
   sectionsOfQuickCommands,
   upsertQuickCommand,
   validateQuickCommand,
   type QuickCommand,
+  type QuickCommandColor,
 } from "../../state/quickCommands";
 import {
   AsidePanel,
@@ -45,9 +48,11 @@ interface Draft {
   group: string;
   command: string;
   enter: boolean;
+  /** undefined = 默认（无色）。 */
+  color: QuickCommandColor | undefined;
 }
 
-const EMPTY: Draft = { id: null, name: "", group: "", command: "", enter: false };
+const EMPTY: Draft = { id: null, name: "", group: "", command: "", enter: false, color: undefined };
 
 function draftOf(command: QuickCommand): Draft {
   return {
@@ -56,7 +61,68 @@ function draftOf(command: QuickCommand): Draft {
     group: command.group ?? "",
     command: command.command,
     enter: command.enter !== false,
+    color: command.color,
   };
+}
+
+/** 色块单选（radiogroup）：第一个是「默认」（空心圈 + 斜线），后面是预设色；方向键切换并选中，Tab 只停在选中的那个上。 */
+function ColorPicker({
+  value,
+  onChange,
+}: {
+  value: QuickCommandColor | undefined;
+  onChange: (color: QuickCommandColor | undefined) => void;
+}) {
+  const options: (QuickCommandColor | undefined)[] = [undefined, ...QUICK_COMMAND_COLORS];
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const selected = Math.max(0, options.indexOf(value));
+  const select = (index: number) => {
+    const next = (index + options.length) % options.length;
+    onChange(options[next]);
+    refs.current[next]?.focus();
+  };
+  return (
+    <div role="radiogroup" aria-label="颜色" className="flex flex-wrap items-center gap-2">
+      {options.map((color, index) => {
+        const active = index === selected;
+        const label = color ? QUICK_COMMAND_COLOR_STYLES[color].label : "默认";
+        return (
+          <button
+            key={color ?? "default"}
+            ref={(element) => {
+              refs.current[index] = element;
+            }}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            aria-label={label}
+            title={label}
+            data-color-option={color ?? "default"}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onChange(color)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+                event.preventDefault();
+                select(index + 1);
+              } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+                event.preventDefault();
+                select(index - 1);
+              }
+            }}
+            className={cn(
+              "relative h-5 w-5 shrink-0 cursor-pointer rounded-full outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+              color ? QUICK_COMMAND_COLOR_STYLES[color].dot : "border border-muted-foreground/60 bg-transparent",
+              active && "ring-2 ring-foreground ring-offset-2 ring-offset-background",
+            )}
+          >
+            {!color && (
+              <span className="pointer-events-none absolute left-1/2 top-1/2 h-px w-3.5 -translate-x-1/2 -translate-y-1/2 -rotate-45 bg-muted-foreground/70" />
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function QuickCommandsPanel({
@@ -111,6 +177,12 @@ export default function QuickCommandsPanel({
           onClick={() => setDraft(draftOf(command))}
           className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left"
         >
+          {/* 没颜色的留一个同样大小的空位，名字对得齐 */}
+          <span
+            aria-hidden
+            data-color-dot={command.color ?? "none"}
+            className={cn("h-2 w-2 shrink-0 rounded-full", command.color && QUICK_COMMAND_COLOR_STYLES[command.color].dot)}
+          />
           <span className="min-w-0 flex-1">
             <span className="block truncate text-sm">{command.name}</span>
             <span className="block truncate font-mono text-xs text-muted-foreground">
@@ -177,6 +249,7 @@ export default function QuickCommandsPanel({
       command: draft.command,
       group: draft.group.trim() || undefined,
       enter: draft.enter,
+      color: draft.color,
     };
     onChange(upsertQuickCommand(commands, item));
     setDraft(null);
@@ -297,6 +370,13 @@ export default function QuickCommandsPanel({
                 placeholder="例如：Debian、面板安装、测试脚本"
                 aria-label="分组"
               />
+            </div>
+            <div className="space-y-1.5">
+              <Label>
+                颜色
+                <span className="ml-2 text-xs font-normal text-muted-foreground">可选</span>
+              </Label>
+              <ColorPicker value={draft.color} onChange={(color) => setDraft({ ...draft, color })} />
             </div>
             <div className="space-y-1.5">
               <Label>命令</Label>

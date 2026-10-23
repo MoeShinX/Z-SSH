@@ -205,3 +205,30 @@ describe("命令栏拖动条", () => {
     expect(live.result.current).toBe(QUICK_BAR_DEFAULT_HEIGHT);
   });
 });
+
+describe("快捷命令按钮颜色", () => {
+  const button = (id: string) => document.querySelector(`[data-quick-command="${id}"]`) as HTMLElement;
+
+  it("有颜色的按钮带淡底色 + 边框 + 彩色图标，文字保持正常前景色", () => {
+    render(
+      <QuickCommandBar
+        {...props({ commands: [{ id: "a", name: "危险", command: "rm -rf x", enter: true, color: "red" }] })}
+      />,
+    );
+    const el = button("a");
+    expect(el.className).toContain("bg-red-500/15");
+    expect(el.className).toContain("ring-red-500/40");
+    expect(el.querySelector("svg")?.getAttribute("class")).toContain("text-red-500");
+    expect(el.className).not.toMatch(/text-red/);
+  });
+
+  it("没颜色的按钮样式和以前一样", () => {
+    render(<QuickCommandBar {...props()} />);
+    const el = button("a");
+    expect(el.className).toBe(
+      "my-0.5 flex max-w-40 shrink-0 items-center gap-1 rounded px-2 py-0.5 hover:bg-accent hover:text-accent-foreground",
+    );
+    expect(el.querySelector("svg")?.getAttribute("class")).toContain("text-muted-foreground");
+    expect(el.querySelector("svg")?.getAttribute("class")).not.toMatch(/text-(red|green|blue)/);
+  });
+});

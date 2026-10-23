@@ -7,8 +7,11 @@ import {
   isMultiline,
   moveQuickCommand,
   moveQuickCommandInGroup,
+  normalizeQuickCommandColor,
   parseQuickCommands,
   payloadOf,
+  QUICK_COMMAND_COLORS,
+  QUICK_COMMAND_COLOR_STYLES,
   searchQuickCommands,
   sectionsOfQuickCommands,
   serializeQuickCommands,
@@ -128,5 +131,45 @@ describe("按分组上移 / 下移、搜索、归拢（UI-10）", () => {
     ]);
     expect(sectionsOfQuickCommands([cmd("p")]).map((section) => section.group)).toEqual([""]);
     expect(sectionsOfQuickCommands([])).toEqual([]);
+  });
+});
+
+describe("快捷命令颜色", () => {
+  it("已知颜色保留；未知值当作没设，但整条命令不丢", () => {
+    const raw = JSON.stringify([
+      { id: "a", name: "A", command: "ls", color: "red" },
+      { id: "b", name: "B", command: "ls", color: "magenta" },
+      { id: "c", name: "C", command: "ls", color: 5 },
+      { id: "d", name: "D", command: "ls" },
+    ]);
+    const list = parseQuickCommands(raw);
+    expect(list.map((item) => [item.id, item.color])).toEqual([
+      ["a", "red"],
+      ["b", undefined],
+      ["c", undefined],
+      ["d", undefined],
+    ]);
+  });
+
+  it("序列化：有颜色才写 color 字段；往返一致", () => {
+    const list = [qc("a", { color: "teal" }), qc("b")];
+    const written = JSON.parse(serializeQuickCommands(list)) as Record<string, unknown>[];
+    expect(written[0].color).toBe("teal");
+    expect("color" in written[1]).toBe(false);
+    expect(parseQuickCommands(serializeQuickCommands(list)).map((item) => item.color)).toEqual(["teal", undefined]);
+  });
+
+  it("颜色表：8 个预设，每个都有中文名和各处要用的样式", () => {
+    expect(QUICK_COMMAND_COLORS).toEqual(["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"]);
+    for (const id of QUICK_COMMAND_COLORS) {
+      const style = QUICK_COMMAND_COLOR_STYLES[id];
+      expect(style.label).not.toBe("");
+      expect(style.button).toContain(`bg-${id}-500/15`);
+      expect(style.dot).toBe(`bg-${id}-500`);
+      expect(style.icon).toContain(`text-${id}-`);
+      expect(normalizeQuickCommandColor(id)).toBe(id);
+    }
+    expect(normalizeQuickCommandColor("nope")).toBeUndefined();
+    expect(normalizeQuickCommandColor(undefined)).toBeUndefined();
   });
 });

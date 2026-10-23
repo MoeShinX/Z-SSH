@@ -11,7 +11,7 @@ import { ListChecks, Plus, Radio, SquareTerminal } from "lucide-react";
 import { useRef } from "react";
 
 import { cn } from "../../lib/utils";
-import type { QuickCommand } from "../../state/quickCommands";
+import { QUICK_COMMAND_COLOR_STYLES, type QuickCommand } from "../../state/quickCommands";
 import { Button } from "../ui/button";
 import {
   ContextMenu,
@@ -166,37 +166,44 @@ export default function QuickCommandBar({
             还没有快捷命令，点这里添加常用命令（例如查看端口、系统更新）
           </button>
         ) : (
-          commands.map((command) => (
-            <ContextMenu key={command.id}>
-              <ContextMenuTrigger asChild>
-                <button
-                  data-quick-command={command.id}
-                  onClick={(event) => onRun(command, event.ctrlKey || event.metaKey)}
-                  title={`${command.command}${
-                    command.enter === false ? "\n（只填入，不回车）" : ""
-                  }\nCtrl+单击：发到所有分屏`}
-                  className="my-0.5 flex max-w-40 shrink-0 items-center gap-1 rounded px-2 py-0.5 hover:bg-accent hover:text-accent-foreground"
-                >
-                  <SquareTerminal size={12} className="shrink-0 text-muted-foreground" />
-                  <span className="truncate">{command.name}</span>
-                </button>
-              </ContextMenuTrigger>
-              <ContextMenuContent className="w-44">
-                <ContextMenuItem onSelect={() => onRun(command, false)}>发送</ContextMenuItem>
-                <ContextMenuItem onSelect={() => onRun(command, true)}>
-                  发到这个标签的所有分屏
-                </ContextMenuItem>
-                <ContextMenuSeparator />
-                <ContextMenuItem onSelect={() => onEdit(command)}>编辑</ContextMenuItem>
-                <ContextMenuItem
-                  destructive
-                  onSelect={() => onDelete(command)}
-                >
-                  删除
-                </ContextMenuItem>
-              </ContextMenuContent>
-            </ContextMenu>
-          ))
+          commands.map((command) => {
+            const color = command.color ? QUICK_COMMAND_COLOR_STYLES[command.color] : undefined;
+            return (
+              <ContextMenu key={command.id}>
+                <ContextMenuTrigger asChild>
+                  <button
+                    data-quick-command={command.id}
+                    onClick={(event) => onRun(command, event.ctrlKey || event.metaKey)}
+                    title={`${command.command}${
+                      command.enter === false ? "\n（只填入，不回车）" : ""
+                    }\nCtrl+单击：发到所有分屏`}
+                    data-color={command.color}
+                    className={cn(
+                      "my-0.5 flex max-w-40 shrink-0 items-center gap-1 rounded px-2 py-0.5",
+                      color ? color.button : "hover:bg-accent hover:text-accent-foreground",
+                    )}
+                  >
+                    <SquareTerminal size={12} className={cn("shrink-0", color ? color.icon : "text-muted-foreground")} />
+                    <span className="truncate">{command.name}</span>
+                  </button>
+                </ContextMenuTrigger>
+                <ContextMenuContent className="w-44">
+                  <ContextMenuItem onSelect={() => onRun(command, false)}>发送</ContextMenuItem>
+                  <ContextMenuItem onSelect={() => onRun(command, true)}>
+                    发到这个标签的所有分屏
+                  </ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem onSelect={() => onEdit(command)}>编辑</ContextMenuItem>
+                  <ContextMenuItem
+                    destructive
+                    onSelect={() => onDelete(command)}
+                  >
+                    删除
+                  </ContextMenuItem>
+                </ContextMenuContent>
+              </ContextMenu>
+            );
+          })
         )}
       </div>
 
