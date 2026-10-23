@@ -106,8 +106,9 @@ pub fn bare_address(raw: &str) -> String {
 
 /// 放进 ssh 命令行的一个参数：只含字母、数字和 `._-:%+`（IPv6 的冒号、作用域 `%` 也在内）
 /// 时原样写；否则用 POSIX 单引号引起来，里面的单引号写成 `'\''`。
-/// 单引号写法在 bash / zsh / PowerShell 里含义一致；cmd.exe 不认单引号，粘贴到 cmd 里
-/// 带特殊字符的用户名需要自己改成双引号。
+/// 不含单引号时，单引号写法在 bash / zsh / PowerShell 里含义一致；含单引号时 `'\''` 只有
+/// POSIX shell 认，PowerShell 要写成 `''`，粘贴到 PowerShell 前需要自己改。cmd.exe 不认单引号，
+/// 粘贴到 cmd 里带特殊字符的用户名需要自己改成双引号。
 fn command_arg(text: &str) -> String {
     let plain = !text.is_empty()
         && text
@@ -147,8 +148,10 @@ pub fn format_connection_info(info: &ConnectionInfo) -> Zeroizing<String> {
     if let Some(proxy) = &info.proxy {
         line(&format!("代理：{proxy}"));
     }
+    // 地址以 `-` 开头时 ssh 会把它当成选项（引号挡不住），前面加 `--` 让它只能是主机名。
+    let end_of_options = if address.starts_with('-') { "-- " } else { "" };
     line(&format!(
-        "ssh -p {} -l {} {}",
+        "ssh -p {} -l {} {end_of_options}{}",
         info.port,
         command_arg(&info.username),
         command_arg(&address)
@@ -467,6 +470,15 @@ mod tests {
         assert!(format_connection_info(&data).ends_with("-l root 'host name'"));
         data.address = "[fe80::1%eth0]".to_owned();
         assert!(format_connection_info(&data).ends_with("-l root fe80::1%eth0"));
+    }
+
+    #[test]
+    fn an_address_starting_with_a_dash_cannot_become_an_ssh_option() {
+        let mut data = info(InfoAuth::Agent);
+        data.address = "-Fevil".to_owned();
+        assert!(format_connection_info(&data).ends_with("-l root -- -Fevil"));
+        data.address = "host.example".to_owned();
+        assert!(format_connection_info(&data).ends_with("-l root host.example"));
     }
 
     #[test]

@@ -313,6 +313,19 @@ fn plan_command_asks_gnu_tar_for_literal_names_and_unzip_for_plain_ones() {
 }
 
 #[test]
+fn plan_command_never_falls_back_to_a_predictable_temp_name() {
+    for format in [ArchiveFormat::TarGz, ArchiveFormat::Zip] {
+        let script = plan_command(format, "/d/a.tar.gz", "/d", true);
+        assert!(
+            script.starts_with("T=$(mktemp 2>/dev/null) || {"),
+            "{script}"
+        );
+        assert!(!script.contains("/tmp/"), "{script}");
+        assert!(!script.contains("$$"), "{script}");
+    }
+}
+
+#[test]
 fn plan_command_checks_every_existing_parent_for_symlinks() {
     let tar = plan_command(ArchiveFormat::TarGz, "/d/a.tar.gz", "/d/out dir", true);
     // 逐级走路径：每一级 `[ -L ]`，命中就标成 l

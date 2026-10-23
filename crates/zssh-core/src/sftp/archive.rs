@@ -298,7 +298,9 @@ pub fn plan_command(format: ArchiveFormat, archive: &str, dest: &str, literal: b
     };
     // 逐级检查：从条目的第一段开始，每走一段就看「到这里为止的路径」是不是符号链接。
     // 目录条目先去掉末尾的 `/`，所以它自己也会被查到。
-    const SCRIPT: &str = r#"T=$(mktemp 2>/dev/null) || T=/tmp/.zssh-list.$$; trap 'rm -f "$T"' EXIT; exec 3<&0; ( exec @LIST@ ) >"$T" </dev/null & pid=$!; ( read -r _ <&3; kill -TERM $pid 2>/dev/null ) & w=$!; wait $pid; rc=$?; kill $w 2>/dev/null; echo "@MARK@$rc" >&2; if cd @DEST@ 2>/dev/null; then ex=1; else ex=0; fi; @FEED@ | while IFS= read -r p; do case "$p" in */) k=d; q=${p%/};; *) k=n; q=$p;; esac; if [ $ex = 1 ]; then l=0; pre=; rest=$q; while [ -n "$rest" ]; do c=${rest%%/*}; case "$rest" in */*) rest=${rest#*/};; *) rest=;; esac; pre=$pre$c; if [ -L "$pre" ]; then l=1; break; fi; pre=$pre/; done; if [ $l = 1 ]; then k=l; elif [ $k = n ]; then if [ -e "$p" ] || [ -L "$p" ]; then k=x; fi; fi; fi; printf '%s%s\n' "$k" "$p"; done"#;
+    // 临时文件只用 mktemp 建：没有 mktemp 时不退回 `/tmp` 下的固定名字（多用户服务器上别人可以
+    // 先放一个同名符号链接，把列表输出写到我们的其它文件上），直接报错不解压。
+    const SCRIPT: &str = r#"T=$(mktemp 2>/dev/null) || { echo "服务器上没有 mktemp 命令，没法检查压缩包" >&2; exit 1; }; trap 'rm -f "$T"' EXIT; exec 3<&0; ( exec @LIST@ ) >"$T" </dev/null & pid=$!; ( read -r _ <&3; kill -TERM $pid 2>/dev/null ) & w=$!; wait $pid; rc=$?; kill $w 2>/dev/null; echo "@MARK@$rc" >&2; if cd @DEST@ 2>/dev/null; then ex=1; else ex=0; fi; @FEED@ | while IFS= read -r p; do case "$p" in */) k=d; q=${p%/};; *) k=n; q=$p;; esac; if [ $ex = 1 ]; then l=0; pre=; rest=$q; while [ -n "$rest" ]; do c=${rest%%/*}; case "$rest" in */*) rest=${rest#*/};; *) rest=;; esac; pre=$pre$c; if [ -L "$pre" ]; then l=1; break; fi; pre=$pre/; done; if [ $l = 1 ]; then k=l; elif [ $k = n ]; then if [ -e "$p" ] || [ -L "$p" ]; then k=x; fi; fi; fi; printf '%s%s\n' "$k" "$p"; done"#;
     SCRIPT
         .replace("@LIST@", &list_command(format, archive, literal))
         .replace("@MARK@", LIST_EXIT_MARK)
