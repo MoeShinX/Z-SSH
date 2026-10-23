@@ -240,11 +240,11 @@ export default function TopTabs({
           />
           {/* 主机树侧栏开关（主机页和终端界面共用一个开关） */}
           <SidebarToggle />
-          {/* 固定最左：主机页 */}
+          {/* 固定最左：主机页。和主机树对齐时撑满左侧块剩下的宽度，右边不留一截空白 */}
           <TabShape
             active={view === "vault"}
             onClick={onShowVault}
-            className="rounded-md"
+            className={cn("rounded-md", alignToHostTree && "mr-1.5 min-w-0 max-w-none flex-1 shrink")}
             label="主机"
             icon={<LayoutGrid size={14} />}
           />
