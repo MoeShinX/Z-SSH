@@ -986,7 +986,8 @@ function AgentBlock({
       stacked
     >
       <p className="text-xs text-muted-foreground">{description}</p>
-      <div className="flex items-center gap-2">
+      {/* 按钮行和上面的说明文字隔开一点，不要贴在一起 */}
+      <div className="mt-2.5 flex items-center gap-2">
         <Button variant="outline" size="sm" disabled={probing} onClick={refresh}>
           {probing ? "检测中…" : "重新检测"}
         </Button>

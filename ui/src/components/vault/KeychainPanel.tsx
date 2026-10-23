@@ -63,8 +63,12 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
   // 导入私钥的正文（只在 kind = key_inline 且要替换时填）
   const [inlineKey, setInlineKey] = useState("");
   const [busy, setBusy] = useState(false);
+  // 点了「新建」、正在填一条新凭据：表单要显示出来（这时既没有选中项，名称也还是空的）
+  const [creating, setCreating] = useState(false);
 
-  const startNew = () => {
+  /** 清掉表单并收起（保存、删除之后，或者点「清空」）。 */
+  const resetForm = () => {
+    setCreating(false);
     setSelected(null);
     setName("");
     setKind("password");
@@ -75,7 +79,14 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
     setInlineKey("");
   };
 
+  /** 「新建」：空表单，并且显示出来。 */
+  const startNew = () => {
+    resetForm();
+    setCreating(true);
+  };
+
   const pick = (identity: Identity) => {
+    setCreating(false);
     setSelected(identity);
     setName(identity.name);
     setKind(identity.kind);
@@ -112,7 +123,7 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
           clear: clearPassphrase,
         }),
       });
-      startNew();
+      resetForm();
     } catch (error: unknown) {
       onError(String(error));
     } finally {
@@ -125,7 +136,7 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
     setBusy(true);
     try {
       await removeIdentity(selected.id);
-      startNew();
+      resetForm();
     } catch (error: unknown) {
       onError(String(error));
     } finally {
@@ -133,7 +144,7 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
     }
   };
 
-  const editing = selected !== null || name !== "";
+  const editing = creating || selected !== null || name !== "";
   // 已有导入私钥、类型没改：后端会沿用原口令，"留空不改"和"清除口令"才有意义
   const canKeepPassphrase =
     selected !== null &&
@@ -334,7 +345,7 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
               复制公钥
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={startNew} disabled={busy}>
+          <Button variant="outline" size="sm" onClick={resetForm} disabled={busy}>
             清空
           </Button>
           <Button size="sm" onClick={() => void submit()} disabled={busy}>

@@ -33,7 +33,10 @@ import {
 } from "../../stores/editors";
 import { toEditorError } from "../../api/editor";
 import { LocalConflictDialog } from "./LocalConflictDialog";
-import { loadLanguage } from "./loadLanguage";
+import { HASH_LINE_COMMENT, loadLanguage } from "./loadLanguage";
+
+/** 纯文本也能用 Ctrl+/ 加 / 去 `#` 注释（语言包里带了注释符号的以语言包为准）。 */
+const PLAIN_TEXT_COMMENTS: Extension = EditorState.languageData.of(() => [HASH_LINE_COMMENT]);
 
 /** 草稿写盘的间隔：有未保存修改时每隔几秒写一次，崩溃后下次启动能找回。 */
 export const DRAFT_INTERVAL_MS = 4000;
@@ -213,7 +216,8 @@ export default function EditorTabView({ editId, active, sftpId }: Props) {
       .then((extension) => {
         if (cancelled || !viewRef.current) return;
         viewRef.current.dispatch({
-          effects: languageCompartment.current.reconfigure(extension ?? []),
+          // 认不出语言的纯文本：服务器上的配置大多用 `#` 注释，给 Ctrl+/ 一个可用的注释符号
+          effects: languageCompartment.current.reconfigure(extension ?? PLAIN_TEXT_COMMENTS),
         });
       })
       .catch(() => {});
