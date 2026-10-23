@@ -128,7 +128,7 @@ export function Combobox({ value, onChange, options, placeholder, className, "ar
               onMouseEnter={() => setActive(index)}
               onClick={() => pick(name)}
               className={cn(
-                "flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm",
+                "flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 text-[13px]",
                 index === active ? "bg-accent text-accent-foreground" : "hover:bg-accent/60",
               )}
             >

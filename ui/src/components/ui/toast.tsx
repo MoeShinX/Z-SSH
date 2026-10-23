@@ -148,7 +148,7 @@ const ToastContainer: React.FC = () => {
         <div
           key={toastItem.id}
           className={cn(
-            "flex items-start gap-3 rounded-lg border p-3 shadow-lg",
+            "flex items-start gap-2.5 rounded-lg border px-3 py-2.5 shadow-lg",
             "bg-card",
             TOAST_STYLES[toastItem.type],
             toastItem.onClick && "cursor-pointer transition-opacity hover:opacity-90",
@@ -160,9 +160,9 @@ const ToastContainer: React.FC = () => {
           <div className="mt-0.5 flex-shrink-0">{TOAST_ICONS[toastItem.type]}</div>
           <div className="min-w-0 flex-1">
             {toastItem.title && (
-              <div className="text-sm font-medium text-foreground">{toastItem.title}</div>
+              <div className="text-[13px] font-medium text-foreground">{toastItem.title}</div>
             )}
-            <div className="break-words text-sm text-muted-foreground">{toastItem.message}</div>
+            <div className="break-words text-xs leading-relaxed text-muted-foreground">{toastItem.message}</div>
             {toastItem.actionLabel && toastItem.onClick && (
               <div className="mt-1 text-xs font-medium text-primary">
                 {toastItem.actionLabel} →
