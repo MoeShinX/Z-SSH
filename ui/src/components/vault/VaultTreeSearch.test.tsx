@@ -23,8 +23,8 @@ import { useVault } from "../../stores/vault";
 import VaultView, { HostTreeAside, type HostActions } from "./VaultView";
 
 const groups: Group[] = [
-  { id: 1, name: "Prod", parent_id: null, sort: 0 },
-  { id: 2, name: "Lab", parent_id: null, sort: 1 },
+  { id: 1, name: "Prod", parent_id: null, sort: 1 },
+  { id: 2, name: "Lab", parent_id: null, sort: 2 },
   { id: 3, name: "Asia", parent_id: 1, sort: 0 },
 ];
 const host = (id: number, name: string, group_id: number | null, extra: Partial<Host> = {}) =>

@@ -2909,8 +2909,16 @@ export default function App() {
           }
           setSftpDockOpen((open) => !open);
         }}
-        quickBarOpen={quickBarOpen}
-        onToggleQuickBar={() => void updateSettingValue("quick_commands_bar", !quickBarOpen)}
+        // 主机页没有终端、看不到底部的命令栏：这个按钮改成打开 / 关上右侧的快捷命令管理面板
+        quickBarOpen={view === "vault" ? sidePanel === "quickCommands" : quickBarOpen}
+        onToggleQuickBar={() => {
+          if (view === "vault") {
+            if (sidePanel === "quickCommands") setSidePanel("none");
+            else openQuickCommandsPanel(null);
+            return;
+          }
+          void updateSettingValue("quick_commands_bar", !quickBarOpen);
+        }}
       />
 
       <DockRow

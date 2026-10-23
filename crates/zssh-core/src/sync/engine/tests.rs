@@ -1409,3 +1409,150 @@ async fn restoring_a_backup_with_a_deleted_host_survives_the_next_sync() {
         .expect("A 再同步");
     assert_eq!(names(&db), ["web-a", "web-b", "web-c"]);
 }
+
+/// 按顺序规则（sort > 0 在前按 sort，sort == 0 在后按名字）排出某一层的主机名。
+fn layer_names(db: &Database, group_id: Option<i64>) -> Vec<String> {
+    let mut hosts: Vec<_> = db
+        .host_list()
+        .unwrap()
+        .into_iter()
+        .filter(|host| host.group_id == group_id)
+        .collect();
+    hosts.sort_by(|a, b| {
+        (a.sort == 0, a.sort, a.name.clone()).cmp(&(b.sort == 0, b.sort, b.name.clone()))
+    });
+    hosts.into_iter().map(|host| host.name).collect()
+}
+
+fn root_group_names(db: &Database) -> Vec<String> {
+    let mut groups: Vec<_> = db
+        .group_list()
+        .unwrap()
+        .into_iter()
+        .filter(|group| group.parent_id.is_none())
+        .collect();
+    groups.sort_by(|a, b| {
+        (a.sort == 0, a.sort, a.name.clone()).cmp(&(b.sort == 0, b.sort, b.name.clone()))
+    });
+    groups.into_iter().map(|group| group.name).collect()
+}
+
+#[tokio::test]
+async fn manual_host_and_group_order_syncs_to_the_other_computer() {
+    use crate::model::GroupDraft;
+
+    let dir_a = temp_dir("order-a");
+    let dir_b = temp_dir("order-b");
+    let db_a = Database::open_in_memory().expect("A 库");
+    let db_b = Database::open_in_memory().expect("B 库");
+    let sealer_a = TestSealer(1);
+    let sealer_b = TestSealer(2);
+    let storage = MemoryStorage::new();
+
+    let group_id = |db: &Database, name: &str| {
+        db.group_save(&GroupDraft {
+            id: None,
+            name: name.to_owned(),
+            parent_id: None,
+            sort: 0,
+        })
+        .expect("建分组")
+        .id
+    };
+    let alpha = group_id(&db_a, "alpha");
+    let beta = group_id(&db_a, "beta");
+    let mut ids = Vec::new();
+    for name in ["h1", "h2", "h3"] {
+        let draft = HostDraft {
+            id: None,
+            group_id: Some(alpha),
+            name: name.to_owned(),
+            host: format!("{name}.example.internal"),
+            port: 22,
+            username: "root".to_owned(),
+            auth_method: AuthMethod::Password,
+            identity_id: None,
+            proxy_id: None,
+            jump_host_id: None,
+            proxy_mode: ProxyMode::Default,
+            tags: Vec::new(),
+            sort: 0,
+            legacy_algorithms: false,
+        };
+        ids.push(db_a.host_save(&draft).expect("建主机").id);
+    }
+
+    let engine_a = SyncEngine::new(&db_a, &sealer_a, "dev-a", &dir_a, None, None);
+    let engine_b = SyncEngine::new(&db_b, &sealer_b, "dev-b", &dir_b, None, None);
+    engine_a
+        .sync(&storage, PASSWORD, None)
+        .await
+        .expect("A 首次");
+    engine_b
+        .sync(&storage, PASSWORD, None)
+        .await
+        .expect("B 首次");
+    let b_alpha = db_b
+        .group_list()
+        .unwrap()
+        .into_iter()
+        .find(|group| group.name == "alpha")
+        .expect("B 收到分组")
+        .id;
+    assert_eq!(
+        layer_names(&db_b, Some(b_alpha)),
+        ["h1", "h2", "h3"],
+        "没调过时按名字"
+    );
+
+    // A 调整顺序：主机 h3 h1 h2，分组 beta alpha。修改时间钉在未来，免得和同一秒里的建库平局。
+    db_a.host_reorder(&[ids[2], ids[0], ids[1]])
+        .expect("重排主机");
+    db_a.group_reorder(&[beta, alpha]).expect("重排分组");
+    let edit_time = SyncEngine::now() + 3600;
+    db_a.with_conn_as(|conn| -> Result<(), crate::error::ZsshError> {
+        conn.execute(
+            "UPDATE hosts SET updated_at = ?1 WHERE sort != 0",
+            [edit_time],
+        )?;
+        conn.execute(
+            "UPDATE groups SET updated_at = ?1 WHERE sort != 0",
+            [edit_time],
+        )?;
+        Ok(())
+    })
+    .expect("钉住修改时间");
+    engine_a
+        .sync(&storage, PASSWORD, None)
+        .await
+        .expect("A 重排后同步");
+    let report = engine_b
+        .sync(&storage, PASSWORD, None)
+        .await
+        .expect("B 同步");
+    assert_eq!(report.status, SyncStatus::Completed, "{report:?}");
+
+    assert_eq!(
+        layer_names(&db_b, Some(b_alpha)),
+        ["h3", "h1", "h2"],
+        "另一台电脑的主机顺序跟着变"
+    );
+    assert_eq!(root_group_names(&db_b), ["beta", "alpha"]);
+    assert_eq!(
+        layer_names(&db_a, Some(alpha)),
+        layer_names(&db_b, Some(b_alpha)),
+        "两台电脑一致"
+    );
+
+    // 再同步一轮也稳定：顺序不会被撤销。
+    engine_a
+        .sync(&storage, PASSWORD, None)
+        .await
+        .expect("A 再同步");
+    engine_b
+        .sync(&storage, PASSWORD, None)
+        .await
+        .expect("B 再同步");
+    assert_eq!(layer_names(&db_a, Some(alpha)), ["h3", "h1", "h2"]);
+    assert_eq!(layer_names(&db_b, Some(b_alpha)), ["h3", "h1", "h2"]);
+}

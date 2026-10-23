@@ -114,6 +114,13 @@ export const saveHost = (draft: HostDraft): Promise<Host> =>
 export const deleteHost = (id: number): Promise<void> =>
   invoke("host_delete", { id });
 
+/** 把一层主机（同一个分组下 / 都未分组）按这个顺序排成 1..n；一个事务，不合法就整个不改。 */
+export const reorderHosts = (ids: number[]): Promise<void> => invoke("host_reorder", { ids });
+/** 把一层分组（同一个父分组下）按这个顺序排成 1..n。 */
+export const reorderGroups = (ids: number[]): Promise<void> => invoke("group_reorder", { ids });
+/** 「按名字重新排序」：分组下直接的主机和子分组回到按名字；null = 只管未分组主机。 */
+export const resetOrder = (groupId: number | null): Promise<void> => invoke("order_reset", { groupId });
+
 export const listIdentities = (): Promise<Identity[]> => invoke("identity_list");
 export const saveIdentity = (draft: IdentityDraft): Promise<Identity> =>
   invoke("identity_save", { draft });

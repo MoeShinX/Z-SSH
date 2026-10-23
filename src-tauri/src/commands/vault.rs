@@ -48,6 +48,24 @@ pub async fn host_delete(
     Ok(())
 }
 
+/// 把一层主机（同一个分组下 / 都未分组）按传入顺序排成 1..n；整个是一个事务。
+#[tauri::command]
+pub async fn host_reorder(state: State<'_, AppState>, ids: Vec<i64>) -> Result<(), String> {
+    state.store.host_reorder(&ids).map_err(to_message)
+}
+
+/// 把一层分组（同一个父分组下）按传入顺序排成 1..n；整个是一个事务。
+#[tauri::command]
+pub async fn group_reorder(state: State<'_, AppState>, ids: Vec<i64>) -> Result<(), String> {
+    state.store.group_reorder(&ids).map_err(to_message)
+}
+
+/// 「按名字重新排序」：把某个分组下直接的主机和子分组（`group_id` 为空时只管未分组主机）的顺序清零。
+#[tauri::command]
+pub async fn order_reset(state: State<'_, AppState>, group_id: Option<i64>) -> Result<(), String> {
+    state.store.order_reset(group_id).map_err(to_message)
+}
+
 #[tauri::command]
 pub async fn identity_list(state: State<'_, AppState>) -> Result<Vec<Identity>, String> {
     state.store.identity_list().map_err(to_message)

@@ -186,10 +186,23 @@ vi.mock("./components/TerminalView", async () => {
 // 标题栏 / 设置页 / 面板在 jsdom 下不需要真的渲染
 // 齿轮按钮和设置页的 × 只留一个按钮，测设置页的进出（R-11）
 vi.mock("./components/titlebar/TopTabs", () => ({
-  default: (props: { onOpenSettings: () => void }) => (
-    <button data-testid="gear" onClick={props.onOpenSettings}>
-      设置
-    </button>
+  default: (props: {
+    onOpenSettings: () => void;
+    onToggleQuickBar: () => void;
+    quickBarOpen: boolean;
+  }) => (
+    <>
+      <button data-testid="gear" onClick={props.onOpenSettings}>
+        设置
+      </button>
+      <button
+        data-testid="quick"
+        data-on={String(props.quickBarOpen)}
+        onClick={props.onToggleQuickBar}
+      >
+        快捷命令
+      </button>
+    </>
   ),
 }));
 vi.mock("./components/settings/SettingsPage", () => ({
@@ -597,6 +610,22 @@ describe("App 启动时回收上一页的会话", () => {
     });
 
     expect(mocks.sessionsReset).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("主机页的快捷命令按钮", () => {
+  it("主机页看不到终端底部的命令栏：点按钮打开 / 关上右侧的快捷命令面板，不改命令栏开关", async () => {
+    const view = await mountApp();
+    const { useSettings } = await import("./stores/settings");
+    const before = useSettings.getState().quick_commands_bar;
+    const panel = () => view.queryByText("命令列表");
+    expect(panel()).toBeNull();
+    await act(async () => view.getByTestId("quick").click());
+    expect(panel()).not.toBeNull();
+    expect(view.getByTestId("quick").dataset.on).toBe("true");
+    await act(async () => view.getByTestId("quick").click());
+    expect(panel()).toBeNull();
+    expect(useSettings.getState().quick_commands_bar).toBe(before);
   });
 });
 

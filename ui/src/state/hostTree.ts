@@ -26,6 +26,19 @@ export function compareNames(a: string, b: string): number {
   return nameClass(a) - nameClass(b) || collator.compare(a, b) || a.localeCompare(b);
 }
 
+/**
+ * 同一层（同一个分组下的主机、同一个父分组下的子分组）的显示顺序：`sort > 0` 的排前面、
+ * 按 `sort` 从小到大；`sort == 0`（没调整过的）排后面、按名字（{@link compareNames}）；
+ * `sort` 相同时也用名字兜底。全是 0 的时候和原来的纯按名字完全一样。
+ */
+export function compareOrder(a: { sort: number; name: string }, b: { sort: number; name: string }): number {
+  const aSet = a.sort > 0;
+  const bSet = b.sort > 0;
+  if (aSet !== bSet) return aSet ? -1 : 1;
+  if (aSet && a.sort !== b.sort) return a.sort - b.sort;
+  return compareNames(a.name, b.name);
+}
+
 export function groupKey(groupId: number | null): string {
   return groupId === null ? UNGROUPED_KEY : `g${groupId}`;
 }
@@ -160,11 +173,38 @@ export function treeFilterFor(groups: Group[], hosts: Host[], rawText: string): 
   return { text, hostIds, groupIds, ungrouped, counts, total: hostIds.size };
 }
 
-/** 某个分组（null = 未分组）下面直接挂的主机，按名字排；搜索时只留过滤结果里的。 */
+/** 某个分组（null = 未分组）下面直接挂的主机，按 {@link compareOrder} 排；搜索时只留过滤结果里的。 */
 export function hostsUnder(hosts: Host[], groupId: number | null, filter: TreeFilter | null): Host[] {
   return hosts
     .filter((host) => host.group_id === groupId && (filter === null || filter.hostIds.has(host.id)))
-    .sort((a, b) => compareNames(a.name, b.name));
+    .sort(compareOrder);
+}
+
+/** 某个父分组（null = 根）下面直接的子分组，按 {@link compareOrder} 排；搜索时只留过滤结果里的。 */
+export function groupsUnder(groups: Group[], parentId: number | null, filter: TreeFilter | null): Group[] {
+  return groups
+    .filter((group) => group.parent_id === parentId && (filter === null || filter.groupIds.has(group.id)))
+    .sort(compareOrder);
+}
+
+/** 把 `movedId` 从列表里拿出来，插到 `targetId` 前面（`after` 为真则后面）。目标不在列表里返回 null。 */
+export function insertInLayer(ids: number[], movedId: number, targetId: number, after: boolean): number[] | null {
+  if (movedId === targetId) return null;
+  const rest = ids.filter((id) => id !== movedId);
+  const at = rest.indexOf(targetId);
+  if (at < 0) return null;
+  rest.splice(after ? at + 1 : at, 0, movedId);
+  return rest;
+}
+
+/** 在列表里把 `id` 往前（-1）或往后（+1）挪一格；已经在头 / 尾、或不在列表里返回 null。 */
+export function stepInLayer(ids: number[], id: number, delta: -1 | 1): number[] | null {
+  const at = ids.indexOf(id);
+  const to = at + delta;
+  if (at < 0 || to < 0 || to >= ids.length) return null;
+  const next = [...ids];
+  [next[at], next[to]] = [next[to], next[at]];
+  return next;
 }
 
 /**
@@ -175,8 +215,8 @@ export function filteredHostOrder(groups: Group[], hosts: Host[], filter: TreeFi
   const order: Host[] = [];
   const seen = new Set<number>();
   const walk = (parentId: number | null) => {
-    for (const group of groups) {
-      if (group.parent_id !== parentId || seen.has(group.id) || !filter.groupIds.has(group.id)) continue;
+    for (const group of groupsUnder(groups, parentId, filter)) {
+      if (seen.has(group.id)) continue;
       seen.add(group.id);
       walk(group.id);
       order.push(...hostsUnder(hosts, group.id, filter));

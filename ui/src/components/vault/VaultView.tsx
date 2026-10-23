@@ -5,7 +5,10 @@
 //! 数据仍然来自我们自己的 stores/vault（后端 SQLite），没有搬 Netcatty 的状态。
 
 import {
+  ArrowDown,
+  ArrowDownAZ,
   ArrowLeftRight,
+  ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
@@ -38,6 +41,7 @@ import { useSettings } from "../../stores/settings";
 import {
   filteredHostOrder,
   groupKey,
+  groupsUnder,
   hostsUnder,
   parseExpanded,
   parseRecent,
@@ -64,11 +68,15 @@ import {
 import {
   dragJustEnded,
   HostDragGhost,
+  InsertLine,
   moveHostToGroup,
+  startGroupDrag,
   startHostDrag,
+  useInsertMark,
   useIsDropTarget,
   type DropGroup,
 } from "./hostDrag";
+import { canStepGroup, canStepHost, resetLayerOrder, stepGroup, stepHost } from "./treeOrder";
 import { Input } from "../ui/input";
 import { InstallKeyDialog } from "./SshKeyDialogs";
 import { ScrollArea } from "../ui/scroll-area";
@@ -450,6 +458,7 @@ export function HostTreeAside({
       <aside
         ref={asideRef}
         data-section="vault-sidebar"
+        data-order-locked={filter !== null ? "true" : undefined}
         className="relative flex shrink-0 flex-col border-r border-border/60 bg-background"
         style={{ width }}
       >
@@ -509,8 +518,7 @@ export function HostTreeAside({
               active={selectedGroup === "all"}
               onClick={() => onSelectGroup("all")}
             />
-            {groups
-              .filter((group) => group.parent_id === null && (filter === null || filter.groupIds.has(group.id)))
+            {groupsUnder(groups, null, filter)
               .map((group) => (
                 <GroupBranch
                   key={group.id}
@@ -547,6 +555,10 @@ export function HostTreeAside({
                   </ContextMenuItem>
                   <ContextMenuItem onSelect={() => onNewGroup(null, { adoptUngrouped: true })}>
                     <Pencil className="mr-2 h-3.5 w-3.5" /> 重命名（建成分组）…
+                  </ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem onSelect={() => void resetLayerOrder(null)}>
+                    <ArrowDownAZ className="mr-2 h-3.5 w-3.5" /> 按名字重新排序
                   </ContextMenuItem>
                 </>
               }
@@ -609,6 +621,7 @@ function GroupRow({
   onToggle,
   dropGroup,
   guide,
+  orderGroup,
 }: {
   label: React.ReactNode;
   count: number;
@@ -623,21 +636,28 @@ function GroupRow({
   /** 有就是可以展开的分组行（"全部主机"没有）。 */
   expanded?: boolean;
   onToggle?: () => void;
+  /** 真实的分组行：可以拖动调整它在同一层的顺序（"全部主机"/"未分组"没有）。 */
+  orderGroup?: Group;
 }) {
   const dropping = useIsDropTarget(dropGroup === undefined ? -1 : dropGroup);
+  const insertMark = useInsertMark("group", orderGroup?.id ?? -1);
   const content = (
     <button
-      onClick={onClick}
+      onClick={() => !dragJustEnded() && onClick()}
       onDoubleClick={onToggle}
       data-drop-group={dropGroup === undefined ? undefined : (dropGroup ?? "none")}
+      data-order-group={orderGroup?.id}
+      data-order-parent={orderGroup ? String(orderGroup.parent_id ?? "root") : undefined}
+      onPointerDown={orderGroup ? (event) => startGroupDrag(orderGroup, event) : undefined}
       {...guideAttrs(guide)}
       style={{ paddingLeft: 4 + depth * 14, ...(guide ? treeGuideStyle(depth, guide) : null) }}
       className={cn(
-        "flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[13px] transition-colors",
+        "relative flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[13px] transition-colors",
         active ? "bg-accent font-medium text-accent-foreground" : "hover:bg-accent/50",
         dropping && "bg-primary/15 ring-1 ring-inset ring-primary",
       )}
     >
+      <InsertLine mark={insertMark} />
       {onToggle ? (
         <span
           role="button"
@@ -725,9 +745,7 @@ function GroupBranch({
   onDeleteGroup: (group: Group) => void;
   hostActions: HostActions;
 }) {
-  const children = groups.filter(
-    (item) => item.parent_id === group.id && (filter === null || filter.groupIds.has(item.id)),
-  );
+  const children = groupsUnder(groups, group.id, filter);
   const key = groupKey(group.id);
   const open = isExpanded(key);
   // 子项的显示顺序是先子分组后主机；最后一个子项画成 └
@@ -743,6 +761,7 @@ function GroupBranch({
         active={selected === group.id}
         onClick={() => onSelect(group.id)}
         dropGroup={group.id}
+        orderGroup={group}
         depth={depth}
         expanded={open}
         onToggle={() => onToggle(key)}
@@ -754,6 +773,8 @@ function GroupBranch({
             <ContextMenuItem onSelect={() => onEditGroup(group)}>
               <Pencil className="mr-2 h-3.5 w-3.5" /> 重命名
             </ContextMenuItem>
+            <ContextMenuSeparator />
+            <GroupOrderItems group={group} locked={filter !== null} />
             <ContextMenuSeparator />
             <ContextMenuItem
               destructive
@@ -931,11 +952,13 @@ function HostLeaf({
   searchActive?: boolean;
 }) {
   const hint = term ? matchHint(host, term) : null;
+  const insertMark = useInsertMark("host", host.id);
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <button
           data-section="tree-host"
+          data-order-host={host.id}
           data-search-active={searchActive ? "true" : undefined}
           data-drop-group={host.group_id ?? "none"}
           onPointerDown={(event) => startHostDrag(host, event)}
@@ -945,11 +968,12 @@ function HostLeaf({
           {...guideAttrs(guide)}
           style={{ paddingLeft: 4 + depth * 14 + 16, ...treeGuideStyle(depth, guide) }}
           className={cn(
-            "flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[13px] transition-colors",
+            "relative flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[13px] transition-colors",
             selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
             searchActive && "bg-accent/70 ring-1 ring-inset ring-primary/60",
           )}
         >
+          <InsertLine mark={insertMark} />
           <OsIcon hostId={host.id} size="tree" />
           <span className="truncate">{term ? <Highlight text={host.name} term={term} /> : host.name}</span>
           {hint && (
@@ -968,6 +992,7 @@ function HostLeaf({
         onCopy={(kind) => actions.copy(host, kind)}
         onInstallKey={actions.installKey ? () => actions.installKey?.(host) : undefined}
         onForwards={actions.forwards ? () => actions.forwards?.(host) : undefined}
+        orderLocked={term !== undefined}
       />
     </ContextMenu>
   );
@@ -1126,7 +1151,7 @@ function HostRow({
 export function flattenGroups(groups: Group[]): { group: Group; depth: number }[] {
   const out: { group: Group; depth: number }[] = [];
   const walk = (parentId: number | null, depth: number) => {
-    for (const group of groups.filter((item) => item.parent_id === parentId)) {
+    for (const group of groupsUnder(groups, parentId, null)) {
       out.push({ group, depth });
       walk(group.id, depth + 1);
     }
@@ -1167,6 +1192,41 @@ function MoveToGroupMenu({ host }: { host: Host }) {
   );
 }
 
+/** 右键「上移 / 下移」（树里的主机）：第一个的上移、最后一个的下移置灰；搜索时过滤后的列表不连续，全部置灰。 */
+function HostOrderItems({ host, locked }: { host: Host; locked: boolean }) {
+  const hosts = useVault((state) => state.hosts);
+  const [canUp, canDown] = canStepHost(hosts, host);
+  return (
+    <>
+      <ContextMenuItem disabled={locked || !canUp} data-order-action="up" onSelect={() => void stepHost(host, -1)}>
+        <ArrowUp className="mr-2 h-3.5 w-3.5" /> 上移
+      </ContextMenuItem>
+      <ContextMenuItem disabled={locked || !canDown} data-order-action="down" onSelect={() => void stepHost(host, 1)}>
+        <ArrowDown className="mr-2 h-3.5 w-3.5" /> 下移
+      </ContextMenuItem>
+    </>
+  );
+}
+
+/** 分组右键的「上移 / 下移 / 按名字重新排序」。 */
+function GroupOrderItems({ group, locked }: { group: Group; locked: boolean }) {
+  const groups = useVault((state) => state.groups);
+  const [canUp, canDown] = canStepGroup(groups, group);
+  return (
+    <>
+      <ContextMenuItem disabled={locked || !canUp} data-order-action="up" onSelect={() => void stepGroup(group, -1)}>
+        <ArrowUp className="mr-2 h-3.5 w-3.5" /> 上移
+      </ContextMenuItem>
+      <ContextMenuItem disabled={locked || !canDown} data-order-action="down" onSelect={() => void stepGroup(group, 1)}>
+        <ArrowDown className="mr-2 h-3.5 w-3.5" /> 下移
+      </ContextMenuItem>
+      <ContextMenuItem data-order-action="reset" onSelect={() => void resetLayerOrder(group.id)}>
+        <ArrowDownAZ className="mr-2 h-3.5 w-3.5" /> 按名字重新排序
+      </ContextMenuItem>
+    </>
+  );
+}
+
 function HostMenu({
   host,
   onConnect,
@@ -1176,6 +1236,7 @@ function HostMenu({
   onCopy,
   onInstallKey,
   onForwards,
+  orderLocked,
 }: {
   host: Host;
   onConnect: () => void;
@@ -1185,6 +1246,8 @@ function HostMenu({
   onCopy: (kind: HostCopyKind) => void;
   onInstallKey?: () => void;
   onForwards?: () => void;
+  /** 给了就在菜单里显示「上移 / 下移」（树里的主机行）；值 = 当前是不是在搜索（搜索时置灰）。 */
+  orderLocked?: boolean;
 }) {
   return (
     <ContextMenuContent className="w-44">
@@ -1214,6 +1277,7 @@ function HostMenu({
         </ContextMenuItem>
       )}
       <MoveToGroupMenu host={host} />
+      {orderLocked !== undefined && <HostOrderItems host={host} locked={orderLocked} />}
       <ContextMenuSeparator />
       <ContextMenuItem destructive onSelect={onDelete}>
         <Trash2 className="mr-2 h-3.5 w-3.5" /> 删除

@@ -130,6 +130,8 @@ export default function TopTabs({
   // 拖主机树宽度时 width 实时跟着变（拖动值是共享的）；收起、设置页保持原来紧挨着排。
   const hostTreeCollapsed = useSettings((state) => state["layout.vault_sidebar_collapsed"]);
   const { width: hostTreeWidth } = useHostTreeWidth();
+  // 主机页上这个按钮打开的是快捷命令管理面板（见 App 里的 onToggleQuickBar）
+  const quickBarLabel = view === "vault" ? "快捷命令" : "快捷命令栏";
   const alignToHostTree = !hostTreeCollapsed && (view === "vault" || view === "terminal");
 
   // SFTP 标签的拖动：用指针事件自己做（Tauri 默认开着 dragDropEnabled，Windows 上
@@ -426,7 +428,7 @@ export default function TopTabs({
                 <button
                   data-tauri-drag-region={false}
                   data-action="toggle-quick-commands"
-                  title="快捷命令栏"
+                  title={quickBarLabel}
                   onClick={onToggleQuickBar}
                   className={cn(
                     "top-tab-utility-btn mb-1 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md",
@@ -436,7 +438,7 @@ export default function TopTabs({
                   <Command size={16} />
                 </button>
               </TooltipTrigger>
-              <TooltipContent>快捷命令栏</TooltipContent>
+              <TooltipContent>{quickBarLabel}</TooltipContent>
             </Tooltip>
           )}
           <ThemeSwitcher />

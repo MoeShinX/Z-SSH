@@ -121,8 +121,8 @@ describe("主机树", () => {
 describe("右键移动到分组", () => {
   it("分组按树的顺序摊平，子组跟在父组后面", () => {
     const groups: Group[] = [
-      { id: 1, name: "生产", parent_id: null, sort: 0 },
-      { id: 2, name: "测试", parent_id: null, sort: 1 },
+      { id: 1, name: "生产", parent_id: null, sort: 1 },
+      { id: 2, name: "测试", parent_id: null, sort: 2 },
       { id: 3, name: "香港", parent_id: 1, sort: 0 },
     ];
     expect(flattenGroups(groups).map(({ group, depth }) => `${group.name}:${depth}`)).toEqual([
@@ -216,7 +216,7 @@ describe("右键「未分组」", () => {
 describe("主机树的虚线连接线", () => {
   const A: Group = { id: 2, name: "A", parent_id: null, sort: 0 };
   const B: Group = { id: 3, name: "B", parent_id: 2, sort: 0 };
-  const C: Group = { id: 4, name: "C", parent_id: 2, sort: 1 };
+  const C: Group = { id: 4, name: "C", parent_id: 2, sort: 0 };
   /** 树里带连接线的行，按显示顺序：[标签, 形状, 穿过的祖先层]。 */
   const lines = () =>
     [...document.querySelectorAll('[data-section="vault-sidebar"] [data-tree-line]')].map((el) => [

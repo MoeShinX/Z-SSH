@@ -61,16 +61,31 @@ impl Database {
             let now = crate::store::hosts::now_unix();
             match draft.id {
                 Some(id) => {
-                    let changed = conn.execute(
+                    // 同主机：顺序（`sort`）不由「保存分组」决定，`draft.sort` 只是打开对话框时的
+                    // 旧值。保持库里的值；换了父分组就置 0，排到新那一层的末尾（UI-9）。
+                    let (old_parent, old_sort): (Option<i64>, i64) = conn
+                        .query_row(
+                            "SELECT parent_id, sort FROM groups WHERE id = ?1",
+                            [id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|err| match err {
+                            rusqlite::Error::QueryReturnedNoRows => ZsshError::NotFound {
+                                entity: "分组",
+                                id,
+                            },
+                            other => other.into(),
+                        })?;
+                    let sort = if old_parent == draft.parent_id {
+                        old_sort
+                    } else {
+                        0
+                    };
+                    conn.execute(
                         "UPDATE groups SET name = ?1, parent_id = ?2, sort = ?3, updated_at = ?4 \
                          WHERE id = ?5",
-                        params![name, draft.parent_id, draft.sort, now, id],
+                        params![name, draft.parent_id, sort, now, id],
                     )?;
-                    if changed == 0 {
-                        return Err(ZsshError::NotFound {
-                            entity: "分组", id
-                        });
-                    }
                     group_get(conn, id)
                 }
                 None => {

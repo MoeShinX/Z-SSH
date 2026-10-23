@@ -26,6 +26,11 @@ interface VaultState {
   /** 一批主机移到某个分组（null = 未分组），全部存完再重新加载一次。 */
   moveHosts: (hostIds: number[], groupId: number | null) => Promise<void>;
   removeGroup: (id: number) => Promise<void>;
+  /** 手动顺序（UI-9）：传整层的新顺序；存完重新加载。 */
+  reorderHosts: (ids: number[]) => Promise<void>;
+  reorderGroups: (ids: number[]) => Promise<void>;
+  /** 「按名字重新排序」。 */
+  resetOrder: (groupId: number | null) => Promise<void>;
   saveHost: (draft: HostDraft) => Promise<Host>;
   removeHost: (id: number) => Promise<void>;
   saveIdentity: (draft: IdentityDraft) => Promise<Identity>;
@@ -76,6 +81,30 @@ export const useVault = create<VaultState>((set, get) => ({
   async removeGroup(id) {
     await api.deleteGroup(id);
     await get().load();
+  },
+
+  async reorderHosts(ids) {
+    try {
+      await api.reorderHosts(ids);
+    } finally {
+      await get().load();
+    }
+  },
+
+  async reorderGroups(ids) {
+    try {
+      await api.reorderGroups(ids);
+    } finally {
+      await get().load();
+    }
+  },
+
+  async resetOrder(groupId) {
+    try {
+      await api.resetOrder(groupId);
+    } finally {
+      await get().load();
+    }
   },
 
   async saveHost(draft) {

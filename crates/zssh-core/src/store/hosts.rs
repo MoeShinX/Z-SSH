@@ -74,6 +74,23 @@ impl Database {
 
             match draft.id {
                 Some(id) => {
+                    // 顺序（`sort`）不由「保存主机」决定：前端传来的 `draft.sort` 只是打开面板时
+                    // 那一刻的旧值，用它会把之后在树里调好的顺序冲掉（UI-9）。已有的主机
+                    // 一律保持库里的 `sort`；换了分组就置 0，排到新分组这一层的末尾。
+                    let (old_group, old_sort): (Option<i64>, i64) = conn
+                        .query_row(
+                            "SELECT group_id, sort FROM hosts WHERE id = ?1",
+                            [id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|err| match err {
+                            rusqlite::Error::QueryReturnedNoRows => ZsshError::NotFound {
+                                entity: "主机",
+                                id,
+                            },
+                            other => other.into(),
+                        })?;
+                    let sort = if old_group == draft.group_id { old_sort } else { 0 };
                     let changed = conn.execute(
                         "UPDATE hosts SET group_id = ?1, name = ?2, host = ?3, port = ?4, \
                          username = ?5, auth_method = ?6, identity_id = ?7, proxy_id = ?8, \
@@ -91,7 +108,7 @@ impl Database {
                             draft.jump_host_id,
                             draft.proxy_mode.as_str(),
                             tags,
-                            draft.sort,
+                            sort,
                             now,
                             legacy,
                             id,

@@ -4,6 +4,10 @@ import type { Group, Host } from "../api/vault";
 import {
   filteredHostOrder,
   compareNames,
+  compareOrder,
+  groupsUnder,
+  insertInLayer,
+  stepInLayer,
   groupKey,
   hostMatches,
   hostsUnder,
@@ -187,5 +191,74 @@ describe("主机页按最近打开排", () => {
       "andnode",
       "诛仙",
     ]);
+  });
+});
+
+describe("手动顺序（UI-9）", () => {
+  const withSort = <T extends Group | Host>(item: T, sort: number): T => ({ ...item, sort });
+
+  it("全是 0 时和纯按名字一样；sort 相同也按名字兜底", () => {
+    const list = [host(1, "beta", null), host(2, "alpha", null), host(3, "10", null), host(4, "9", null)];
+    expect([...list].sort(compareOrder).map((h) => h.name)).toEqual(
+      [...list].sort((a, b) => compareNames(a.name, b.name)).map((h) => h.name),
+    );
+    const same = [withSort(host(1, "b", null), 2), withSort(host(2, "a", null), 2)];
+    expect(same.sort(compareOrder).map((h) => h.name)).toEqual(["a", "b"]);
+  });
+
+  it("有 sort 的在前按 sort，sort 为 0 的排后面按名字", () => {
+    const list = [
+      host(1, "alpha", 2),
+      withSort(host(2, "zeta", 2), 2),
+      host(3, "beta", 2),
+      withSort(host(4, "mid", 2), 1),
+    ];
+    expect(hostsUnder(list, 2, null).map((h) => h.name)).toEqual(["mid", "zeta", "alpha", "beta"]);
+    // 新加的（sort 0）排在调整过的后面，没调整过的几个之间按名字
+    expect(hostsUnder([...list, host(5, "aaa-new", 2)], 2, null).map((h) => h.name)).toEqual([
+      "mid",
+      "zeta",
+      "aaa-new",
+      "alpha",
+      "beta",
+    ]);
+  });
+
+  it("分组同理：同一个父分组下的子分组按 sort、再按名字", () => {
+    const list = [group(1, "b"), withSort(group(2, "z"), 1), group(3, "a"), group(4, "child", 1)];
+    expect(groupsUnder(list, null, null).map((g) => g.name)).toEqual(["z", "a", "b"]);
+    expect(groupsUnder(list, 1, null).map((g) => g.name)).toEqual(["child"]);
+    // 搜索时只留过滤结果里的
+    const filter = treeFilterFor(list, [], "a")!;
+    expect(groupsUnder(list, null, filter).map((g) => g.name)).toEqual(["a"]);
+  });
+
+  it("搜索结果的主机顺序（↑ ↓）跟着手动顺序", () => {
+    const list = [
+      host(1, "web-a", 2),
+      withSort(host(2, "web-b", 2), 1),
+      host(3, "web-c", null),
+      withSort(host(4, "web-d", null), 1),
+    ];
+    const gs = [group(2, "Prod")];
+    const filter = treeFilterFor(gs, list, "web")!;
+    expect(filteredHostOrder(gs, list, filter).map((h) => h.name)).toEqual(["web-b", "web-a", "web-d", "web-c"]);
+  });
+
+  it("插到目标前面 / 后面；自己、不在这一层的目标不动", () => {
+    expect(insertInLayer([1, 2, 3, 4], 4, 2, false)).toEqual([1, 4, 2, 3]);
+    expect(insertInLayer([1, 2, 3, 4], 1, 3, true)).toEqual([2, 3, 1, 4]);
+    expect(insertInLayer([1, 2, 3], 1, 1, true)).toBeNull();
+    expect(insertInLayer([1, 2, 3], 1, 9, true)).toBeNull();
+    // 换分组：被拖的还不在目标那一层里
+    expect(insertInLayer([5, 6], 9, 6, true)).toEqual([5, 6, 9]);
+  });
+
+  it("上移 / 下移一格；头上不能再上移、尾上不能再下移", () => {
+    expect(stepInLayer([1, 2, 3], 2, -1)).toEqual([2, 1, 3]);
+    expect(stepInLayer([1, 2, 3], 2, 1)).toEqual([1, 3, 2]);
+    expect(stepInLayer([1, 2, 3], 1, -1)).toBeNull();
+    expect(stepInLayer([1, 2, 3], 3, 1)).toBeNull();
+    expect(stepInLayer([1, 2, 3], 9, 1)).toBeNull();
   });
 });

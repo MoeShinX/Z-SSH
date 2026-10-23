@@ -153,7 +153,10 @@ fn group_tree_crud() {
         })
         .expect("改名");
     assert_eq!(renamed.name, "华东机房");
-    assert_eq!(renamed.sort, 2);
+    assert_eq!(
+        renamed.sort, 1,
+        "保存分组不改顺序：draft.sort 被忽略，保持库里的 1"
+    );
 
     let all = db.group_list().expect("列分组");
     assert_eq!(all.len(), 2);
@@ -1608,4 +1611,288 @@ fn deleting_the_default_proxy_clears_the_settings_that_point_at_it() {
         db.setting_get(app_key).unwrap().as_deref(),
         Some(format!("\"proxy:{}\"", kept.id).as_str())
     );
+}
+
+// ---------- 手动顺序（UI-9） ----------
+
+fn named_host(db: &Database, name: &str, group_id: Option<i64>) -> i64 {
+    let mut draft = sample_host(group_id, None);
+    draft.name = name.to_owned();
+    draft.sort = 0;
+    db.host_save(&draft).unwrap().id
+}
+
+fn named_group(db: &Database, name: &str, parent_id: Option<i64>) -> i64 {
+    db.group_save(&GroupDraft {
+        id: None,
+        name: name.to_owned(),
+        parent_id,
+        sort: 0,
+    })
+    .unwrap()
+    .id
+}
+
+/// (sort, updated_at)
+fn host_row(db: &Database, id: i64) -> (i64, i64) {
+    let host = db.host_get(id).unwrap();
+    (host.sort, host.updated_at)
+}
+
+fn group_sort(db: &Database, id: i64) -> i64 {
+    db.group_list()
+        .unwrap()
+        .into_iter()
+        .find(|group| group.id == id)
+        .unwrap()
+        .sort
+}
+
+/// 把所有记录的 updated_at 压成很久以前，用来看有没有被改。
+fn age_records(db: &Database) {
+    db.with_conn(|conn| {
+        conn.execute("UPDATE hosts SET updated_at = 1000", [])?;
+        conn.execute("UPDATE groups SET updated_at = 1000", [])?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn host_reorder_numbers_the_layer_and_touches_updated_at() {
+    let db = memory_db();
+    let group = named_group(&db, "g", None);
+    let a = named_host(&db, "a", Some(group));
+    let b = named_host(&db, "b", Some(group));
+    let c = named_host(&db, "c", Some(group));
+    let other = named_host(&db, "别层的", None);
+    age_records(&db);
+
+    db.host_reorder(&[c, a, b]).unwrap();
+    assert_eq!(host_row(&db, c).0, 1);
+    assert_eq!(host_row(&db, a).0, 2);
+    assert_eq!(host_row(&db, b).0, 3);
+    for id in [a, b, c] {
+        assert!(
+            host_row(&db, id).1 > 1000,
+            "改了 sort 的记录要更新 updated_at"
+        );
+    }
+    assert_eq!(host_row(&db, other), (0, 1000), "别的层不受影响");
+
+    // 已经是目标值的记录不动
+    age_records(&db);
+    db.host_reorder(&[c, a, b]).unwrap();
+    assert_eq!(host_row(&db, c).1, 1000);
+    // 空列表什么都不做
+    db.host_reorder(&[]).unwrap();
+}
+
+#[test]
+fn host_reorder_works_for_ungrouped_hosts() {
+    let db = memory_db();
+    let a = named_host(&db, "a", None);
+    let b = named_host(&db, "b", None);
+    db.host_reorder(&[b, a]).unwrap();
+    assert_eq!(host_row(&db, b).0, 1);
+    assert_eq!(host_row(&db, a).0, 2);
+}
+
+#[test]
+fn host_reorder_rejects_bad_input_and_changes_nothing() {
+    let db = memory_db();
+    let group = named_group(&db, "g", None);
+    let a = named_host(&db, "a", Some(group));
+    let b = named_host(&db, "b", Some(group));
+    let loose = named_host(&db, "loose", None);
+    age_records(&db);
+
+    // 重复
+    assert!(matches!(
+        db.host_reorder(&[a, b, a]),
+        Err(ZsshError::InvalidInput(_))
+    ));
+    // 不存在（排在前面的已经合法，也不能留下改动）
+    assert!(matches!(
+        db.host_reorder(&[b, a, 9999]),
+        Err(ZsshError::NotFound { .. })
+    ));
+    // 不同层：分组里的 + 未分组的
+    assert!(matches!(
+        db.host_reorder(&[b, a, loose]),
+        Err(ZsshError::InvalidInput(_))
+    ));
+    for id in [a, b, loose] {
+        assert_eq!(host_row(&db, id), (0, 1000), "失败的重排什么都不改");
+    }
+}
+
+#[test]
+fn group_reorder_validates_the_layer_and_is_transactional() {
+    let db = memory_db();
+    let root_a = named_group(&db, "a", None);
+    let root_b = named_group(&db, "b", None);
+    let child = named_group(&db, "c", Some(root_a));
+    let child2 = named_group(&db, "d", Some(root_a));
+    age_records(&db);
+
+    // 不同父分组
+    assert!(matches!(
+        db.group_reorder(&[root_b, root_a, child]),
+        Err(ZsshError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        db.group_reorder(&[root_b, root_b]),
+        Err(ZsshError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        db.group_reorder(&[root_b, 9999]),
+        Err(ZsshError::NotFound { .. })
+    ));
+    for id in [root_a, root_b, child, child2] {
+        assert_eq!(group_sort(&db, id), 0, "失败的重排什么都不改");
+    }
+
+    db.group_reorder(&[root_b, root_a]).unwrap();
+    db.group_reorder(&[child2, child]).unwrap();
+    assert_eq!(group_sort(&db, root_b), 1);
+    assert_eq!(group_sort(&db, root_a), 2);
+    assert_eq!(group_sort(&db, child2), 1);
+    assert_eq!(group_sort(&db, child), 2);
+    let updated: i64 = db
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM groups WHERE updated_at > 1000",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(updated, 4, "改了顺序的分组更新 updated_at");
+    let roots: Vec<i64> = db
+        .group_list()
+        .unwrap()
+        .into_iter()
+        .filter(|group| group.parent_id.is_none())
+        .map(|group| group.id)
+        .collect();
+    assert_eq!(roots, vec![root_b, root_a]);
+}
+
+#[test]
+fn order_reset_puts_one_layer_back_to_name_order() {
+    let db = memory_db();
+    let parent = named_group(&db, "p", None);
+    let sub_a = named_group(&db, "a", Some(parent));
+    let sub_b = named_group(&db, "b", Some(parent));
+    let h1 = named_host(&db, "h1", Some(parent));
+    let h2 = named_host(&db, "h2", Some(parent));
+    let loose1 = named_host(&db, "l1", None);
+    let loose2 = named_host(&db, "l2", None);
+    let deep = named_host(&db, "deep", Some(sub_a));
+    db.group_reorder(&[sub_b, sub_a]).unwrap();
+    db.host_reorder(&[h2, h1]).unwrap();
+    db.host_reorder(&[loose2, loose1]).unwrap();
+    db.host_reorder(&[deep]).unwrap();
+    age_records(&db);
+
+    db.order_reset(Some(parent)).unwrap();
+    assert_eq!(group_sort(&db, sub_a), 0);
+    assert_eq!(group_sort(&db, sub_b), 0);
+    assert_eq!(host_row(&db, h1).0, 0);
+    assert_eq!(host_row(&db, h2).0, 0);
+    assert!(host_row(&db, h1).1 > 1000, "重置也要更新 updated_at");
+    assert_eq!(host_row(&db, loose1).0, 2, "别的层不受影响");
+    assert_eq!(
+        host_row(&db, deep),
+        (1, 1000),
+        "子分组里的主机是另一层，不受影响"
+    );
+
+    // 未分组
+    db.order_reset(None).unwrap();
+    assert_eq!(host_row(&db, loose1).0, 0);
+    assert_eq!(host_row(&db, loose2).0, 0);
+    // 不存在的分组
+    assert!(matches!(
+        db.order_reset(Some(9999)),
+        Err(ZsshError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn saving_a_host_keeps_its_order_unless_the_group_changes() {
+    let db = memory_db();
+    let g1 = named_group(&db, "g1", None);
+    let g2 = named_group(&db, "g2", None);
+    let a = named_host(&db, "a", Some(g1));
+    let b = named_host(&db, "b", Some(g1));
+    db.host_reorder(&[b, a]).unwrap();
+
+    // 只改名字等字段，draft.sort 带着旧值（甚至是 0）：库里的顺序不变
+    let mut draft = sample_host(Some(g1), None);
+    draft.id = Some(a);
+    draft.name = "a2".to_owned();
+    draft.sort = 0;
+    let saved = db.host_save(&draft).unwrap();
+    assert_eq!(saved.sort, 2);
+    draft.sort = 99;
+    assert_eq!(db.host_save(&draft).unwrap().sort, 2);
+
+    // 换分组：sort 置 0，排到新分组末尾
+    draft.group_id = Some(g2);
+    draft.sort = 2;
+    assert_eq!(db.host_save(&draft).unwrap().sort, 0);
+    // 换回未分组也算换分组
+    draft.group_id = None;
+    assert_eq!(db.host_save(&draft).unwrap().sort, 0);
+    assert_eq!(host_row(&db, b).0, 1, "别的主机不受影响");
+}
+
+#[test]
+fn saving_a_group_keeps_its_order_unless_the_parent_changes() {
+    let db = memory_db();
+    let root = named_group(&db, "root", None);
+    let a = named_group(&db, "a", Some(root));
+    let b = named_group(&db, "b", Some(root));
+    db.group_reorder(&[b, a]).unwrap();
+
+    let renamed = db
+        .group_save(&GroupDraft {
+            id: Some(a),
+            name: "a2".to_owned(),
+            parent_id: Some(root),
+            sort: 0,
+        })
+        .unwrap();
+    assert_eq!(renamed.sort, 2, "只改名字，顺序不变");
+
+    let moved = db
+        .group_save(&GroupDraft {
+            id: Some(a),
+            name: "a2".to_owned(),
+            parent_id: None,
+            sort: 2,
+        })
+        .unwrap();
+    assert_eq!(moved.sort, 0, "换了父分组，排到新那一层末尾");
+}
+
+#[test]
+fn reorder_notifies_sync_listeners_only_on_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let db = memory_db();
+    let a = named_host(&db, "a", None);
+    let b = named_host(&db, "b", None);
+    let fired = Arc::new(AtomicUsize::new(0));
+    let counter = fired.clone();
+    db.set_change_listener(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    db.host_reorder(&[b, a]).unwrap();
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert!(db.host_reorder(&[a, a]).is_err());
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "失败不通知");
 }
