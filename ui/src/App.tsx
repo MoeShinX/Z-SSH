@@ -397,6 +397,8 @@ export default function App() {
   const [forwardHostId, setForwardHostId] = useState<number | null>(null);
   /** 快捷命令面板打开时要编辑的那一条（"new" = 新建）。 */
   const [quickEditId, setQuickEditId] = useState<string | null>(null);
+  // 每次从命令栏打开 / 新建 / 编辑都换一个：面板按它重新挂载，已经开着时再点「+」也能重新进入新建
+  const [quickPanelNonce, setQuickPanelNonce] = useState(0);
   // 快捷命令栏：列表跟着同步，开关和当前分组只在本机
   const quickRaw = useSettings((state) => state.quick_commands);
   const quickBarOpen = useSettings((state) => state.quick_commands_bar);
@@ -1612,9 +1614,6 @@ export default function App() {
 
   const openHost = useCallback(
     (host: Host) => {
-      // 主机页双击连接时，第一下单击已经打开了这台主机的详情：连接就不需要它了，关掉。
-      // 连不上的话 showHostAfterFailedConnect 会再把它打开。
-      setHostPanel((current) => (current?.host?.id === host.id ? null : current));
       // 当前是个空白标签（新标签、还没连）：就在它里面连，不再另开一个
       const current = wsRef.current;
       const tab = current.tabs.find((item) => item.id === current.activeTabId);
@@ -1780,6 +1779,7 @@ export default function App() {
 
   const openQuickCommandsPanel = useCallback((editId: string | null) => {
     setQuickEditId(editId);
+    setQuickPanelNonce((nonce) => nonce + 1);
     setSidePanel("quickCommands");
   }, []);
 
@@ -3115,7 +3115,13 @@ export default function App() {
                           void updateSettingValue("quick_commands_group", group)
                         }
                         onRun={runQuickCommand}
-                        onManage={() => openQuickCommandsPanel(quickCommands.length ? null : "new")}
+                        // 面板开着（不管是列表、新建还是编辑某条）时再点管理按钮就关上
+                        onManage={() =>
+                          sidePanel === "quickCommands"
+                            ? setSidePanel("none")
+                            : openQuickCommandsPanel(quickCommands.length ? null : "new")
+                        }
+                        managing={sidePanel === "quickCommands"}
                         onCreate={() => openQuickCommandsPanel("new")}
                         onEdit={(command) => openQuickCommandsPanel(command.id)}
                         onDelete={(command) =>
@@ -3317,6 +3323,7 @@ export default function App() {
         )}
         {sidePanel === "quickCommands" && (
           <QuickCommandsPanel
+            key={quickPanelNonce}
             commands={quickCommands}
             onChange={saveQuickCommands}
             initialEditId={quickEditId}

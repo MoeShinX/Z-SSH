@@ -103,6 +103,8 @@ export const SETTING_DEFAULTS = {
   "layout.vault_expanded": "",
   // 主机页左边树收起没有，同样是本机布局、不同步
   "layout.vault_sidebar_collapsed": false,
+  // 主机页右边的显示方式：grid 卡片 / list 列表（本机布局、不同步）
+  "layout.vault_view_mode": "grid",
   // 最近打开的主机（id，逗号分隔，最近的在前），主机页卡片按它排；本机布局、不同步
   "layout.recent_hosts": "",
   // 服务器概览面板的宽度（拖左边缘调），本机布局、不同步
@@ -171,6 +173,7 @@ export interface SettingValues {
   "layout.quick_bar_height": number;
   "layout.vault_expanded": string;
   "layout.vault_sidebar_collapsed": boolean;
+  "layout.vault_view_mode": string;
   "layout.recent_hosts": string;
   "layout.overview_width": number;
   quick_commands: string;

@@ -67,11 +67,39 @@ describe("快捷命令栏", () => {
     expect(p.onCreate).toHaveBeenCalledTimes(2);
   });
 
-  it("没有命令时引导去添加", () => {
+  it("没有命令时引导去添加（直接新建）；「+」照样在", () => {
     const p = props({ commands: [] });
     render(<QuickCommandBar {...p} />);
     fireEvent.click(screen.getByText(/还没有快捷命令/));
-    expect(p.onManage).toHaveBeenCalled();
+    expect(p.onCreate).toHaveBeenCalledTimes(1);
+    expect(p.onManage).not.toHaveBeenCalled();
+    expect(screen.getByTitle("新建快捷命令")).toBeTruthy();
+  });
+
+  it("管理按钮的图标和顶栏的 ⌘ 不一样；「+」在管理按钮旁边、命令按钮之前，点它新建", () => {
+    const p = props();
+    const { container } = render(<QuickCommandBar {...p} />);
+    const manage = screen.getByTitle("管理快捷命令");
+    expect(manage.querySelector("svg")?.getAttribute("class")).toContain("lucide-list-checks");
+    expect(manage.querySelector("svg")?.getAttribute("class")).not.toContain("lucide-command");
+    const create = screen.getByTitle("新建快捷命令");
+    expect(create.querySelector("svg")?.getAttribute("class")).toContain("lucide-plus");
+    // 固定在左边（不在会滚动 / 换行的命令列表里）
+    const list = container.querySelector('[data-section="quick-command-list"]') as HTMLElement;
+    expect(list.contains(create)).toBe(false);
+    expect(manage.compareDocumentPosition(create) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(create.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(create);
+    expect(p.onCreate).toHaveBeenCalledTimes(1);
+    fireEvent.click(manage);
+    expect(p.onManage).toHaveBeenCalledTimes(1);
+  });
+
+  it("面板开着时管理按钮显示成按下的样子", () => {
+    const { rerender } = render(<QuickCommandBar {...props()} />);
+    expect(screen.getByTitle("管理快捷命令").getAttribute("aria-pressed")).toBe("false");
+    rerender(<QuickCommandBar {...props({ managing: true })} />);
+    expect(screen.getByTitle("管理快捷命令").getAttribute("aria-pressed")).toBe("true");
   });
 
   it("只有一个窗格时广播开关灰掉；开着时显示广播中", () => {

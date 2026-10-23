@@ -1,14 +1,17 @@
 //! 管理快捷命令的侧面板（和代理、凭据面板同一种样式）：列表 + 选中后在下面编辑。
 
-import { ArrowDown, ArrowUp, Pencil, Plus, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Pencil, Plus, Search, Trash2, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "../../lib/utils";
 import {
+  canMoveInGroup,
   COMMANDS_MAX,
   groupsOf,
-  moveQuickCommand,
+  moveQuickCommandInGroup,
   newQuickCommandId,
+  searchQuickCommands,
+  sectionsOfQuickCommands,
   upsertQuickCommand,
   validateQuickCommand,
   type QuickCommand,
@@ -19,8 +22,8 @@ import {
   AsidePanelFooter,
   AsidePanelSection,
 } from "../ui/aside-panel";
-import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
+import { Combobox } from "../ui/combobox";
 import { ConfirmDialog } from "../ui/confirm-dialog";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -65,6 +68,9 @@ export default function QuickCommandsPanel({
 }: QuickCommandsPanelProps) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<QuickCommand | null>(null);
+  const [query, setQuery] = useState("");
+  // 折起来的分组（"" = 未分组）；不持久化，每次打开面板都是全部展开
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
 
   useEffect(() => {
     if (initialEditId === "new") setDraft({ ...EMPTY });
@@ -77,6 +83,82 @@ export default function QuickCommandsPanel({
   }, [initialEditId]);
 
   const groups = groupsOf(commands);
+  const searching = query.trim() !== "";
+  const sections = useMemo(() => sectionsOfQuickCommands(searchQuickCommands(commands, query)), [commands, query]);
+  // 一个分组都没有时不画分组标题，和以前一样是一张平铺的列表
+  const grouped = groups.length > 0;
+  const toggleSection = (group: string) =>
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (!next.delete(group)) next.add(group);
+      return next;
+    });
+
+  const renderRow = (command: QuickCommand) => {
+    const selected = draft?.id === command.id;
+    // 上移 / 下移只在同一分组内动（跨分组没意义）；搜索时列表是过滤过的，不连续，一律禁用
+    const [canUp, canDown] = canMoveInGroup(commands, command.id);
+    return (
+      <div
+        key={command.id}
+        data-quick-command-row={command.id}
+        className={cn(
+          "flex items-center gap-1 rounded-md border pr-1",
+          selected ? "border-primary bg-primary/10" : "border-border/60 hover:bg-accent/40",
+        )}
+      >
+        <button
+          onClick={() => setDraft(draftOf(command))}
+          className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left"
+        >
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm">{command.name}</span>
+            <span className="block truncate font-mono text-xs text-muted-foreground">
+              {command.command.split(/\r?\n/)[0]}
+            </span>
+          </span>
+        </button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6"
+          title={searching ? "上移（搜索时不可用）" : "上移"}
+          disabled={searching || !canUp}
+          onClick={() => onChange(moveQuickCommandInGroup(commands, command.id, -1))}
+        >
+          <ArrowUp size={12} />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6"
+          title={searching ? "下移（搜索时不可用）" : "下移"}
+          disabled={searching || !canDown}
+          onClick={() => onChange(moveQuickCommandInGroup(commands, command.id, 1))}
+        >
+          <ArrowDown size={12} />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6"
+          title="编辑"
+          onClick={() => setDraft(draftOf(command))}
+        >
+          <Pencil size={12} />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          title="删除"
+          onClick={() => setConfirmDelete(command)}
+        >
+          <Trash2 size={12} />
+        </Button>
+      </div>
+    );
+  };
 
   const save = () => {
     if (!draft) return;
@@ -120,74 +202,67 @@ export default function QuickCommandsPanel({
       <AsidePanelContent>
         <AsidePanelSection title="命令列表">
           <p className="text-xs text-muted-foreground">
-            显示在终端底部的命令栏里，顺序就是这里的顺序。单击发到当前窗格，Ctrl+单击发到这个标签的所有分屏。
+            显示在终端底部的命令栏里，同一分组内的顺序就是命令栏里的顺序（上移 / 下移只在分组内移动）。单击发到当前窗格，Ctrl+单击发到这个标签的所有分屏。
           </p>
+          {commands.length > 0 && (
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                data-section="quick-command-search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && query !== "") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setQuery("");
+                  }
+                }}
+                className="h-8 pl-8 pr-8 text-[13px]"
+                placeholder="搜索名称、命令或分组"
+                aria-label="搜索快捷命令"
+                spellCheck={false}
+                autoComplete="off"
+              />
+              {query !== "" && (
+                <button
+                  type="button"
+                  title="清空搜索"
+                  aria-label="清空搜索"
+                  onClick={() => setQuery("")}
+                  className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+          )}
           <div className="space-y-1">
             {commands.length === 0 && (
               <p className="px-1 py-2 text-sm text-muted-foreground">
                 还没有快捷命令，点右上角「新建命令」添加。
               </p>
             )}
-            {commands.map((command, index) => {
-              const selected = draft?.id === command.id;
+            {commands.length > 0 && sections.length === 0 && (
+              <p className="px-1 py-2 text-sm text-muted-foreground">没有匹配的命令。</p>
+            )}
+            {sections.map((section) => {
+              if (!grouped) return section.items.map(renderRow);
+              // 搜索时有匹配的分组自动展开（不动用户折起来的状态，清掉搜索后还是原样）
+              const open = searching || !collapsed.has(section.group);
               return (
-                <div
-                  key={command.id}
-                  className={cn(
-                    "flex items-center gap-1 rounded-md border pr-1",
-                    selected ? "border-primary bg-primary/10" : "border-border/60 hover:bg-accent/40",
-                  )}
-                >
+                <div key={section.group || "\u0000ungrouped"} data-quick-command-group={section.group || "none"} className="space-y-1">
                   <button
-                    onClick={() => setDraft(draftOf(command))}
-                    className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left"
+                    type="button"
+                    aria-expanded={open}
+                    onClick={() => toggleSection(section.group)}
+                    className="flex w-full cursor-pointer items-center gap-1 rounded px-1 py-1 text-left text-xs font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground"
                   >
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm">{command.name}</span>
-                      <span className="block truncate font-mono text-xs text-muted-foreground">
-                        {command.command.split(/\r?\n/)[0]}
-                      </span>
-                    </span>
-                    {command.group && <Badge variant="secondary">{command.group}</Badge>}
+                    {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    <span className="truncate">{section.group || "未分组"}</span>
+                    <span className="ml-auto shrink-0 font-normal">{section.items.length}</span>
                   </button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6"
-                    title="上移"
-                    disabled={index === 0}
-                    onClick={() => onChange(moveQuickCommand(commands, command.id, -1))}
-                  >
-                    <ArrowUp size={12} />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6"
-                    title="下移"
-                    disabled={index === commands.length - 1}
-                    onClick={() => onChange(moveQuickCommand(commands, command.id, 1))}
-                  >
-                    <ArrowDown size={12} />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6"
-                    title="编辑"
-                    onClick={() => setDraft(draftOf(command))}
-                  >
-                    <Pencil size={12} />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                    title="删除"
-                    onClick={() => setConfirmDelete(command)}
-                  >
-                    <Trash2 size={12} />
-                  </Button>
+                  {open && section.items.map(renderRow)}
                 </div>
               );
             })}
@@ -211,18 +286,14 @@ export default function QuickCommandsPanel({
                 分组
                 <span className="ml-2 text-xs font-normal text-muted-foreground">可选</span>
               </Label>
-              <Input
+              <Combobox
                 value={draft.group}
-                onChange={(event) => setDraft({ ...draft, group: event.target.value })}
+                onChange={(group) => setDraft({ ...draft, group })}
+                options={groups}
                 className="h-9"
                 placeholder="例如：Debian、面板安装、测试脚本"
-                list="quick-command-groups"
+                aria-label="分组"
               />
-              <datalist id="quick-command-groups">
-                {groups.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
             </div>
             <div className="space-y-1.5">
               <Label>命令</Label>

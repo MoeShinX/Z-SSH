@@ -3,11 +3,11 @@
 //! - 单击：发到当前焦点的窗格；Ctrl+单击（或这个标签开着输入广播）：发到这个标签的所有分屏
 //! - 右键按钮：编辑 / 删除 / 发到所有分屏
 //! - 双击或右键按钮之间 / 后面的空白处：新建一条快捷命令
-//! - 最左边：管理快捷命令；分组切换；输入广播开关
+//! - 最左边：管理快捷命令（再点一下关上面板）和「+」新建；分组切换；输入广播开关
 //! - 上边框可以拖：默认一行（放不下横向滚动），拖高后按钮自动换行、放不下纵向滚动；
 //!   双击拖动条恢复一行
 
-import { Command, Radio, SquareTerminal } from "lucide-react";
+import { ListChecks, Plus, Radio, SquareTerminal } from "lucide-react";
 import { useRef } from "react";
 
 import { cn } from "../../lib/utils";
@@ -34,8 +34,11 @@ export interface QuickCommandBarProps {
   onGroupChange: (group: string) => void;
   /** `all` = 发到这个标签的所有分屏。 */
   onRun: (command: QuickCommand, all: boolean) => void;
+  /** 管理按钮：App 里是开关右侧的管理面板（开着时再点就关上）。 */
   onManage: () => void;
-  /** 在空白处双击 / 右键：直接新建一条。 */
+  /** 右侧的管理面板正开着（管理按钮显示成按下的样子）。 */
+  managing?: boolean;
+  /** 「+」按钮、空白处双击 / 右键、没有命令时的提示：直接新建一条。 */
   onCreate: () => void;
   onEdit: (command: QuickCommand) => void;
   onDelete: (command: QuickCommand) => void;
@@ -53,6 +56,7 @@ export default function QuickCommandBar({
   onGroupChange,
   onRun,
   onManage,
+  managing = false,
   onCreate,
   onEdit,
   onDelete,
@@ -83,14 +87,30 @@ export default function QuickCommandBar({
         onCommit={onCommit}
         onReset={onReset}
       />
+      {/* 图标和顶栏右上角的 ⌘（显示 / 隐藏这一栏）区分开：这里是管理列表 */}
+      <Button
+        variant="ghost"
+        size="icon"
+        className={cn("h-6 w-6 shrink-0", managing && "bg-accent text-accent-foreground")}
+        title="管理快捷命令"
+        aria-label="管理快捷命令"
+        aria-pressed={managing}
+        data-action="manage-quick-commands"
+        onClick={onManage}
+      >
+        <ListChecks size={13} />
+      </Button>
+      {/* 放在左边的固定位置：命令多到横向滚动 / 换行时也一直看得见 */}
       <Button
         variant="ghost"
         size="icon"
         className="h-6 w-6 shrink-0"
-        title="管理快捷命令"
-        onClick={onManage}
+        title="新建快捷命令"
+        aria-label="新建快捷命令"
+        data-action="create-quick-command"
+        onClick={onCreate}
       >
-        <Command size={13} />
+        <Plus size={14} />
       </Button>
       {groups.length > 0 && (
         <Select
@@ -140,7 +160,7 @@ export default function QuickCommandBar({
       >
         {commands.length === 0 ? (
           <button
-            onClick={onManage}
+            onClick={onCreate}
             className="my-0.5 truncate rounded px-2 py-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
           >
             还没有快捷命令，点这里添加常用命令（例如查看端口、系统更新）

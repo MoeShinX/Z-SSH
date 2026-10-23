@@ -124,3 +124,58 @@ export function moveQuickCommand(list: QuickCommand[], id: string, delta: -1 | 1
   [next[index], next[target]] = [next[target], next[index]];
   return next;
 }
+
+/** 分组键：没有分组的用空串。 */
+const groupOfCommand = (item: QuickCommand): string => item.group ?? "";
+
+/**
+ * 在同一分组内上移 / 下移一位。和同组里相邻的那条交换它们在整个列表里的位置，别的分组的命令
+ * 原地不动，所以每个分组里的相对顺序（也就是选了这个分组后命令栏里的顺序）恰好变了这一位。
+ * 已经是组内第一 / 最后一条时原样返回。
+ */
+export function moveQuickCommandInGroup(list: QuickCommand[], id: string, delta: -1 | 1): QuickCommand[] {
+  const index = list.findIndex((item) => item.id === id);
+  if (index < 0) return list;
+  const group = groupOfCommand(list[index]);
+  let target = index + delta;
+  while (target >= 0 && target < list.length && groupOfCommand(list[target]) !== group) target += delta;
+  if (target < 0 || target >= list.length) return list;
+  const next = list.slice();
+  [next[index], next[target]] = [next[target], next[index]];
+  return next;
+}
+
+/** 这条在自己的分组里还能不能上移 / 下移：[上移, 下移]。 */
+export function canMoveInGroup(list: QuickCommand[], id: string): [boolean, boolean] {
+  return [
+    moveQuickCommandInGroup(list, id, -1) !== list,
+    moveQuickCommandInGroup(list, id, 1) !== list,
+  ];
+}
+
+/** 按名字、命令内容、分组过滤（不分大小写）；搜索词为空返回原列表。 */
+export function searchQuickCommands(list: QuickCommand[], query: string): QuickCommand[] {
+  const text = query.trim().toLowerCase();
+  if (text === "") return list;
+  return list.filter(
+    (item) =>
+      item.name.toLowerCase().includes(text) ||
+      item.command.toLowerCase().includes(text) ||
+      (item.group ?? "").toLowerCase().includes(text),
+  );
+}
+
+export interface QuickCommandSection {
+  /** 分组名；空串 = 未分组。 */
+  group: string;
+  items: QuickCommand[];
+}
+
+/** 按分组归拢（管理面板的显示）：分组按第一次出现的顺序，未分组放最后；组内保持列表里的相对顺序。 */
+export function sectionsOfQuickCommands(list: QuickCommand[]): QuickCommandSection[] {
+  const sections: QuickCommandSection[] = groupsOf(list).map((group) => ({ group, items: [] }));
+  const byGroup = new Map(sections.map((section) => [section.group, section]));
+  const ungrouped: QuickCommandSection = { group: "", items: [] };
+  for (const item of list) (item.group ? byGroup.get(item.group) : ungrouped)?.items.push(item);
+  return ungrouped.items.length > 0 ? [...sections, ungrouped] : sections;
+}

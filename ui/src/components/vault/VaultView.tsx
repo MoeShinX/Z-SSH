@@ -153,7 +153,10 @@ export default function VaultView({
   }, []);
   const [selectedGroup, setSelectedGroup] = useState<number | null | "all">("all");
   const [selectedHostId, setSelectedHostId] = useState<number | null>(null);
-  const [mode, setMode] = useState<ViewMode>("grid");
+  // 卡片 / 列表记在设置里（本机布局），重启后保持上次选的
+  const mode: ViewMode = useSettings((state) => state["layout.vault_view_mode"]) === "list" ? "list" : "grid";
+  const updateSetting = useSettings((state) => state.update);
+  const setMode = (next: ViewMode) => void updateSetting("layout.vault_view_mode", next);
   const [installHost, setInstallHost] = useState<Host | null>(null);
 
   const groupName = useMemo(() => {
@@ -188,9 +191,13 @@ export default function VaultView({
     }
   };
 
-  /** 右边卡片的操作（单击看详情、双击连接、右键菜单）。 */
+  /**
+   * 主机页的主机操作（右边卡片 / 列表和左边的树共用）：单击只选中（两边联动高亮），双击连接，
+   * 右键「编辑」和卡片 / 行上的铅笔按钮才打开详情。
+   */
   const hostActions: HostActions = {
-    select: (host) => {
+    select: (host) => setSelectedHostId(host.id),
+    edit: (host) => {
       setSelectedHostId(host.id);
       onSelectHost(host);
     },
@@ -202,12 +209,6 @@ export default function VaultView({
     forwards: (host) => onOpenForwards(host.id),
   };
 
-  /** 左边树里的主机：和终端界面的树一样，单击只高亮并展开底部的属性面板，右键「编辑」才打开详情。 */
-  const treeHostActions: HostActions = {
-    ...hostActions,
-    select: (host) => setSelectedHostId(host.id),
-    edit: hostActions.select,
-  };
 
   const copyHost = (host: Host, kind: HostCopyKind) => {
     const text = hostCopyText(host, kind);
@@ -224,7 +225,7 @@ export default function VaultView({
         selectedGroup={selectedGroup}
         onSelectGroup={setSelectedGroup}
         selectedHostId={selectedHostId}
-        hostActions={treeHostActions}
+        hostActions={hostActions}
         onNewHost={onNewHost}
         onNewGroup={onNewGroup}
         onEditGroup={onEditGroup}
@@ -294,7 +295,7 @@ export default function VaultView({
               onNewHost={() => onNewHost(selectedGroup === "all" ? null : selectedGroup)}
             />
           ) : mode === "grid" ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
+            <div data-view="grid" className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
               {filtered.map((host) => (
                 <HostCard
                   key={host.id}
@@ -302,8 +303,9 @@ export default function VaultView({
                   groupName={host.group_id === null ? null : groupName.get(host.group_id) ?? null}
                   onConnect={() => onOpenHost(host)}
                   onOpenSftp={() => onOpenSftp(host)}
-                  onSelect={() => onSelectHost(host)}
-                  onEdit={() => onSelectHost(host)}
+                  selected={selectedHostId === host.id}
+                  onSelect={() => hostActions.select(host)}
+                  onEdit={() => hostActions.edit?.(host)}
                   onDelete={() => onDeleteHost(host)}
                   onCopy={(kind) => copyHost(host, kind)}
                   onInstallKey={() => setInstallHost(host)}
@@ -312,17 +314,18 @@ export default function VaultView({
               ))}
             </div>
           ) : (
-            <div className="overflow-hidden rounded-lg border border-border/60">
+            <div data-view="list" className="overflow-hidden rounded-lg border border-border/60">
               {filtered.map((host, index) => (
                 <HostRow
                   key={host.id}
                   host={host}
                   groupName={host.group_id === null ? null : groupName.get(host.group_id) ?? null}
                   last={index === filtered.length - 1}
+                  selected={selectedHostId === host.id}
                   onConnect={() => onOpenHost(host)}
                   onOpenSftp={() => onOpenSftp(host)}
-                  onSelect={() => onSelectHost(host)}
-                  onEdit={() => onSelectHost(host)}
+                  onSelect={() => hostActions.select(host)}
+                  onEdit={() => hostActions.edit?.(host)}
                   onDelete={() => onDeleteHost(host)}
                   onCopy={(kind) => copyHost(host, kind)}
                   onInstallKey={() => setInstallHost(host)}
@@ -833,7 +836,7 @@ export interface HostActions {
   remove: (host: Host) => void;
   copy: (host: Host, kind: HostCopyKind) => void;
   installKey?: (host: Host) => void;
-  /** 右键「编辑」；没给就和单击一样（主机页单击就是打开详情）。 */
+  /** 右键「编辑」/ 编辑按钮：打开详情；没给就和单击一样。 */
   edit?: (host: Host) => void;
   forwards?: (host: Host) => void;
 }
@@ -998,10 +1001,45 @@ function HostLeaf({
   );
 }
 
-/** 主机卡片（网格视图）。双击连接，右键出菜单，悬停显示"连接"。 */
+/** 卡片 / 行获得焦点时的快捷键：Enter 连接、F2 打开详情（子按钮自己的按键不处理）。 */
+function hostKeyDown(event: React.KeyboardEvent, onConnect: () => void, onEdit: () => void) {
+  if (event.target !== event.currentTarget || event.nativeEvent.isComposing) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    onConnect();
+  } else if (event.key === "F2") {
+    event.preventDefault();
+    onEdit();
+  }
+}
+
+/** 卡片 / 行上的编辑（铅笔）按钮：点它打开详情，点击和双击都不冒泡成卡片的单击 / 双击。 */
+function EditButton({ onEdit, className }: { onEdit: () => void; className?: string }) {
+  return (
+    <Button
+      size="icon-sm"
+      variant="secondary"
+      title="编辑"
+      aria-label="编辑"
+      data-action="edit-host"
+      className={className}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.stopPropagation();
+        onEdit();
+      }}
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      <Pencil size={13} />
+    </Button>
+  );
+}
+
+/** 主机卡片（网格视图）。单击选中，双击连接，右键出菜单，悬停显示「编辑」和「连接」。 */
 function HostCard({
   host,
   groupName,
+  selected,
   onConnect,
   onOpenSftp,
   onSelect,
@@ -1013,6 +1051,7 @@ function HostCard({
 }: {
   host: Host;
   groupName: string | null;
+  selected: boolean;
   onConnect: () => void;
   onOpenSftp: () => void;
   onSelect: () => void;
@@ -1026,10 +1065,18 @@ function HostCard({
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
+          data-section="host-card"
+          data-host-id={host.id}
+          data-selected={selected ? "true" : undefined}
+          tabIndex={0}
           onPointerDown={(event) => startHostDrag(host, event)}
           onClick={() => !dragJustEnded() && onSelect()}
           onDoubleClick={onConnect}
-          className="group cursor-pointer rounded-lg border border-border/60 bg-card p-4 shadow-sm transition-colors hover:border-ring/60 hover:bg-accent/30"
+          onKeyDown={(event) => hostKeyDown(event, onConnect, onEdit)}
+          className={cn(
+            "group cursor-pointer rounded-lg border bg-card p-4 shadow-sm outline-none transition-colors hover:border-ring/60 hover:bg-accent/30 focus-visible:ring-1 focus-visible:ring-ring/60",
+            selected ? "border-ring/70 bg-accent/40" : "border-border/60",
+          )}
         >
           <div className="flex items-start gap-3">
             <OsIcon hostId={host.id} size="card" />
@@ -1039,18 +1086,24 @@ function HostCard({
                 {host.username}@{host.host}:{host.port}
               </div>
             </div>
-            <Button
-              size="icon-sm"
-              variant="secondary"
-              title="连接"
-              className="opacity-0 transition-opacity group-hover:opacity-100"
-              onClick={(event) => {
-                event.stopPropagation();
-                onConnect();
-              }}
-            >
-              <Play size={13} />
-            </Button>
+            <div className="flex shrink-0 items-center gap-1">
+              <EditButton
+                onEdit={onEdit}
+                className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
+              />
+              <Button
+                size="icon-sm"
+                variant="secondary"
+                title="连接"
+                className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onConnect();
+                }}
+              >
+                <Play size={13} />
+              </Button>
+            </div>
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-1">
             {groupName && <Badge variant="secondary">{groupName}</Badge>}
@@ -1077,11 +1130,12 @@ function HostCard({
   );
 }
 
-/** 主机行（列表视图）。 */
+/** 主机行（列表视图）。单击选中，双击连接；右侧常显编辑按钮，悬停显示「连接」。 */
 function HostRow({
   host,
   groupName,
   last,
+  selected,
   onConnect,
   onOpenSftp,
   onSelect,
@@ -1094,6 +1148,7 @@ function HostRow({
   host: Host;
   groupName: string | null;
   last: boolean;
+  selected: boolean;
   onConnect: () => void;
   onOpenSftp: () => void;
   onSelect: () => void;
@@ -1107,11 +1162,17 @@ function HostRow({
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
+          data-section="host-row"
+          data-host-id={host.id}
+          data-selected={selected ? "true" : undefined}
+          tabIndex={0}
           onPointerDown={(event) => startHostDrag(host, event)}
           onClick={() => !dragJustEnded() && onSelect()}
           onDoubleClick={onConnect}
+          onKeyDown={(event) => hostKeyDown(event, onConnect, onEdit)}
           className={cn(
-            "group grid cursor-pointer grid-cols-[minmax(0,1.4fr)_minmax(0,1.6fr)_minmax(0,0.8fr)_auto] items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-accent/30",
+            "group grid cursor-pointer grid-cols-[minmax(0,1.4fr)_minmax(0,1.6fr)_minmax(0,0.8fr)_auto] items-center gap-3 px-4 py-2.5 text-sm outline-none transition-colors hover:bg-accent/30 focus-visible:bg-accent/30",
+            selected && "bg-accent/60",
             !last && "border-b border-border/40",
           )}
         >
@@ -1120,17 +1181,20 @@ function HostRow({
             {host.username}@{host.host}:{host.port}
           </span>
           <span className="truncate text-xs text-muted-foreground">{groupName ?? "未分组"}</span>
-          <Button
-            size="sm"
-            variant="secondary"
-            className="opacity-0 transition-opacity group-hover:opacity-100"
-            onClick={(event) => {
-              event.stopPropagation();
-              onConnect();
-            }}
-          >
-            <Play size={13} /> 连接
-          </Button>
+          <div className="flex shrink-0 items-center gap-1">
+            <EditButton onEdit={onEdit} />
+            <Button
+              size="sm"
+              variant="secondary"
+              className="opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
+              onClick={(event) => {
+                event.stopPropagation();
+                onConnect();
+              }}
+            >
+              <Play size={13} /> 连接
+            </Button>
+          </div>
         </div>
       </ContextMenuTrigger>
       <HostMenu

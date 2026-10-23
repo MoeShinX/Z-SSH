@@ -60,7 +60,11 @@ beforeEach(() => {
     hosts: [host(1, "CA1 PVE", 2), host(2, "DE1 PVE", 2), host(3, "loose", null)],
     load: async () => {},
   } as never);
-  useSettings.setState({ "layout.vault_expanded": "", "layout.vault_sidebar_collapsed": false });
+  useSettings.setState({
+    "layout.vault_expanded": "",
+    "layout.vault_sidebar_collapsed": false,
+    "layout.vault_view_mode": "grid",
+  });
   globalThis.ResizeObserver = class {
     observe() {}
     unobserve() {}
@@ -96,6 +100,20 @@ describe("主机树", () => {
     expect(handlers.onSelectHost).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
     fireEvent.doubleClick(first);
     expect(handlers.onOpenHost).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
+  });
+
+  it("卡片 / 列表的选择记在设置里：切成列表后写进设置，下次按设置里的显示", async () => {
+    const { settingsSet } = await import("../../api/settings");
+    const first = render(<VaultView {...props()} />);
+    expect(document.querySelector('[data-view="grid"]')).not.toBeNull();
+    await act(async () => screen.getByTitle("列表视图").click());
+    expect(vi.mocked(settingsSet)).toHaveBeenCalledWith("layout.vault_view_mode", JSON.stringify("list"));
+    expect(document.querySelector('[data-view="list"]')).not.toBeNull();
+    first.unmount();
+    // 重启：设置里读回来的是 list
+    useSettings.setState({ "layout.vault_view_mode": "list" });
+    render(<VaultView {...props()} />);
+    expect(document.querySelector('[data-view="list"]')).not.toBeNull();
   });
 
   it("搜索时有匹配主机的分组自动展开", async () => {

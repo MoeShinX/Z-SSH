@@ -93,6 +93,8 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("layout.quick_bar_height", SyncMode::LocalOnly),
     ("layout.vault_expanded", SyncMode::LocalOnly),
     ("layout.vault_sidebar_collapsed", SyncMode::LocalOnly),
+    // 主机页右边用卡片还是列表：本机的使用习惯
+    ("layout.vault_view_mode", SyncMode::LocalOnly),
     // 主机页卡片按最近打开排：每台电脑用的不一样
     ("layout.recent_hosts", SyncMode::LocalOnly),
     ("layout.overview_width", SyncMode::LocalOnly),

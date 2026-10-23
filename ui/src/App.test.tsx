@@ -8,7 +8,7 @@
 //!
 //! 这里直接盯住 `session_open` 的调用次数：修之前是 2，修之后是 1。
 
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps, Ref } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -629,6 +629,52 @@ describe("主机页的快捷命令按钮", () => {
   });
 });
 
+describe("终端底部命令栏的管理按钮和「+」（UI-10）", () => {
+  async function openTerminalWithBar() {
+    const view = await mountApp();
+    // mountApp 重置了模块：设置 store 要在它之后取，才是 App 用的那一份
+    const { useSettings } = await import("./stores/settings");
+    await act(async () => useSettings.setState({ quick_commands_bar: true } as never));
+    await act(async () => view.getByTestId("open-host").click());
+    await waitFor(() => expect(mocks.ready.size).toBe(1));
+    const root = document.body;
+    return {
+      manage: () => root.querySelector('[data-action="manage-quick-commands"]') as HTMLElement,
+      create: () => root.querySelector('[data-action="create-quick-command"]') as HTMLElement,
+      listPanel: () => screen.queryByText("命令列表"),
+    };
+  }
+
+  it("管理按钮开关右侧的面板：再点一下关上", async () => {
+    const bar = await openTerminalWithBar();
+    expect(bar.listPanel()).toBeNull();
+    await act(async () => bar.manage().click());
+    expect(bar.listPanel()).not.toBeNull();
+    expect(bar.manage().getAttribute("aria-pressed")).toBe("true");
+    await act(async () => bar.manage().click());
+    expect(bar.listPanel()).toBeNull();
+    expect(bar.manage().getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("面板开在「新建」状态时点管理按钮也是关上；「+」直接打开新建表单", async () => {
+    const bar = await openTerminalWithBar();
+    await act(async () => bar.create().click());
+    expect(bar.listPanel()).not.toBeNull();
+    expect(screen.getByPlaceholderText("例如：端口查看")).toBeTruthy();
+    await act(async () => bar.manage().click());
+    expect(bar.listPanel()).toBeNull();
+  });
+
+  it("面板已开着、新建表单被取消后，再点「+」能重新进入新建", async () => {
+    const bar = await openTerminalWithBar();
+    await act(async () => bar.create().click());
+    await act(async () => screen.getByText("取消").click());
+    expect(screen.queryByPlaceholderText("例如：端口查看")).toBeNull();
+    await act(async () => bar.create().click());
+    expect(screen.getByPlaceholderText("例如：端口查看")).toBeTruthy();
+  });
+});
+
 describe("设置页的进出（R-11）", () => {
   it("在主机页点齿轮进设置，再点齿轮回主机页", async () => {
     const view = await mountApp();
@@ -788,12 +834,19 @@ describe("主机详情什么时候出来", () => {
     } as never);
   }
 
-  it("主机页双击连接（第一下单击打开了详情）：连接时把这台的详情关掉", async () => {
+  it("主机页单击只选中、不再开详情，所以连接不碰详情：自己打开的详情（右键编辑 / 编辑按钮）连接后仍在", async () => {
+    const view = await mountApp();
+    // 没有点编辑：只是连接，详情不会冒出来
+    await act(async () => view.getByTestId("open-host").click());
+    expect(view.queryByTestId("host-panel")).toBeNull();
+  });
+
+  it("主机页编辑中的详情，双击同一台连接：不替用户关掉（避免丢掉没保存的修改）", async () => {
     const view = await mountApp();
     await act(async () => view.getByTestId("select-host").click());
     expect(view.queryByTestId("host-panel")).not.toBeNull();
     await act(async () => view.getByTestId("open-host").click());
-    expect(view.queryByTestId("host-panel")).toBeNull();
+    expect(view.queryByTestId("host-panel")).not.toBeNull();
   });
 
   it("第一次就没连上：自动打开这台主机的详情", async () => {
