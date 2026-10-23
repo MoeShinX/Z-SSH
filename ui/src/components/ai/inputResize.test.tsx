@@ -99,14 +99,15 @@ describe("输入框拖动条", () => {
   it("往上拖变高、松手写进设置；双击恢复默认", async () => {
     mount();
     expect(handle().className).toContain("cursor-ns-resize");
+    // 存的是旧版默认 50：按新默认 75 显示，往上拖 100 就是 175
     expect(textarea().style.height).toBe(`${AI_INPUT_DEFAULT_HEIGHT}px`);
 
     fireEvent.pointerDown(handle(), { clientY: 500, pointerId: 1 });
     fireEvent.pointerMove(handle(), { clientY: 400, pointerId: 1 });
-    expect(textarea().style.height).toBe("150px");
+    expect(textarea().style.height).toBe("175px");
     fireEvent.pointerUp(handle(), { clientY: 400, pointerId: 1 });
     await waitFor(() =>
-      expect(mocks.settingsSet).toHaveBeenCalledWith("layout.ai_input_height", "150"),
+      expect(mocks.settingsSet).toHaveBeenCalledWith("layout.ai_input_height", "175"),
     );
 
     fireEvent.doubleClick(handle());

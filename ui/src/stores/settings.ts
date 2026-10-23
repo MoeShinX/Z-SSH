@@ -96,7 +96,7 @@ export const SETTING_DEFAULTS = {
   // 主机树侧栏的宽度（UI-5，拖右边缘调，默认 224），同样是本机布局、不同步
   "layout.host_tree_width": 224,
   // AI 面板输入框的高度（拖输入框上沿调），同样是本机布局、不同步
-  "layout.ai_input_height": 50,
+  "layout.ai_input_height": 75,
   // 终端底部快捷命令栏的高度（拖栏的上边框调，默认一行），同样是本机布局、不同步
   "layout.quick_bar_height": 28,
   // 主机页左边树的展开状态（逗号分隔的分组键），同样是本机布局、不同步
