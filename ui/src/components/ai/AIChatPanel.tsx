@@ -1152,8 +1152,9 @@ export default function AIChatPanel({
             >
               <Plus size={16} />
             </Button>
-            <Button variant="ghost" size="icon" title="关闭" onClick={onClose}>
-              <Trash2 size={16} />
+            {/* 关闭面板（不是删除对话：以前用的垃圾桶图标让人误会） */}
+            <Button variant="ghost" size="icon" title="关闭" aria-label="关闭 AI 面板" onClick={onClose}>
+              <X size={16} />
             </Button>
           </div>
         </div>
