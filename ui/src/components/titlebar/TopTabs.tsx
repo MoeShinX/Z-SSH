@@ -240,11 +240,12 @@ export default function TopTabs({
           />
           {/* 主机树侧栏开关（主机页和终端界面共用一个开关） */}
           <SidebarToggle />
-          {/* 固定最左：主机页。和主机树对齐时撑满左侧块剩下的宽度，右边不留一截空白 */}
+          {/* 固定最左：主机页。和主机树对齐时撑满左侧块剩下的宽度（右边缘对齐主机树的分隔线），文字居中 */}
           <TabShape
             active={view === "vault"}
             onClick={onShowVault}
-            className={cn("rounded-md", alignToHostTree && "mr-1.5 min-w-0 max-w-none flex-1 shrink")}
+            className={cn("rounded-md", alignToHostTree && "min-w-0 max-w-none flex-1 shrink justify-center")}
+            centered={alignToHostTree}
             label="主机"
             icon={<LayoutGrid size={14} />}
           />
@@ -478,6 +479,8 @@ export default function TopTabs({
 }
 
 interface TabShapeProps {
+  /** 图标和文字在标签里居中（标签被撑宽时用），默认靠左。 */
+  centered?: boolean;
   label: string;
   active: boolean;
   onClick: () => void;
@@ -519,6 +522,7 @@ function TabShape({
   onPointerDown,
   dragging,
   dockTarget,
+  centered = false,
 }: TabShapeProps) {
   // 当前终端标签借终端的底色，和下面的终端连成一块；主机名始终是界面的文字色（换终端配色不变色）。
   // 界面和终端一明一暗时不借：标签整块用界面配色，和终端之间就是自然的分界。
@@ -554,7 +558,7 @@ function TabShape({
       {dotClass && (
         <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotClass)} title={dotTitle} />
       )}
-      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <span className={cn("min-w-0 truncate", centered ? "flex-initial" : "flex-1")}>{label}</span>
       {aiBadge && (
         <span
           data-ai-badge={aiBadge}
