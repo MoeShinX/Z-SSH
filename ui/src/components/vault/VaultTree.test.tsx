@@ -18,6 +18,7 @@ vi.mock("../../api/settings", () => ({
 
 import type { Group, Host } from "../../api/vault";
 import { useSettings } from "../../stores/settings";
+import { resetHostInfoForTests } from "../../state/hostInfoPanel";
 import { useVault } from "../../stores/vault";
 import VaultView, { flattenGroups } from "./VaultView";
 import { UNGROUPED_KEY } from "../../state/hostTree";
@@ -53,6 +54,7 @@ const props = () => ({
 afterEach(cleanup);
 
 beforeEach(() => {
+  resetHostInfoForTests();
   useVault.setState({
     groups: [group],
     hosts: [host(1, "CA1 PVE", 2), host(2, "DE1 PVE", 2), host(3, "loose", null)],
@@ -81,12 +83,16 @@ describe("主机树", () => {
     expect(treeHosts()).toEqual([]);
   });
 
-  it("双击树里的主机就连接，单击看详情", async () => {
+  it("单击只展开底部的属性面板、不打开详情；右键「编辑」才打开详情；双击连接", async () => {
     useSettings.setState({ "layout.vault_expanded": "g2" });
     const handlers = props();
     render(<VaultView {...handlers} />);
     const [first] = document.querySelectorAll('[data-section="tree-host"]');
     fireEvent.click(first);
+    expect(handlers.onSelectHost).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-section="host-info"]')?.textContent).toContain("CA1 PVE");
+    await act(async () => fireEvent.contextMenu(first));
+    await act(async () => screen.getByText("编辑").click());
     expect(handlers.onSelectHost).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
     fireEvent.doubleClick(first);
     expect(handlers.onOpenHost).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }));
@@ -191,7 +197,7 @@ describe("拖主机换分组", () => {
     window.dispatchEvent(new MouseEvent("pointerup", { clientX: 12, clientY: 201 }));
     fireEvent.click(loose);
     expect(saveHost).not.toHaveBeenCalled();
-    expect(handlers.onSelectHost).toHaveBeenCalled();
+    expect(document.querySelector('[data-section="host-info"]')?.textContent).toContain("loose");
   });
 });
 

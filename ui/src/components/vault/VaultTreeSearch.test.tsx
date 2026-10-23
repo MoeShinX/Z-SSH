@@ -18,6 +18,7 @@ vi.mock("../../api/settings", () => ({
 
 import type { Group, Host } from "../../api/vault";
 import { useSettings } from "../../stores/settings";
+import { resetHostInfoForTests } from "../../state/hostInfoPanel";
 import { useVault } from "../../stores/vault";
 import VaultView, { HostTreeAside, type HostActions } from "./VaultView";
 
@@ -64,6 +65,7 @@ const props = () => ({
 afterEach(cleanup);
 
 beforeEach(() => {
+  resetHostInfoForTests();
   useVault.setState({ groups, hosts, load: async () => {} } as never);
   useSettings.setState({ "layout.vault_expanded": "", "layout.vault_sidebar_collapsed": false });
   globalThis.ResizeObserver = class {
@@ -256,8 +258,10 @@ describe("主机树搜索框", () => {
     render(<VaultView {...handlers} />);
     await type("lab");
     const [row] = document.querySelectorAll('[data-section="tree-host"]');
+    // 单击展开属性面板（不打开详情）
     fireEvent.click(row);
-    expect(handlers.onSelectHost).toHaveBeenCalledWith(expect.objectContaining({ id: 4 }));
+    expect(handlers.onSelectHost).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-section="host-info"]')).not.toBeNull();
     fireEvent.doubleClick(row);
     expect(handlers.onOpenHost).toHaveBeenCalledWith(expect.objectContaining({ id: 4 }));
     await act(async () => fireEvent.contextMenu(row));

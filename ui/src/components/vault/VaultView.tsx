@@ -180,7 +180,7 @@ export default function VaultView({
     }
   };
 
-  /** 树里主机的操作（单击看详情、双击连接、右键菜单），和右边的卡片一样。 */
+  /** 右边卡片的操作（单击看详情、双击连接、右键菜单）。 */
   const hostActions: HostActions = {
     select: (host) => {
       setSelectedHostId(host.id);
@@ -192,6 +192,13 @@ export default function VaultView({
     copy: (host, kind) => copyHost(host, kind),
     installKey: (host) => setInstallHost(host),
     forwards: (host) => onOpenForwards(host.id),
+  };
+
+  /** 左边树里的主机：和终端界面的树一样，单击只高亮并展开底部的属性面板，右键「编辑」才打开详情。 */
+  const treeHostActions: HostActions = {
+    ...hostActions,
+    select: (host) => setSelectedHostId(host.id),
+    edit: hostActions.select,
   };
 
   const copyHost = (host: Host, kind: HostCopyKind) => {
@@ -209,12 +216,13 @@ export default function VaultView({
         selectedGroup={selectedGroup}
         onSelectGroup={setSelectedGroup}
         selectedHostId={selectedHostId}
-        hostActions={hostActions}
+        hostActions={treeHostActions}
         onNewHost={onNewHost}
         onNewGroup={onNewGroup}
         onEditGroup={onEditGroup}
         onDeleteGroup={onDeleteGroup}
         collapsedStyle="icons"
+        infoPanel
       />
 
       {/* 主区 */}
@@ -357,10 +365,7 @@ export function HostTreeAside({
   onEditGroup: (group: Group) => void;
   onDeleteGroup: (group: Group) => void;
   collapsedStyle: "icons" | "hidden";
-  /**
-   * 终端界面用：单击主机在树底部展开 / 收起只读属性面板（UI-6）。主机页不传，
-   * 单击照旧是打开详情。
-   */
+  /** 单击主机在树底部展开 / 收起只读属性面板（UI-6）；主机页和终端界面现在都开着。 */
   infoPanel?: boolean;
 }) {
   const groups = useVault((state) => state.groups);
