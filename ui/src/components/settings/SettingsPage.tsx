@@ -947,9 +947,15 @@ function AgentBlock({
    * 以前手动模式只看「存没存过路径」，没存过时开关拨不过去、输入框也出不来（issue #3）。
    */
   const [manualPending, setManualPending] = useState(false);
+  /** 每次「检测并保存」和每次拨开关都加一：检测结果回来时序号对不上（中途切回了自动）就作废。 */
+  const probeSeq = useRef(0);
 
-  // 设置读回来（或别处改了）路径：输入框跟着显示存着的值
-  useEffect(() => setManual(path), [path]);
+  // 设置读回来（或别处改了）路径：输入框跟着显示存着的值。手动还没保存好时不动输入框
+  // （保存失败、设置回滚成空时，草稿要留着）。
+  useEffect(() => {
+    if (!manualPending) setManual(path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
 
   // 存了手动路径，或者刚拨到「手动」还没保存，都算手动模式；留空是自动（默认）。
   const isManual = path.trim() !== "" || manualPending;
@@ -1006,6 +1012,7 @@ function AgentBlock({
             checked={isManual}
             aria-label={`${label} 手动指定路径`}
             onCheckedChange={(checked) => {
+              probeSeq.current += 1;
               if (checked) {
                 // 拨到手动：先出输入框，检测通过才保存
                 setManualPending(true);
@@ -1071,14 +1078,23 @@ function AgentBlock({
             size="sm"
             disabled={probing}
             onClick={() => {
+              const seq = (probeSeq.current += 1);
+              const value = manual;
               setProbing(true);
-              void aiAgentProbePath(agent, manual)
+              void aiAgentProbePath(agent, value)
                 .then((install) => {
+                  // 检测期间切回了自动（或又点了一次）：这次结果作废，别把路径又存回去
+                  if (seq !== probeSeq.current) return;
                   toast.success(`可用：${install.version}`);
-                  setManualPending(false);
-                  void update(pathKey, manual).then(refresh);
+                  void update(pathKey, value).then((saved) => {
+                    // 保存成功才收起「待保存」；失败时设置会回滚成原值，输入框和草稿留着
+                    if (saved && seq === probeSeq.current) setManualPending(false);
+                    refresh();
+                  });
                 })
-                .catch((error: unknown) => toast.error(String(error)))
+                .catch((error: unknown) => {
+                  if (seq === probeSeq.current) toast.error(String(error));
+                })
                 .finally(() => setProbing(false));
             }}
           >

@@ -138,4 +138,48 @@ describe("智能体路径：自动 / 手动指定开关", () => {
     expect(toggle().getAttribute("aria-checked")).toBe("false");
     expect(useSettings.getState().ai_claude_path).toBe("");
   });
+
+  it("点了「检测并保存」还没出结果就切回自动：结果回来后作废，不把路径存回去", async () => {
+    let finish!: () => void;
+    mocks.aiAgentProbePath.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () =>
+            resolve({
+              path: "D:\bin\claude.exe",
+              version: "2.1.301 (Claude Code)",
+              source: "manual" as const,
+              needs_shell: false,
+              auto: false,
+              too_old: false,
+              skipped_older: null,
+            });
+        }),
+    );
+    await openAiSection();
+    await act(async () => toggle().click());
+    await act(async () => fireEvent.change(pathInput()!, { target: { value: "D:\bin\claude.exe" } }));
+    await act(async () => screen.getByText("检测并保存").click());
+    await act(async () => toggle().click());
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    await act(async () => finish());
+    expect(useSettings.getState().ai_claude_path).toBe("");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    expect(mocks.settingsSet).not.toHaveBeenCalledWith("ai_claude_path", expect.anything());
+  });
+
+  it("检测通过但保存失败：仍是手动，输入框和填的路径都还在", async () => {
+    mocks.settingsSet.mockImplementationOnce(async () => {
+      throw new Error("磁盘满了");
+    });
+    await openAiSection();
+    await act(async () => toggle().click());
+    await act(async () => fireEvent.change(pathInput()!, { target: { value: "D:\bin\claude.exe" } }));
+    await act(async () => screen.getByText("检测并保存").click());
+    await waitFor(() => expect(mocks.settingsSet).toHaveBeenCalled());
+    await act(async () => {});
+    expect(useSettings.getState().ai_claude_path).toBe("");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(pathInput()?.value).toBe("D:\bin\claude.exe");
+  });
 });
