@@ -55,6 +55,9 @@ pub enum ArchiveError {
     Cancelled,
     /// 压缩包里有指向目录外的路径。
     UnsafeEntries,
+    /// 目标目录里已有符号链接挡在条目的路径上（或条目本身是链接），解压可能写到目录外；
+    /// 带的是第一个这样的条目的相对路径。
+    DestSymlink(String),
     /// 不认识的格式 / 不能这样做（给人看的原因）。
     Unsupported(String),
     /// 命令跑了但失败，或者其它出错（给人看的原因）。
@@ -66,6 +69,10 @@ impl std::fmt::Display for ArchiveError {
         match self {
             Self::Cancelled => f.write_str("已取消"),
             Self::UnsafeEntries => f.write_str("压缩包里有指向目录外的路径，已拒绝解压"),
+            Self::DestSymlink(path) => write!(
+                f,
+                "目标目录里有符号链接（{path}），解压可能写到目录外，已拒绝"
+            ),
             Self::Unsupported(message) | Self::Failed(message) => f.write_str(message),
         }
     }
@@ -273,27 +280,30 @@ fn guarded(worker: &str) -> String {
     )
 }
 
-/// 解压前的检查命令：列出条目，同时在目标目录里逐条核对是否已存在。
+/// 解压前的检查命令：列出条目，同时在目标目录里逐条核对是否已存在、路径上有没有符号链接。
 ///
 /// 列条目的命令（`tar -t` / `unzip -Z1`）输出先落到服务器上的临时文件，退出码写在 stderr 里
 /// （见 [`LIST_EXIT_MARK`]）；然后逐行输出：第一个字符是状态，`d` 目录条目（以 `/` 结尾）、
-/// `x` 文件已存在、`n` 文件不存在。目标目录还不存在时全部算不存在。列条目的命令同样由
-/// 看守盯着（见 [`guarded`]），取消时被终止。
+/// `x` 文件已存在、`n` 文件不存在、`l` 条目本身或它在目标目录里已存在的某一级父目录是符号链接
+/// （tar / unzip 都会顺着这样的链接写到目录外，所以整包都要拒绝）。目标目录还不存在时全部算
+/// 不存在、没有链接。zip 的条目先把 `\` 换成 `/`（`unzip` 就是这样解的，Windows 打的包常用
+/// 反斜杠），再核对，这样 `dir\file.txt` 和 `dir/file.txt` 一样能查出冲突和链接。
+/// 条目只当作 `read -r` 读进来的数据，从不拼进命令。列条目的命令同样由看守盯着
+/// （见 [`guarded`]），取消时被终止。
 pub fn plan_command(format: ArchiveFormat, archive: &str, dest: &str, literal: bool) -> String {
-    let list = list_command(format, archive, literal);
-    let dest = shell_quote(dest);
-    format!(
-        "T=$(mktemp 2>/dev/null) || T=/tmp/.zssh-list.$$; trap 'rm -f \"$T\"' EXIT; \
-         exec 3<&0; ( exec {list} ) >\"$T\" </dev/null & pid=$!; \
-         ( read -r _ <&3; kill -TERM $pid 2>/dev/null ) & w=$!; \
-         wait $pid; rc=$?; kill $w 2>/dev/null; echo \"{LIST_EXIT_MARK}$rc\" >&2; \
-         if cd {dest} 2>/dev/null; then \
-         while IFS= read -r p; do case \"$p\" in */) printf 'd%s\\n' \"$p\";; \
-         *) if [ -e \"$p\" ] || [ -L \"$p\" ]; then printf 'x%s\\n' \"$p\"; \
-         else printf 'n%s\\n' \"$p\"; fi;; esac; done <\"$T\"; \
-         else while IFS= read -r p; do case \"$p\" in */) printf 'd%s\\n' \"$p\";; \
-         *) printf 'n%s\\n' \"$p\";; esac; done <\"$T\"; fi"
-    )
+    let feed = if format.is_zip() {
+        r#"tr '\\' '/' <"$T""#
+    } else {
+        r#"cat "$T""#
+    };
+    // 逐级检查：从条目的第一段开始，每走一段就看「到这里为止的路径」是不是符号链接。
+    // 目录条目先去掉末尾的 `/`，所以它自己也会被查到。
+    const SCRIPT: &str = r#"T=$(mktemp 2>/dev/null) || T=/tmp/.zssh-list.$$; trap 'rm -f "$T"' EXIT; exec 3<&0; ( exec @LIST@ ) >"$T" </dev/null & pid=$!; ( read -r _ <&3; kill -TERM $pid 2>/dev/null ) & w=$!; wait $pid; rc=$?; kill $w 2>/dev/null; echo "@MARK@$rc" >&2; if cd @DEST@ 2>/dev/null; then ex=1; else ex=0; fi; @FEED@ | while IFS= read -r p; do case "$p" in */) k=d; q=${p%/};; *) k=n; q=$p;; esac; if [ $ex = 1 ]; then l=0; pre=; rest=$q; while [ -n "$rest" ]; do c=${rest%%/*}; case "$rest" in */*) rest=${rest#*/};; *) rest=;; esac; pre=$pre$c; if [ -L "$pre" ]; then l=1; break; fi; pre=$pre/; done; if [ $l = 1 ]; then k=l; elif [ $k = n ]; then if [ -e "$p" ] || [ -L "$p" ]; then k=x; fi; fi; fi; printf '%s%s\n' "$k" "$p"; done"#;
+    SCRIPT
+        .replace("@LIST@", &list_command(format, archive, literal))
+        .replace("@MARK@", LIST_EXIT_MARK)
+        .replace("@DEST@", &shell_quote(dest))
+        .replace("@FEED@", feed)
 }
 
 /// 同名文件的处理方式。
@@ -473,16 +483,19 @@ pub struct PlanScan {
     pub conflict_sample: Vec<String>,
 }
 
-/// 解析 [`plan_command`] 的 stdout：同时做安全检查，有指向目录外的条目返回 `UnsafeEntries`。
+/// 解析 [`plan_command`] 的 stdout：同时做安全检查，有指向目录外的条目返回 `UnsafeEntries`，
+/// 目标目录里已有符号链接挡路（状态 `l`）返回 `DestSymlink`（带第一个的路径，整包拒绝）。
+/// 路径越界优先报：它在包本身就不对，不用再看目标目录。
 pub fn scan_plan_output(stdout: &str, zip: bool) -> Result<PlanScan, ArchiveError> {
     let mut scan = PlanScan::default();
+    let mut first_link: Option<String> = None;
     for line in stdout.split('\n') {
         let mut chars = line.chars();
         let Some(kind) = chars.next() else {
             continue;
         };
         let path = chars.as_str();
-        if !matches!(kind, 'd' | 'x' | 'n') {
+        if !matches!(kind, 'd' | 'x' | 'n' | 'l') {
             continue;
         }
         // 原样和解码后的两种写法都查：宁可多拒绝，不放过。
@@ -491,6 +504,16 @@ pub fn scan_plan_output(stdout: &str, zip: bool) -> Result<PlanScan, ArchiveErro
         {
             return Err(ArchiveError::UnsafeEntries);
         }
+        // zip 的反斜杠就是分隔符：显示用的路径统一成 `/`（脚本里已经换过，这里再保险一次）。
+        let path = if zip {
+            path.replace('\\', "/")
+        } else {
+            path.to_owned()
+        };
+        if kind == 'l' {
+            first_link.get_or_insert(path);
+            continue;
+        }
         scan.total_entries += 1;
         if kind != 'd' {
             scan.total_files += 1;
@@ -498,11 +521,14 @@ pub fn scan_plan_output(stdout: &str, zip: bool) -> Result<PlanScan, ArchiveErro
         if kind == 'x' {
             scan.conflict_count += 1;
             if scan.conflict_sample.len() < CONFLICT_SAMPLE {
-                scan.conflict_sample.push(path.to_owned());
+                scan.conflict_sample.push(path);
             }
         }
     }
-    Ok(scan)
+    match first_link {
+        Some(path) => Err(ArchiveError::DestSymlink(path)),
+        None => Ok(scan),
+    }
 }
 
 /// 从 stderr 里取出列条目命令的退出码。

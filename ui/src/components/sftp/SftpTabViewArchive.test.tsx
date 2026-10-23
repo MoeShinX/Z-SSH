@@ -147,9 +147,13 @@ async function settleLoads() {
   }
 }
 
-async function renderWorkspace() {
+async function renderWorkspace(onActiveCountChange?: (count: number) => void) {
   const view = render(
-    <SftpTabView sftpId="s1" initialPaths={{ local: "C:\\work", remote: "/srv" }} />,
+    <SftpTabView
+      sftpId="s1"
+      initialPaths={{ local: "C:\\work", remote: "/srv" }}
+      onActiveCountChange={onActiveCountChange}
+    />,
   );
   await waitFor(() =>
     expect(view.container.querySelectorAll("[data-row]").length).toBe(
@@ -404,7 +408,7 @@ describe("解压", () => {
     expect(menuItem("extract-folder")).toBeNull();
   });
 
-  it("没有同名文件：先检查，再直接解压到 /srv/site，完成后提示解出多少并刷新", async () => {
+  it("没有同名文件：先检查，再用「跳过已有文件」解压到 /srv/site，完成后提示解出多少并刷新", async () => {
     const { container } = await renderWorkspace();
     await rightClick(container, "site.tar.gz");
     await waitFor(() => expect(isDisabled("extract-folder")).toBe(false));
@@ -421,7 +425,8 @@ describe("解压", () => {
       op_id: expect.any(String),
       archive: "/srv/site.tar.gz",
       dest: "/srv/site",
-      policy: "overwrite",
+      // 没冲突时不能用覆盖：检查之后才出现的同名文件不会被悄悄盖掉
+      policy: "skip_existing",
       plan: {
         fingerprint: PLAN.fingerprint,
         dest_exists: false,
@@ -582,5 +587,57 @@ describe("解压", () => {
         "解压失败：解压失败（退出码 2）：tar: No space left on device",
       ),
     );
+  });
+});
+
+describe("关标签前的确认（进行中的数量）", () => {
+  // App 在关标签 / 停靠面板 / 退出程序时读这个数：大于 0 就先弹确认。
+
+  it("压缩进行中上报 1（关标签会弹确认），结束后回到 0", async () => {
+    const counts: number[] = [];
+    const { container } = await renderWorkspace((count) => counts.push(count));
+    expect(counts[counts.length - 1]).toBe(0);
+    let finish: (value: unknown) => void = () => {};
+    mocks.sftpCompress.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    await rightClick(container, "app.conf");
+    await waitFor(() => expect(isDisabled("compress")).toBe(false));
+    await chooseCompress("compress-tar-gz");
+    await waitFor(() => expect(counts[counts.length - 1]).toBe(1));
+    await act(async () => finish({ state: "ok", name: "a.tar.gz", path: "/srv/a.tar.gz" }));
+    await waitFor(() => expect(counts[counts.length - 1]).toBe(0));
+  });
+
+  it("检查压缩包和解压进行中也算：整个过程里都是 1，结束后回到 0", async () => {
+    const counts: number[] = [];
+    let finishPlan: (value: unknown) => void = () => {};
+    let finishExtract: (value: unknown) => void = () => {};
+    mocks.sftpExtractPlan.mockImplementation(
+      () => new Promise((resolve) => { finishPlan = resolve; }),
+    );
+    mocks.sftpExtract.mockImplementation(
+      () => new Promise((resolve) => { finishExtract = resolve; }),
+    );
+    const { container } = await renderWorkspace((count) => counts.push(count));
+    await rightClick(container, "site.tar.gz");
+    await waitFor(() => expect(isDisabled("extract-folder")).toBe(false));
+    await choose("extract-folder");
+    await waitFor(() => expect(counts[counts.length - 1]).toBe(1));
+    await act(async () => finishPlan(PLAN));
+    await waitFor(() => expect(mocks.sftpExtract).toHaveBeenCalledTimes(1));
+    expect(counts[counts.length - 1]).toBe(1);
+    await act(async () => finishExtract({ state: "ok", extracted: 10, skipped: 0 }));
+    await waitFor(() => expect(counts[counts.length - 1]).toBe(0));
+  });
+
+  it("压缩失败后也回到 0，不会让标签一直关不掉", async () => {
+    const counts: number[] = [];
+    mocks.sftpCompress.mockRejectedValue("压缩失败");
+    const { container } = await renderWorkspace((count) => counts.push(count));
+    await rightClick(container, "app.conf");
+    await waitFor(() => expect(isDisabled("compress")).toBe(false));
+    await chooseCompress("compress-tar-gz");
+    await waitFor(() => expect(toastMocks.error).toHaveBeenCalled());
+    await waitFor(() => expect(counts[counts.length - 1]).toBe(0));
+    expect(counts).toContain(1);
   });
 });

@@ -104,6 +104,22 @@ pub fn bare_address(raw: &str) -> String {
     trimmed.to_owned()
 }
 
+/// 放进 ssh 命令行的一个参数：只含字母、数字和 `._-:%+`（IPv6 的冒号、作用域 `%` 也在内）
+/// 时原样写；否则用 POSIX 单引号引起来，里面的单引号写成 `'\''`。
+/// 单引号写法在 bash / zsh / PowerShell 里含义一致；cmd.exe 不认单引号，粘贴到 cmd 里
+/// 带特殊字符的用户名需要自己改成双引号。
+fn command_arg(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '%' | '+'));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 /// 拼连接信息文字。纯函数，返回值带明文密码时用 `Zeroizing` 包着。
 pub fn format_connection_info(info: &ConnectionInfo) -> Zeroizing<String> {
     let address = bare_address(&info.address);
@@ -131,7 +147,12 @@ pub fn format_connection_info(info: &ConnectionInfo) -> Zeroizing<String> {
     if let Some(proxy) = &info.proxy {
         line(&format!("代理：{proxy}"));
     }
-    line(&format!("ssh -p {} {}@{address}", info.port, info.username));
+    line(&format!(
+        "ssh -p {} -l {} {}",
+        info.port,
+        command_arg(&info.username),
+        command_arg(&address)
+    ));
     // 末尾不留换行：粘贴到输入框里不会多出一个回车
     if text.ends_with('\n') {
         text.pop();
@@ -359,7 +380,7 @@ mod tests {
         let text = format_connection_info(&data);
         assert_eq!(
             text.as_str(),
-            "名称：web-1\n地址：host.example\n端口：22\n用户名：root\n密码：pw-value\nssh -p 22 root@host.example"
+            "名称：web-1\n地址：host.example\n端口：22\n用户名：root\n密码：pw-value\nssh -p 22 -l root host.example"
         );
         assert!(data.has_password());
     }
@@ -405,9 +426,47 @@ mod tests {
                 "密码：未保存",
                 "跳板机：bastion",
                 "代理：公司代理",
-                "ssh -p 22 root@host.example",
+                "ssh -p 22 -l root host.example",
             ]
         );
+    }
+
+    #[test]
+    fn the_ssh_command_quotes_usernames_that_the_shell_would_mangle() {
+        let command = |username: &str| {
+            let mut data = info(InfoAuth::Agent);
+            data.username = username.to_owned();
+            format_connection_info(&data)
+                .lines()
+                .last()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(command("deploy"), "ssh -p 22 -l deploy host.example");
+        assert_eq!(command("a.b_c-d"), "ssh -p 22 -l a.b_c-d host.example");
+        assert_eq!(
+            command("john smith"),
+            "ssh -p 22 -l 'john smith' host.example"
+        );
+        assert_eq!(
+            command("ACME\\deploy"),
+            "ssh -p 22 -l 'ACME\\deploy' host.example"
+        );
+        assert_eq!(
+            command("o'brien"),
+            "ssh -p 22 -l 'o'\\''brien' host.example"
+        );
+        assert_eq!(command("$(id)"), "ssh -p 22 -l '$(id)' host.example");
+        assert_eq!(command(""), "ssh -p 22 -l '' host.example");
+    }
+
+    #[test]
+    fn the_ssh_command_quotes_odd_addresses_but_leaves_ipv6_alone() {
+        let mut data = info(InfoAuth::Agent);
+        data.address = "host name".to_owned();
+        assert!(format_connection_info(&data).ends_with("-l root 'host name'"));
+        data.address = "[fe80::1%eth0]".to_owned();
+        assert!(format_connection_info(&data).ends_with("-l root fe80::1%eth0"));
     }
 
     #[test]
@@ -424,7 +483,7 @@ mod tests {
         data.port = 2222;
         let text = format_connection_info(&data);
         assert!(text.contains("地址：2001:db8::1\n"));
-        assert!(text.ends_with("ssh -p 2222 root@2001:db8::1"));
+        assert!(text.ends_with("ssh -p 2222 -l root 2001:db8::1"));
     }
 
     #[test]
@@ -542,7 +601,7 @@ mod db_tests {
         assert_eq!(info.proxy.as_deref(), Some("公司代理"));
         let text = super::format_connection_info(&info);
         assert!(text.contains("密码：vault-pw"));
-        assert!(text.ends_with("ssh -p 2222 deploy@host.example"));
+        assert!(text.ends_with("ssh -p 2222 -l deploy host.example"));
     }
 
     #[test]

@@ -675,3 +675,310 @@ async fn cancelling_an_extract_removes_the_temp_folder_and_stops_tar_full() {
     assert!(!fx.exists(&dest).await);
     fx.finish().await;
 }
+
+/// CRC-32（zip 用的那个），测试里自己造 zip 要用。
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// 按 zip 格式写一个最小的包（只存储、不压缩）。条目名原样写进去，所以可以写 Windows 风格的
+/// 反斜杠路径（服务器上的 zip 命令造不出这种包）。
+fn minimal_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in entries {
+        let offset = u32::try_from(out.len()).unwrap();
+        let crc = crc32(data);
+        let size = u32::try_from(data.len()).unwrap();
+        let name_len = u16::try_from(name.len()).unwrap();
+        // 本地文件头
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&10u16.to_le_bytes()); // 解压所需版本
+        out.extend_from_slice(&0u16.to_le_bytes()); // 标志
+        out.extend_from_slice(&0u16.to_le_bytes()); // 存储，不压缩
+        out.extend_from_slice(&0u16.to_le_bytes()); // 时间
+        out.extend_from_slice(&0x0021u16.to_le_bytes()); // 日期：1980-01-01
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // 额外字段
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        // 中央目录项（制作系统记成 DOS，和 Windows 资源管理器打的包一样）
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes()); // 制作版本，高字节 0 = DOS
+        central.extend_from_slice(&10u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0x0021u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&name_len.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // 额外字段
+        central.extend_from_slice(&0u16.to_le_bytes()); // 注释
+        central.extend_from_slice(&0u16.to_le_bytes()); // 起始磁盘
+        central.extend_from_slice(&0u16.to_le_bytes()); // 内部属性
+        central.extend_from_slice(&0u32.to_le_bytes()); // 外部属性
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let central_offset = u32::try_from(out.len()).unwrap();
+    let central_size = u32::try_from(central.len()).unwrap();
+    let count = u16::try_from(entries.len()).unwrap();
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&central_size.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// 目录里的条目名（只列名字，用来确认「目录外没有多出东西」）。
+async fn names_in(fx: &Fixture, dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = fx
+        .channel
+        .read_dir(dir)
+        .await
+        .expect("列目录")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    names.sort();
+    names
+}
+
+/// 目标目录里已有指向目录外的符号链接：包里经过它（或就是它）的条目会被整包拒绝，
+/// 目录外一个文件都不会多出来。tar.gz 和 zip（含反斜杠写法）各来一遍。
+#[tokio::test]
+async fn symlinks_inside_the_destination_refuse_the_whole_archive_full() {
+    if !common::full_live("symlinks_inside_the_destination_refuse_the_whole_archive_full") {
+        return;
+    }
+    let _serial = serial().await;
+    let Some(fx) = fixture("arch-symlink").await else {
+        return;
+    };
+    let base = fx.remote.path().to_owned();
+    // outside 是目录外的目录；dest 里 link 指向它，fileLink 指向它里面的一个还不存在的文件
+    let (code, out) = fx
+        .sh(&format!(
+            "cd '{base}' && mkdir outside dest src src/link && echo a > src/link/a.txt && echo ok > src/ok.txt \
+             && ln -s ../outside dest/link && ln -s ../outside/target.txt dest/fileLink && echo made"
+        ))
+        .await;
+    assert_eq!(code, Some(0), "造测试目录失败：{out}");
+    let outside = fx.path("outside");
+    let dest = fx.path("dest");
+    let before = names_in(&fx, &outside).await;
+    assert!(before.is_empty());
+
+    // tar.gz：经过 link 的文件
+    let (code, out) = fx
+        .sh(&format!(
+            "cd '{base}/src' && tar -czf ../through.tar.gz ok.txt link 2>&1"
+        ))
+        .await;
+    assert_eq!(code, Some(0), "造 tar 失败：{out}");
+    // tar.gz：条目本身就是目标里已有的文件链接
+    let (code, out) = fx
+        .sh(&format!(
+            "cd '{base}' && mkdir src2 && echo new > src2/fileLink && cd src2 && tar -czf ../self.tar.gz fileLink 2>&1"
+        ))
+        .await;
+    assert_eq!(code, Some(0), "造 tar 失败：{out}");
+    // tar.gz：目录条目本身就是已有的目录链接
+    let (code, out) = fx
+        .sh(&format!(
+            "cd '{base}/src' && tar -czf ../dirlink.tar.gz --no-recursion link 2>&1"
+        ))
+        .await;
+    assert_eq!(code, Some(0), "造 tar 失败：{out}");
+
+    for (archive, label) in [
+        ("through.tar.gz", "经过链接"),
+        ("self.tar.gz", "条目是链接"),
+        ("dirlink.tar.gz", "目录条目是链接"),
+    ] {
+        let err = plan(&fx, &fx.path(archive), &dest).await.unwrap_err();
+        match &err {
+            ArchiveError::DestSymlink(path) => {
+                println!("{label}：{err}");
+                assert!(
+                    path == "link/a.txt" || path == "fileLink" || path == "link/",
+                    "{label}: {path}"
+                );
+            }
+            other => panic!("{label}: 应该因目标里的符号链接被拒绝：{other:?}"),
+        }
+    }
+
+    // zip：正常写法和 Windows 反斜杠写法
+    let backslash = minimal_zip(&[("link\\a.txt", b"evil"), ("ok.txt", b"ok")]);
+    fx.put(&fx.path("backslash-link.zip"), &backslash).await;
+    let err = plan(&fx, &fx.path("backslash-link.zip"), &dest)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ArchiveError::DestSymlink("link/a.txt".to_owned()),
+        "反斜杠写法也要认出链接"
+    );
+    if fx.caps.zip && fx.caps.unzip {
+        let (code, out) = fx
+            .sh(&format!(
+                "cd '{base}/src' && zip -r -q ../through.zip ok.txt link 2>&1"
+            ))
+            .await;
+        assert_eq!(code, Some(0), "造 zip 失败：{out}");
+        let err = plan(&fx, &fx.path("through.zip"), &dest).await.unwrap_err();
+        assert!(matches!(err, ArchiveError::DestSymlink(_)), "{err:?}");
+    } else {
+        println!("服务器没有 zip / unzip：只测了 tar.gz 和手写的 zip");
+    }
+
+    // 目录外什么都没多出来，目标里的两个链接也原样还在
+    assert_eq!(names_in(&fx, &outside).await, before, "目录外多出了文件");
+    assert!(fx.exists(&format!("{dest}/link")).await);
+    assert!(fx.exists(&format!("{dest}/fileLink")).await);
+    assert!(fx.leftovers(&base).await.is_empty());
+    fx.finish().await;
+}
+
+/// Windows 打的 zip（路径用反斜杠）：检查能认出和目标里已有文件的冲突；选「跳过」时保留原文件，
+/// 其余文件解到对应的子目录里；没有冲突时用「跳过」解压，检查之后才出现的同名文件也不会被覆盖。
+#[tokio::test]
+async fn backslash_zip_conflicts_are_detected_and_skip_never_overwrites_full() {
+    if !common::full_live("backslash_zip_conflicts_are_detected_and_skip_never_overwrites_full") {
+        return;
+    }
+    let _serial = serial().await;
+    let Some(fx) = fixture("arch-backslash").await else {
+        return;
+    };
+    if !(fx.caps.zip && fx.caps.unzip) {
+        println!("跳过反斜杠 zip：服务器上没有 unzip");
+        fx.finish().await;
+        return;
+    }
+    let archive = fx.path("win.zip");
+    fx.put(
+        &archive,
+        &minimal_zip(&[
+            ("dir\\file.txt", b"from-zip-file"),
+            ("dir\\sub\\new.txt", b"from-zip-new"),
+            ("top.txt", b"from-zip-top"),
+        ]),
+    )
+    .await;
+
+    // 1) 目标里已有 dir/file.txt：必须报成冲突（以前按原样查 dir\file.txt，会漏报）
+    let dest = fx.path("dest-conflict");
+    fx.channel.create_dir(&dest).await.unwrap();
+    fx.channel.create_dir(&format!("{dest}/dir")).await.unwrap();
+    fx.put(&format!("{dest}/dir/file.txt"), b"LOCAL-file").await;
+    let checked = plan(&fx, &archive, &dest).await.expect("检查 zip");
+    println!("反斜杠 zip 检查结果：{checked:?}");
+    assert_eq!(checked.total_files, 3);
+    assert_eq!(checked.conflict_count, 1, "{checked:?}");
+    assert_eq!(checked.conflict_sample, ["dir/file.txt"]);
+    let done = run_extract(
+        &fx,
+        &checked,
+        &archive,
+        &dest,
+        ConflictPolicy::SkipExisting,
+        "livebs1",
+    )
+    .await
+    .expect("跳过解压");
+    println!(
+        "跳过解压：解出 {}，跳过 {}，警告 {:?}",
+        done.extracted, done.skipped, done.warning
+    );
+    assert_eq!(
+        fx.read(&format!("{dest}/dir/file.txt")).await,
+        b"LOCAL-file"
+    );
+    assert_eq!(
+        fx.read(&format!("{dest}/dir/sub/new.txt")).await,
+        b"from-zip-new"
+    );
+    assert_eq!(fx.read(&format!("{dest}/top.txt")).await, b"from-zip-top");
+
+    // 2) 检查时没有冲突；检查之后、解压之前有人新建了同名文件：「跳过」不能覆盖它
+    let dest2 = fx.path("dest-race");
+    fx.channel.create_dir(&dest2).await.unwrap();
+    let checked = plan(&fx, &archive, &dest2).await.expect("检查 zip");
+    assert_eq!(checked.conflict_count, 0, "{checked:?}");
+    fx.channel
+        .create_dir(&format!("{dest2}/dir"))
+        .await
+        .unwrap();
+    fx.put(&format!("{dest2}/dir/file.txt"), b"LATE-local")
+        .await;
+    run_extract(
+        &fx,
+        &checked,
+        &archive,
+        &dest2,
+        ConflictPolicy::SkipExisting,
+        "livebs2",
+    )
+    .await
+    .expect("跳过解压");
+    assert_eq!(
+        fx.read(&format!("{dest2}/dir/file.txt")).await,
+        b"LATE-local",
+        "检查之后才出现的文件不能被覆盖"
+    );
+    assert_eq!(
+        fx.read(&format!("{dest2}/dir/sub/new.txt")).await,
+        b"from-zip-new"
+    );
+
+    // 3) 明确选「覆盖」才会换成包里的内容
+    let dest3 = fx.path("dest-overwrite");
+    fx.channel.create_dir(&dest3).await.unwrap();
+    fx.channel
+        .create_dir(&format!("{dest3}/dir"))
+        .await
+        .unwrap();
+    fx.put(&format!("{dest3}/dir/file.txt"), b"LOCAL-file")
+        .await;
+    let checked = plan(&fx, &archive, &dest3).await.expect("检查 zip");
+    assert_eq!(checked.conflict_count, 1);
+    run_extract(
+        &fx,
+        &checked,
+        &archive,
+        &dest3,
+        ConflictPolicy::Overwrite,
+        "livebs3",
+    )
+    .await
+    .expect("覆盖解压");
+    assert_eq!(
+        fx.read(&format!("{dest3}/dir/file.txt")).await,
+        b"from-zip-file"
+    );
+    assert!(fx.leftovers(fx.remote.path()).await.is_empty());
+    fx.finish().await;
+}

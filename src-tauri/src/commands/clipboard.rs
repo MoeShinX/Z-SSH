@@ -62,6 +62,28 @@ fn clear_after_delay(
     }
 }
 
+/// 持有着剪贴板（`clipboard` 是打开着的句柄，离开作用域才关闭）写入，并返回写完之后的序号。
+///
+/// 顺序是固定的：写 → 读序号 → 关闭剪贴板。序号必须在关闭之前读：剪贴板一关，别的程序
+/// 马上就能复制新内容，那时再读到的是别人的序号，30 秒后自动清除就会把别人复制的东西清掉。
+/// 持有期间别的程序改不了剪贴板，所以这里读到的序号一定是我们写完最后一个格式时的那个。
+/// 写失败时先用 `wipe` 清空剪贴板（不留下半成品，尤其不能留下没带排除格式的密码），再关闭。
+#[cfg(any(windows, test))]
+fn write_holding_clipboard<C>(
+    clipboard: C,
+    write: impl FnOnce() -> Result<(), String>,
+    wipe: impl FnOnce(),
+    sequence: impl FnOnce() -> u32,
+) -> Result<u32, String> {
+    let result = write();
+    if result.is_err() {
+        wipe();
+    }
+    let read = result.map(|()| sequence());
+    drop(clipboard);
+    read
+}
+
 /// 后台等 30 秒再清；不阻塞命令返回。
 fn schedule_clear(written_sequence: u32) {
     let spawned = std::thread::Builder::new()
@@ -122,6 +144,8 @@ mod imp {
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use zeroize::Zeroizing;
+
+    use super::write_holding_clipboard;
 
     /// `CF_UNICODETEXT`
     const CF_UNICODETEXT: u32 = 13;
@@ -229,26 +253,30 @@ mod imp {
             unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2) };
 
         let clipboard = open()?;
-        // SAFETY: 上面刚打开了剪贴板，`clipboard` 在整个块里都活着。
-        let result = unsafe {
-            EmptyClipboard()
-                .map_err(|_| "写入剪贴板失败".to_owned())
-                .and_then(|()| {
-                    if sensitive {
-                        set_exclusions()?;
-                    }
-                    set_bytes(CF_UNICODETEXT, bytes)
-                })
-        };
-        if result.is_err() {
-            // SAFETY: 同上，剪贴板还开着。
-            unsafe {
-                let _ = EmptyClipboard();
-            }
-        }
-        drop(clipboard);
-        result?;
-        Ok(sequence())
+        // 序号必须在剪贴板还开着时读（见 `write_holding_clipboard`），关掉之后别的程序就能改了。
+        write_holding_clipboard(
+            clipboard,
+            || {
+                // SAFETY: `clipboard` 在 `write_holding_clipboard` 里一直开着，直到序号读完。
+                unsafe {
+                    EmptyClipboard()
+                        .map_err(|_| "写入剪贴板失败".to_owned())
+                        .and_then(|()| {
+                            if sensitive {
+                                set_exclusions()?;
+                            }
+                            set_bytes(CF_UNICODETEXT, bytes)
+                        })
+                }
+            },
+            || {
+                // SAFETY: 同上，剪贴板还开着。
+                unsafe {
+                    let _ = EmptyClipboard();
+                }
+            },
+            sequence,
+        )
     }
 
     /// 序号还是 `expected`（期间没人动过剪贴板）才清空。打不开就放弃，不去抢。
@@ -302,6 +330,53 @@ mod tests {
         let ran = clear_after_delay(Duration::ZERO, 7, || 9, || cleared.set(true));
         assert!(!ran);
         assert!(!cleared.get());
+    }
+
+    /// 记录事件顺序的剪贴板句柄：丢弃时记下「关闭」。
+    struct Guard<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("close");
+        }
+    }
+
+    #[test]
+    fn the_sequence_is_read_after_writing_and_before_the_clipboard_closes() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let result = write_holding_clipboard(
+            Guard(&log),
+            || {
+                log.borrow_mut().push("write");
+                Ok(())
+            },
+            || log.borrow_mut().push("wipe"),
+            || {
+                log.borrow_mut().push("sequence");
+                42
+            },
+        );
+        assert_eq!(result, Ok(42));
+        assert_eq!(*log.borrow(), ["write", "sequence", "close"]);
+    }
+
+    #[test]
+    fn a_failed_write_wipes_the_clipboard_before_closing_and_reads_no_sequence() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let result = write_holding_clipboard(
+            Guard(&log),
+            || {
+                log.borrow_mut().push("write");
+                Err("写入剪贴板失败".to_owned())
+            },
+            || log.borrow_mut().push("wipe"),
+            || {
+                log.borrow_mut().push("sequence");
+                42
+            },
+        );
+        assert_eq!(result, Err("写入剪贴板失败".to_owned()));
+        assert_eq!(*log.borrow(), ["write", "wipe", "close"]);
     }
 
     #[test]

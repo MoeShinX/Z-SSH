@@ -313,6 +313,25 @@ fn plan_command_asks_gnu_tar_for_literal_names_and_unzip_for_plain_ones() {
 }
 
 #[test]
+fn plan_command_checks_every_existing_parent_for_symlinks() {
+    let tar = plan_command(ArchiveFormat::TarGz, "/d/a.tar.gz", "/d/out dir", true);
+    // 逐级走路径：每一级 `[ -L ]`，命中就标成 l
+    assert!(tar.contains("[ -L \"$pre\" ]"), "{tar}");
+    assert!(tar.contains("k=l"), "{tar}");
+    // 先进目标目录，没有这个目录就不查
+    assert!(tar.contains("cd '/d/out dir' 2>/dev/null"), "{tar}");
+    // tar 的条目原样读，zip 的才换反斜杠
+    assert!(tar.contains("cat \"$T\" |"), "{tar}");
+    assert!(!tar.contains("tr '"), "{tar}");
+    let zip = plan_command(ArchiveFormat::Zip, "/d/a.zip", "/d/out dir", true);
+    assert!(zip.contains("tr '\\\\' '/' <\"$T\" |"), "{zip}");
+    assert!(zip.contains("[ -L \"$pre\" ]"), "{zip}");
+    // 条目只经过 read -r 当数据用，命令里不会出现条目内容之外的拼接
+    assert!(zip.contains("IFS= read -r p"), "{zip}");
+    assert!(!zip.contains("@LIST@") && !zip.contains("@FEED@"), "{zip}");
+}
+
+#[test]
 fn extract_commands_carry_the_right_flags_per_format() {
     let ex = |format, mode, skip| extract_command(format, "/d/a.x", "/d/out", false, mode, skip);
     assert_eq!(
@@ -443,6 +462,46 @@ fn scan_refuses_the_whole_archive_when_any_entry_escapes() {
         Err(ArchiveError::UnsafeEntries),
         "zip 的反斜杠分隔"
     );
+}
+
+#[test]
+fn scan_refuses_the_whole_archive_when_a_destination_symlink_is_in_the_way() {
+    // l：条目的某一级父目录（或它自己）在目标里已经是符号链接
+    let stdout = "dsite/\nnsite/a.txt\nllink/a.txt\nllink2/b.txt\nxsite/c.txt\n";
+    let err = scan_plan_output(stdout, false).unwrap_err();
+    assert_eq!(err, ArchiveError::DestSymlink("link/a.txt".to_owned()));
+    assert_eq!(
+        err.to_string(),
+        "目标目录里有符号链接（link/a.txt），解压可能写到目录外，已拒绝"
+    );
+    // zip 一样
+    assert_eq!(
+        scan_plan_output("llink/a.txt\n", true),
+        Err(ArchiveError::DestSymlink("link/a.txt".to_owned()))
+    );
+    // 路径越界优先报（包本身就不对）
+    assert_eq!(
+        scan_plan_output("llink/a.txt\nn../evil\n", false),
+        Err(ArchiveError::UnsafeEntries)
+    );
+}
+
+#[test]
+fn zip_backslash_entries_are_normalised_so_conflicts_are_not_missed() {
+    // 脚本已经把 `\` 换成 `/` 再核对，所以 Windows 打的包里的 dir\file.txt 能被报成冲突；
+    // 这里再验证解析一侧：就算输出里还留着反斜杠，zip 也按 `/` 处理和显示。
+    let scan = scan_plan_output("ddir\\\nxdir\\file.txt\nndir\\other.txt\n", true).unwrap();
+    assert_eq!(scan.total_entries, 3);
+    assert_eq!(scan.conflict_count, 1);
+    assert_eq!(scan.conflict_sample, ["dir/file.txt"]);
+    // 反斜杠里的链接也认得出
+    assert_eq!(
+        scan_plan_output("ldir\\file.txt\n", true),
+        Err(ArchiveError::DestSymlink("dir/file.txt".to_owned()))
+    );
+    // tar 里反斜杠只是普通字符，原样保留
+    let tar = scan_plan_output("xdir\\file.txt\n", false).unwrap();
+    assert_eq!(tar.conflict_sample, ["dir\\file.txt"]);
 }
 
 #[test]
@@ -861,6 +920,18 @@ async fn plan_refuses_archives_that_escape_the_destination() {
         .unwrap_err();
     assert_eq!(err, ArchiveError::UnsafeEntries);
     assert_eq!(err.to_string(), "压缩包里有指向目录外的路径，已拒绝解压");
+}
+
+#[tokio::test]
+async fn plan_refuses_archives_when_the_destination_has_a_symlink_in_the_way() {
+    let fs = archive_fs();
+    fs.put_dir("/d/site");
+    let runner = plan_runner("dsite/\nnsite/ok.txt\nllink/a.txt\n");
+    let err = plan_extract(&runner, &fs, "/d/site.tar.gz", "/d/site", &never())
+        .await
+        .unwrap_err();
+    assert_eq!(err, ArchiveError::DestSymlink("link/a.txt".to_owned()));
+    assert!(err.to_string().contains("符号链接（link/a.txt）"));
 }
 
 #[tokio::test]

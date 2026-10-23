@@ -367,11 +367,6 @@ export default function SftpTabView({
   }, [sftpId]);
 
 
-  // 活跃（非终态）计数：标题上的进行中数量、关闭确认都读它。
-  useEffect(() => {
-    onActiveCountChange?.(activeCount);
-  }, [activeCount, onActiveCountChange]);
-
   // ---------- 列目录 ----------
   // 换目录要"丝滑"：去过的目录先显示上次的列表，后台再读一遍悄悄换上；没去过的先留着
   // 旧列表（调暗），读到再换。连点几下时只认最后一次请求（序号），旧结果晚到不能盖掉新目录。
@@ -738,6 +733,14 @@ export default function SftpTabView({
   const [pasteCancelling, setPasteCancelling] = useState(false);
   const pasteBusyRef = useRef(pasteBusy);
   pasteBusyRef.current = pasteBusy;
+  // 活跃（非终态）计数：标题上的进行中数量、关闭标签 / 停靠面板 / 退出前的确认都读它。
+  // 传输队列的进行中个数，加上服务器上正在跑的压缩 / 检查压缩包 / 解压（它们不在传输队列里，
+  // 关掉标签会取消它们，也要先确认）。复制粘贴（paste）不算，维持原来的行为。
+  const archiveRunning = pasteBusy !== null && pasteBusy.kind !== "paste" ? 1 : 0;
+  const reportedCount = activeCount + archiveRunning;
+  useEffect(() => {
+    onActiveCountChange?.(reportedCount);
+  }, [reportedCount, onActiveCountChange]);
   useEffect(() => {
     if (!pasteBusy) return;
     setPasteElapsed(0);
@@ -972,7 +975,9 @@ export default function SftpTabView({
           selectDest: mode === "folder",
         };
         if (plan.conflict_count > 0) setExtractAsk(ask);
-        else startExtract(ask, "overwrite");
+        // 检查时没有同名文件：用「跳过已有文件」解压。检查和解压之间如果有别人新建了同名文件，
+        // 也不会被悄悄覆盖；只有用户在冲突对话框里明确选了「覆盖」才用 overwrite。
+        else startExtract(ask, "skip_existing");
       })
       .catch((error) => {
         endArchiveBusy();
