@@ -182,4 +182,21 @@ describe("智能体路径：自动 / 手动指定开关", () => {
     expect(toggle().getAttribute("aria-checked")).toBe("true");
     expect(pathInput()?.value).toBe("D:\bin\claude.exe");
   });
+
+  it("已有手动路径 A，改成 B 后保存失败：设置回滚、仍是手动，输入框里的 B 不丢", async () => {
+    useSettings.setState({ ai_claude_path: "D:/old/claude.exe" });
+    mocks.settingsSet.mockImplementationOnce(async () => {
+      throw new Error("磁盘满了");
+    });
+    await openAiSection();
+    expect(pathInput()?.value).toBe("D:/old/claude.exe");
+    await act(async () => fireEvent.change(pathInput()!, { target: { value: "D:/new/claude.exe" } }));
+    await act(async () => screen.getByText("检测并保存").click());
+    await waitFor(() => expect(mocks.settingsSet).toHaveBeenCalledWith("ai_claude_path", JSON.stringify("D:/new/claude.exe")));
+    await act(async () => {});
+    // 设置回滚到写入前确认过的值（不是 B）；输入框里的 B 留着
+    expect(useSettings.getState().ai_claude_path).not.toBe("D:/new/claude.exe");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(pathInput()?.value).toBe("D:/new/claude.exe");
+  });
 });

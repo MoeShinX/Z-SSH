@@ -1086,6 +1086,8 @@ function AgentBlock({
                   // 检测期间切回了自动（或又点了一次）：这次结果作废，别把路径又存回去
                   if (seq !== probeSeq.current) return;
                   toast.success(`可用：${install.version}`);
+                  // 保存结束前都算草稿（第一次填、改已有路径都一样）：失败时设置回滚，输入框不跟着被冲掉
+                  setManualPending(true);
                   void update(pathKey, value).then((saved) => {
                     // 保存成功才收起「待保存」；失败时设置会回滚成原值，输入框和草稿留着
                     if (saved && seq === probeSeq.current) setManualPending(false);
