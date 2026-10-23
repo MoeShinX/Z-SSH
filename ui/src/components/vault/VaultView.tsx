@@ -83,6 +83,7 @@ import { ScrollArea } from "../ui/scroll-area";
 import { ResizeHandle, useHostTreeWidth } from "../ui/resize-handle";
 import { guideAttrs, treeGuideStyle, type TreeGuide } from "./treeGuides";
 import { hostCopyText, type HostCopyKind } from "../../state/hostAddress";
+import { canCopyPassword, copyInfoToClipboard, copyPasswordToClipboard } from "../../state/hostClipboard";
 import {
   cancelPendingCollapse,
   clickHostInfo,
@@ -206,6 +207,8 @@ export default function VaultView({
     openSftp: (host) => onOpenSftp(host),
     remove: (host) => onDeleteHost(host),
     copy: (host, kind) => copyHost(host, kind),
+    copyPassword: (host) => void copyPasswordToClipboard(host.id).then((result) => onNotice(result.message)),
+    copyInfo: (host) => void copyInfoToClipboard(host.id).then((result) => onNotice(result.message)),
     installKey: (host) => setInstallHost(host),
     forwards: (host) => onOpenForwards(host.id),
   };
@@ -315,6 +318,8 @@ export default function VaultView({
                   onEdit={() => hostActions.edit?.(host)}
                   onDelete={() => onDeleteHost(host)}
                   onCopy={(kind) => copyHost(host, kind)}
+                  onCopyPassword={() => hostActions.copyPassword(host)}
+                  onCopyInfo={() => hostActions.copyInfo(host)}
                   onInstallKey={() => setInstallHost(host)}
                   onForwards={() => onOpenForwards(host.id)}
                 />
@@ -335,6 +340,8 @@ export default function VaultView({
                   onEdit={() => hostActions.edit?.(host)}
                   onDelete={() => onDeleteHost(host)}
                   onCopy={(kind) => copyHost(host, kind)}
+                  onCopyPassword={() => hostActions.copyPassword(host)}
+                  onCopyInfo={() => hostActions.copyInfo(host)}
                   onInstallKey={() => setInstallHost(host)}
                   onForwards={() => onOpenForwards(host.id)}
                 />
@@ -843,6 +850,10 @@ export interface HostActions {
   openSftp: (host: Host) => void;
   remove: (host: Host) => void;
   copy: (host: Host, kind: HostCopyKind) => void;
+  /** 「复制密码」：后端取密码直接写进剪贴板，30 秒后自动清除；菜单只在能复制时才有这一项。 */
+  copyPassword: (host: Host) => void;
+  /** 「复制连接信息」：后端拼好文字写进剪贴板（带密码时 30 秒后自动清除）。 */
+  copyInfo: (host: Host) => void;
   installKey?: (host: Host) => void;
   /** 右键「编辑」/ 编辑按钮：打开详情；没给就和单击一样。 */
   edit?: (host: Host) => void;
@@ -1001,6 +1012,8 @@ function HostLeaf({
         onEdit={() => (actions.edit ?? actions.select)(host)}
         onDelete={() => actions.remove(host)}
         onCopy={(kind) => actions.copy(host, kind)}
+        onCopyPassword={() => actions.copyPassword(host)}
+        onCopyInfo={() => actions.copyInfo(host)}
         onInstallKey={actions.installKey ? () => actions.installKey?.(host) : undefined}
         onForwards={actions.forwards ? () => actions.forwards?.(host) : undefined}
         orderLocked={term !== undefined}
@@ -1054,6 +1067,8 @@ function HostCard({
   onEdit,
   onDelete,
   onCopy,
+  onCopyPassword,
+  onCopyInfo,
   onInstallKey,
   onForwards,
 }: {
@@ -1066,6 +1081,8 @@ function HostCard({
   onEdit: () => void;
   onDelete: () => void;
   onCopy: (kind: HostCopyKind) => void;
+  onCopyPassword: () => void;
+  onCopyInfo: () => void;
   onInstallKey: () => void;
   onForwards: () => void;
 }) {
@@ -1131,6 +1148,8 @@ function HostCard({
         onEdit={onEdit}
         onDelete={onDelete}
         onCopy={onCopy}
+        onCopyPassword={onCopyPassword}
+        onCopyInfo={onCopyInfo}
         onInstallKey={onInstallKey}
         onForwards={onForwards}
       />
@@ -1150,6 +1169,8 @@ function HostRow({
   onEdit,
   onDelete,
   onCopy,
+  onCopyPassword,
+  onCopyInfo,
   onInstallKey,
   onForwards,
 }: {
@@ -1163,6 +1184,8 @@ function HostRow({
   onEdit: () => void;
   onDelete: () => void;
   onCopy: (kind: HostCopyKind) => void;
+  onCopyPassword: () => void;
+  onCopyInfo: () => void;
   onInstallKey: () => void;
   onForwards: () => void;
 }) {
@@ -1212,6 +1235,8 @@ function HostRow({
         onEdit={onEdit}
         onDelete={onDelete}
         onCopy={onCopy}
+        onCopyPassword={onCopyPassword}
+        onCopyInfo={onCopyInfo}
         onInstallKey={onInstallKey}
         onForwards={onForwards}
       />
@@ -1306,6 +1331,8 @@ function HostMenu({
   onEdit,
   onDelete,
   onCopy,
+  onCopyPassword,
+  onCopyInfo,
   onInstallKey,
   onForwards,
   orderLocked,
@@ -1316,11 +1343,14 @@ function HostMenu({
   onEdit: () => void;
   onDelete: () => void;
   onCopy: (kind: HostCopyKind) => void;
+  onCopyPassword: () => void;
+  onCopyInfo: () => void;
   onInstallKey?: () => void;
   onForwards?: () => void;
   /** 给了就在菜单里显示「上移 / 下移」（树里的主机行）；值 = 当前是不是在搜索（搜索时置灰）。 */
   orderLocked?: boolean;
 }) {
+  const identities = useVault((state) => state.identities);
   return (
     <ContextMenuContent className="w-44">
       <ContextMenuItem onSelect={onConnect}>
@@ -1337,6 +1367,14 @@ function HostMenu({
       </ContextMenuItem>
       <ContextMenuItem onSelect={() => onCopy("address")}>
         <Check className="mr-2 h-3.5 w-3.5 opacity-0" /> 复制地址
+      </ContextMenuItem>
+      {canCopyPassword(host, identities) && (
+        <ContextMenuItem data-action="copy-password" onSelect={onCopyPassword}>
+          <Check className="mr-2 h-3.5 w-3.5 opacity-0" /> 复制密码
+        </ContextMenuItem>
+      )}
+      <ContextMenuItem data-action="copy-info" onSelect={onCopyInfo}>
+        <Check className="mr-2 h-3.5 w-3.5 opacity-0" /> 复制连接信息
       </ContextMenuItem>
       {onInstallKey && (
         <ContextMenuItem onSelect={onInstallKey}>

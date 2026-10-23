@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod ai;
 pub mod auth;
+pub mod clipboard;
 pub mod forward;
 pub mod ime;
 pub mod session;

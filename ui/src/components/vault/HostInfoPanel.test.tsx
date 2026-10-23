@@ -73,6 +73,8 @@ function setup(infoPanel: boolean) {
     openSftp: vi.fn(),
     remove: vi.fn(),
     copy: vi.fn(),
+    copyPassword: vi.fn(),
+    copyInfo: vi.fn(),
   };
   const noop = () => {};
   render(

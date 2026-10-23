@@ -200,3 +200,11 @@ export const hostMemoryGet = (hostId: number): Promise<HostMemory | null> =>
 /** 改 / 清空（空串）笔记；敏感值会被隐藏，太长会报错。 */
 export const hostMemorySet = (hostId: number, content: string): Promise<void> =>
   invoke("host_memory_set", { hostId, content });
+
+/** 右键「复制密码」：后端按规则取密码直接写进剪贴板（30 秒后自动清除），密码不经过前端。 */
+export const copyHostPassword = (id: number): Promise<void> =>
+  invoke("host_copy_password", { id });
+
+/** 右键「复制连接信息」：后端拼好文字直接写进剪贴板；`with_password` 为真时 30 秒后自动清除。 */
+export const copyHostInfo = (id: number): Promise<{ with_password: boolean }> =>
+  invoke("host_copy_info", { id });

@@ -427,6 +427,8 @@ fn main() {
             commands::auth::hostkey_forget,
             commands::auth::hostkey_saved,
             commands::ime::ime_terminal_focus,
+            commands::clipboard::host_copy_password,
+            commands::clipboard::host_copy_info,
             commands::system::system_double_click_time,
             commands::settings::settings_get,
             commands::settings::settings_set,

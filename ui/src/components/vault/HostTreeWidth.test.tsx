@@ -44,6 +44,8 @@ function asideProps() {
       openSftp: noop,
       remove: noop,
       copy: noop,
+      copyPassword: noop,
+      copyInfo: noop,
       installKey: noop,
       forwards: noop,
     },

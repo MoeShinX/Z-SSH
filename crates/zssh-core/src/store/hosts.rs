@@ -318,7 +318,10 @@ pub(crate) fn host_get(conn: &Connection, id: i64) -> Result<Host, ZsshError> {
 
 /// 认证方式和凭据类型要配套：密码认证只能用密码凭据，私钥认证只能用私钥凭据。
 /// agent 认证不读凭据里的秘密，不限制。
-fn check_identity_matches(method: AuthMethod, identity: &Identity) -> Result<(), ZsshError> {
+pub(crate) fn check_identity_matches(
+    method: AuthMethod,
+    identity: &Identity,
+) -> Result<(), ZsshError> {
     let ok = match method {
         AuthMethod::Password => identity.kind == IdentityKind::Password,
         AuthMethod::Key => matches!(

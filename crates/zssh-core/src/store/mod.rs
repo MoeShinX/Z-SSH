@@ -1,6 +1,7 @@
 //! 存储层：SQLite、DPAPI 加解密，以及各实体的数据访问。
 
 pub mod audit;
+pub mod connection_info;
 pub mod db;
 pub mod forwards;
 pub mod groups;

@@ -299,6 +299,8 @@ describe("终端界面的主机树（同一个组件）", () => {
     openSftp: vi.fn(),
     remove: vi.fn(),
     copy: vi.fn(),
+    copyPassword: vi.fn(),
+    copyInfo: vi.fn(),
   });
   const noop = () => {};
   const aside = (hostActions: HostActions) => (

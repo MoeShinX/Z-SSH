@@ -198,6 +198,7 @@ import { useResolvedMode, useSettings, useTerminalITheme, useTerminalMode } from
 import { useImeDefaultEnglish } from "./terminal/useImeDefaultEnglish";
 import { recordRecent } from "./state/hostTree";
 import { hostCopyText } from "./state/hostAddress";
+import { copyInfoToClipboard, copyPasswordToClipboard } from "./state/hostClipboard";
 import {
   closeSettings,
   escClosesSettings,
@@ -2859,6 +2860,16 @@ export default function App() {
           .writeText(text)
           .then(() => toast.info(`已复制：${text}`))
           .catch(() => toast.error("复制失败"));
+      },
+      copyPassword: (host) => {
+        void copyPasswordToClipboard(host.id).then((result) =>
+          result.ok ? toast.info(result.message) : toast.error(result.message),
+        );
+      },
+      copyInfo: (host) => {
+        void copyInfoToClipboard(host.id).then((result) =>
+          result.ok ? toast.info(result.message) : toast.error(result.message),
+        );
       },
       edit: (host) => {
         setSidePanel("none");
