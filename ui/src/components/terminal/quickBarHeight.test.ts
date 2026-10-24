@@ -3,13 +3,20 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPOSE_BAR_AUTO,
+  COMPOSE_BAR_CHROME,
+  COMPOSE_BAR_MIN_HEIGHT,
   QUICK_BAR_DEFAULT_HEIGHT,
   COMPOSE_INPUT_MIN_HEIGHT,
+  clampComposeBarHeight,
   clampQuickBarHeight,
+  composeBarMaxHeight,
   composeInputMaxHeight,
+  dragComposeBarHeight,
   dragQuickBarHeight,
   overviewBottomOffset,
   quickBarMaxHeight,
+  sanitizeStoredComposeBarHeight,
   sanitizeStoredQuickBarHeight,
 } from "./quickBarHeight";
 
@@ -83,5 +90,52 @@ describe("撰写栏输入框高度", () => {
     expect(composeInputMaxHeight(200)).toBe(60);
     expect(composeInputMaxHeight(100)).toBe(30);
     expect(composeInputMaxHeight(40)).toBe(COMPOSE_INPUT_MIN_HEIGHT);
+  });
+});
+
+describe("撰写栏自身的高度（UI-19）", () => {
+  it("一行 = 输入框 24 + 栏的边框和内边距 5 = 29", () => {
+    expect(COMPOSE_BAR_CHROME).toBe(5);
+    expect(COMPOSE_BAR_MIN_HEIGHT).toBe(29);
+  });
+
+  it("上限是终端区域的 60%（比自动增高的 30% 宽松），至少一行；量不到时用兜底", () => {
+    expect(composeBarMaxHeight(1000)).toBe(600);
+    expect(composeBarMaxHeight(500)).toBe(300);
+    expect(composeBarMaxHeight(333)).toBe(199);
+    expect(composeBarMaxHeight(30)).toBe(COMPOSE_BAR_MIN_HEIGHT);
+    expect(composeBarMaxHeight(0)).toBe(480);
+    expect(composeBarMaxHeight(-10)).toBe(480);
+    expect(composeBarMaxHeight(Number.NaN)).toBe(480);
+    expect(composeBarMaxHeight(2000)).toBeGreaterThan(composeInputMaxHeight(2000));
+  });
+
+  it("夹取：不小于一行、不超过上限，上限随终端高度变", () => {
+    expect(clampComposeBarHeight(100, 1000)).toBe(100);
+    expect(clampComposeBarHeight(1, 1000)).toBe(COMPOSE_BAR_MIN_HEIGHT);
+    expect(clampComposeBarHeight(-50, 1000)).toBe(COMPOSE_BAR_MIN_HEIGHT);
+    expect(clampComposeBarHeight(Number.NaN, 1000)).toBe(COMPOSE_BAR_MIN_HEIGHT);
+    expect(clampComposeBarHeight(Number.POSITIVE_INFINITY, 1000)).toBe(COMPOSE_BAR_MIN_HEIGHT);
+    expect(clampComposeBarHeight(900, 1000)).toBe(600);
+    expect(clampComposeBarHeight(900, 500)).toBe(300);
+    expect(clampComposeBarHeight(100.4, 1000)).toBe(100);
+  });
+
+  it("拖动：往上拖（clientY 变小）变高，往下拖变矮", () => {
+    expect(dragComposeBarHeight(100, 500, 450, 1000)).toBe(150);
+    expect(dragComposeBarHeight(100, 500, 530, 1000)).toBe(70);
+    expect(dragComposeBarHeight(100, 500, 5000, 1000)).toBe(COMPOSE_BAR_MIN_HEIGHT);
+    expect(dragComposeBarHeight(100, 500, -5000, 1000)).toBe(600);
+  });
+
+  it("体检：不是有限数、负数、0、不到一行都当 0（自动）；合法值取整", () => {
+    expect(COMPOSE_BAR_AUTO).toBe(0);
+    for (const bad of [0, -1, -100, 1, 28, Number.NaN, Number.POSITIVE_INFINITY, "100", null, undefined, {}]) {
+      expect(sanitizeStoredComposeBarHeight(bad)).toBe(0);
+    }
+    expect(sanitizeStoredComposeBarHeight(29)).toBe(29);
+    expect(sanitizeStoredComposeBarHeight(120.6)).toBe(121);
+    // 大于上限的不在这里夹（显示时按当前终端高度夹，不改存的值）
+    expect(sanitizeStoredComposeBarHeight(99999)).toBe(99999);
   });
 });

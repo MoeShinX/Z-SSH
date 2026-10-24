@@ -2,11 +2,31 @@
 //! 撰写栏：Enter 发当前窗格、Ctrl+Enter 发所有分屏、Shift+Enter 换行、输入法组合中不发送、
 //! 没连上不清空、↑ ↓ 翻历史（多行里不抢光标）、Esc 还焦点、发送目标开关。
 
-import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const settingsSet = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../../api/settings", () => ({
+  settingsGet: vi.fn(async () => null),
+  settingsSet,
+}));
+
+import { isPanelDragging, resetPanelDraggingForTests } from "../../state/panelWidths";
+import { useSettings } from "../../stores/settings";
 import ComposeBar, { type ComposeBarProps } from "./ComposeBar";
-import { useLiveComposeBarHeight } from "./quickBarHeight";
+import {
+  COMPOSE_BAR_MIN_HEIGHT,
+  composeBarMaxHeight,
+  useLiveComposeBarHeight,
+} from "./quickBarHeight";
 
 afterEach(() => {
   cleanup();
@@ -324,3 +344,155 @@ describe("上报高度", () => {
   });
 });
 
+
+describe("撰写栏高度拖动条", () => {
+  beforeEach(() => {
+    settingsSet.mockClear();
+    useSettings.setState({ "layout.compose_bar_height": 0 });
+    resetPanelDraggingForTests();
+    Element.prototype.setPointerCapture = () => {};
+    Element.prototype.hasPointerCapture = () => false;
+    Element.prototype.releasePointerCapture = () => {};
+  });
+
+  const handle = () =>
+    document.querySelector<HTMLElement>('[data-section="compose-bar-resize-handle"]')!;
+  const bar = () => document.querySelector<HTMLElement>('[data-section="compose-bar"]')!;
+  const saved = () => settingsSet.mock.calls as unknown as [string, string][];
+
+  it("上沿有拖动条：上下调整的光标和提示；默认是自动增高（栏没有固定高度）", () => {
+    const { input } = setup();
+    expect(handle().className).toContain("cursor-ns-resize");
+    expect(handle().getAttribute("title")).toBe("上下拖动调整高度，双击恢复");
+    expect(bar().style.height).toBe("");
+    expect(input.className).not.toContain("self-stretch");
+  });
+
+  it("往上拖栏变高、输入框撑满栏；拖动中不写设置，松手才写；拖动期间终端只做视觉适配", async () => {
+    const { input } = setup();
+    fireEvent.pointerDown(handle(), { clientY: 500, pointerId: 1 });
+    expect(isPanelDragging()).toBe(true);
+    fireEvent.pointerMove(handle(), { clientY: 440, pointerId: 1 });
+    // jsdom 量不到栏的高度，起点按一行高度算
+    expect(bar().style.height).toBe(`${COMPOSE_BAR_MIN_HEIGHT + 60}px`);
+    expect(input.className).toContain("self-stretch");
+    expect(input.className).toContain("overflow-y-auto");
+    expect(input.style.height).toBe("");
+    expect(settingsSet).not.toHaveBeenCalled();
+    fireEvent.pointerUp(handle(), { clientY: 440, pointerId: 1 });
+    expect(isPanelDragging()).toBe(false);
+    await waitFor(() =>
+      expect(saved()).toEqual([["layout.compose_bar_height", String(COMPOSE_BAR_MIN_HEIGHT + 60)]]),
+    );
+    expect(bar().style.height).toBe(`${COMPOSE_BAR_MIN_HEIGHT + 60}px`);
+  });
+
+  it("往下拖变矮，不会比一行更矮；往上不会超过终端区域的 60%", () => {
+    useSettings.setState({ "layout.compose_bar_height": 120 });
+    setup();
+    fireEvent.pointerDown(handle(), { clientY: 500, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientY: 530, pointerId: 1 });
+    expect(bar().style.height).toBe("90px");
+    fireEvent.pointerMove(handle(), { clientY: 5000, pointerId: 1 });
+    expect(bar().style.height).toBe(`${COMPOSE_BAR_MIN_HEIGHT}px`);
+    fireEvent.pointerMove(handle(), { clientY: -5000, pointerId: 1 });
+    // jsdom 量不到终端区域，退到窗口高度
+    expect(bar().style.height).toBe(`${composeBarMaxHeight(window.innerHeight)}px`);
+    expect(composeBarMaxHeight(window.innerHeight)).toBe(Math.floor(window.innerHeight * 0.6));
+    fireEvent.pointerUp(handle(), { clientY: -5000, pointerId: 1 });
+  });
+
+  it("只点一下（没拖动）不会把自动变成固定", () => {
+    setup();
+    fireEvent.pointerDown(handle(), { clientY: 500, pointerId: 1 });
+    fireEvent.pointerUp(handle(), { clientY: 500, pointerId: 1 });
+    expect(settingsSet).not.toHaveBeenCalled();
+    expect(bar().style.height).toBe("");
+    expect(isPanelDragging()).toBe(false);
+  });
+
+  it("双击拖动条恢复自动增高（写 0）", async () => {
+    useSettings.setState({ "layout.compose_bar_height": 120 });
+    const { input } = setup();
+    expect(bar().style.height).toBe("120px");
+    fireEvent.doubleClick(handle());
+    await waitFor(() => expect(saved()).toEqual([["layout.compose_bar_height", "0"]]));
+    expect(bar().style.height).toBe("");
+    expect(input.className).not.toContain("self-stretch");
+  });
+
+  it("存的值不合法（负数、不是数字、不到一行）当自动；超过上限显示按上限夹取、不改存的值", () => {
+    for (const bad of [-5, 0, 10, "abc", null, Number.NaN]) {
+      useSettings.setState({ "layout.compose_bar_height": bad as unknown as number });
+      const { view } = setup();
+      expect(bar().style.height).toBe("");
+      view.unmount();
+    }
+    useSettings.setState({ "layout.compose_bar_height": 99999 });
+    setup();
+    expect(bar().style.height).toBe(`${composeBarMaxHeight(window.innerHeight)}px`);
+    expect(useSettings.getState()["layout.compose_bar_height"]).toBe(99999);
+    expect(settingsSet).not.toHaveBeenCalled();
+  });
+
+  it("固定高度：输入框撑满栏（不再自动增高），内容再多也在框内滚动", () => {
+    useSettings.setState({ "layout.compose_bar_height": 150 });
+    const { input, type } = setup();
+    type(Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n"));
+    expect(bar().style.height).toBe("150px");
+    expect(input.style.height).toBe("");
+    expect(input.className).toContain("self-stretch");
+    expect(input.className).toContain("overflow-y-auto");
+    expect(input.style.overflowY).toBe("");
+  });
+
+  it("自动模式下输入框还是自己长高：不设栏高度，不撑满", () => {
+    const { input, type } = setup();
+    type("a\nb\nc");
+    expect(bar().style.height).toBe("");
+    expect(input.className).not.toContain("self-stretch");
+    expect(input.className).not.toContain("overflow-y-auto");
+  });
+
+  it("固定高度下发送成功清空后高度保持，Enter 和历史照常", () => {
+    useSettings.setState({ "layout.compose_bar_height": 120 });
+    const { input, onSend, type, press } = setup();
+    type("ls -la");
+    press("Enter");
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(input.value).toBe("");
+    expect(bar().style.height).toBe("120px");
+    expect(document.activeElement).toBe(input);
+    press("ArrowUp");
+    expect(input.value).toBe("ls -la");
+    expect(bar().style.height).toBe("120px");
+  });
+
+  it("拖动过程中把栏的实际高度实时上报，卸载后归零", () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      const height = Number.parseFloat(this.style.height) || 0;
+      return { height, width: 100, top: 0, left: 0, right: 100, bottom: height, x: 0, y: 0, toJSON: () => ({}) };
+    });
+    const live = renderHook(() => useLiveComposeBarHeight());
+    const { view } = setup();
+    fireEvent.pointerDown(handle(), { clientY: 500, pointerId: 1 });
+    fireEvent.pointerMove(handle(), { clientY: 400, pointerId: 1 });
+    expect(live.result.current).toBe(COMPOSE_BAR_MIN_HEIGHT + 100);
+    fireEvent.pointerMove(handle(), { clientY: 350, pointerId: 1 });
+    expect(live.result.current).toBe(COMPOSE_BAR_MIN_HEIGHT + 150);
+    fireEvent.pointerUp(handle(), { clientY: 350, pointerId: 1 });
+    expect(live.result.current).toBe(COMPOSE_BAR_MIN_HEIGHT + 150);
+    view.unmount();
+    expect(live.result.current).toBe(0);
+  });
+
+  it("拖到一半卸载：不把终端留在拖动状态", () => {
+    const { view } = setup();
+    fireEvent.pointerDown(handle(), { clientY: 500, pointerId: 1 });
+    expect(isPanelDragging()).toBe(true);
+    view.unmount();
+    expect(isPanelDragging()).toBe(false);
+  });
+});

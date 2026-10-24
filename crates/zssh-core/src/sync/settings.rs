@@ -95,6 +95,7 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("layout.host_tree_width", SyncMode::LocalOnly),
     ("layout.ai_input_height", SyncMode::LocalOnly),
     ("layout.quick_bar_height", SyncMode::LocalOnly),
+    ("layout.compose_bar_height", SyncMode::LocalOnly),
     ("layout.vault_expanded", SyncMode::LocalOnly),
     ("layout.vault_sidebar_collapsed", SyncMode::LocalOnly),
     // 主机页右边用卡片还是列表：本机的使用习惯
@@ -1195,6 +1196,7 @@ mod tests {
             "layout.host_tree_width",
             "layout.ai_input_height",
             "layout.quick_bar_height",
+            "layout.compose_bar_height",
             "compose_bar",
             "ai_opencode_path",
             "ai_codex_path",

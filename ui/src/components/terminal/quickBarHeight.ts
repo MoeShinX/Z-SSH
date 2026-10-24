@@ -144,3 +144,51 @@ export function composeInputMaxHeight(areaHeight: number): number {
     Math.min(rowsMax, Math.floor(areaHeight * COMPOSE_MAX_RATIO)),
   );
 }
+
+// ---------------------------------------------------------------------------
+// 撰写栏本身的高度（UI-19）：上沿拖动条调，存 `layout.compose_bar_height`。
+// 0 = 自动（随内容 1 行到约 5 行，上面的 composeInputMaxHeight）；大于 0 = 用户拖出来的固定高度。
+// ---------------------------------------------------------------------------
+
+/** 栏比输入框多出来的高度：上边框 1px + 上下内边距（`py-0.5`）各 2px。 */
+export const COMPOSE_BAR_CHROME = 5;
+/** 撰写栏只有一行时的高度，也是固定高度的最小值。 */
+export const COMPOSE_BAR_MIN_HEIGHT = COMPOSE_INPUT_MIN_HEIGHT + COMPOSE_BAR_CHROME;
+/** 固定高度最大不超过终端区域高度的这个比例（比自动增高的 30% 宽松，这是「自由调」）。 */
+export const COMPOSE_BAR_MAX_RATIO = 0.6;
+/** 设置值 0 = 自动增高（默认）。 */
+export const COMPOSE_BAR_AUTO = 0;
+/** 量不到终端区域高度时的上限。 */
+const COMPOSE_BAR_FALLBACK_MAX = 480;
+
+/** 当前终端区域高度下撰写栏最高能拖到多少：区域的 60%，至少一行。 */
+export function composeBarMaxHeight(areaHeight: number): number {
+  if (!Number.isFinite(areaHeight) || areaHeight <= 0) return COMPOSE_BAR_FALLBACK_MAX;
+  return Math.max(COMPOSE_BAR_MIN_HEIGHT, Math.floor(areaHeight * COMPOSE_BAR_MAX_RATIO));
+}
+
+/** 把想要的高度夹进 [一行, 区域的 60%]。 */
+export function clampComposeBarHeight(desired: number, areaHeight: number): number {
+  if (!Number.isFinite(desired)) return COMPOSE_BAR_MIN_HEIGHT;
+  return Math.min(
+    composeBarMaxHeight(areaHeight),
+    Math.max(COMPOSE_BAR_MIN_HEIGHT, Math.round(desired)),
+  );
+}
+
+/** 拖动中的高度：拖动条在栏的上沿，往上拖（clientY 变小）栏变高。 */
+export function dragComposeBarHeight(
+  startHeight: number,
+  startY: number,
+  currentY: number,
+  areaHeight: number,
+): number {
+  return clampComposeBarHeight(startHeight + (startY - currentY), areaHeight);
+}
+
+/** 读回来的存量值做体检：不是有限数、负数、0、小于一行的都当 0（自动）；其余取整，上限在显示时再夹。 */
+export function sanitizeStoredComposeBarHeight(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return COMPOSE_BAR_AUTO;
+  if (raw < COMPOSE_BAR_MIN_HEIGHT) return COMPOSE_BAR_AUTO;
+  return Math.round(raw);
+}

@@ -5,6 +5,8 @@
 //! - ↑ / ↓：翻最近发过的 50 条（输入框是空的，或光标在第一行 / 最后一行时才响应；历史只在内存里）
 //! - Esc：把键盘还给当前终端；输入法组合输入中的 Enter 不发送
 //! - 发送成功后清空并留在输入框里（方便连着写）；没连上时不清空
+//! - 栏的上沿有拖动条：上下拖改高度（设置 `layout.compose_bar_height`，0 = 自动增高，大于 0 = 固定高度，
+//!   输入框撑满、内容超出框内滚动），双击恢复自动；固定高度发送后不缩回
 //!
 //! 发送本身不在这里：交给 App 的同一套发送流程（和快捷命令栏共用，见 state/sendCommand.ts）。
 
@@ -29,6 +31,7 @@ import {
   type HistoryNav,
 } from "../../state/composeHistory";
 import { Button } from "../ui/button";
+import { ComposeBarResizeHandle, useComposeBarHeight } from "./ComposeBarResizeHandle";
 import { composeInputMaxHeight, setLiveComposeBarHeight } from "./quickBarHeight";
 
 export interface ComposeBarProps {
@@ -56,11 +59,21 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
   const inputRef = useRef<HTMLTextAreaElement>(null);
   /** 翻历史后下一次渲染把光标放到末尾。 */
   const caretToEnd = useRef(false);
+  // 栏的高度：fixed 为 null = 自动增高（默认），否则是用户拖出来的固定高度（输入框撑满栏）
+  const { fixed, areaHeight, getHeight, onResize, onCommit, onReset } = useComposeBarHeight(barRef);
+  const isFixed = fixed !== null;
 
   // 输入框随内容长高：默认一行，最多约 5 行（也不超过终端区域的 30%），再多框内滚动。
+  // 固定高度时不自动长：输入框由 flex 撑满整栏，内容超出就框内滚动。
   useLayoutEffect(() => {
     const input = inputRef.current;
     if (!input) return;
+    if (isFixed) {
+      input.style.height = "";
+      input.style.overflowY = "";
+      return;
+    }
+    input.style.overflowY = "";
     input.style.height = "auto";
     const border = input.offsetHeight - input.clientHeight;
     const natural = input.scrollHeight + border;
@@ -75,7 +88,7 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
     const max = composeInputMaxHeight(area ?? 0);
     input.style.height = `${Math.min(natural, max)}px`;
     input.style.overflowY = natural > max ? "auto" : "hidden";
-  }, [value]);
+  }, [value, isFixed]);
 
   useLayoutEffect(() => {
     if (!caretToEnd.current) return;
@@ -83,6 +96,12 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
     const input = inputRef.current;
     if (input) input.setSelectionRange(value.length, value.length);
   }, [value]);
+
+  // 拖动过程中栏高变了就立刻上报（真实环境里下面的 ResizeObserver 也会报，这里是不依赖它的保底）。
+  useLayoutEffect(() => {
+    const bar = barRef.current;
+    if (bar) setLiveComposeBarHeight(Math.round(bar.getBoundingClientRect().height));
+  }, [fixed]);
 
   // 把栏的实际高度告诉 App：服务器概览面板的底部偏移要让出它。终端自己会被 flex 布局挤小，
   // 它的 ResizeObserver 会重新 fit，这里不用管。
@@ -152,8 +171,16 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
     <div
       ref={barRef}
       data-section="compose-bar"
-      className="flex shrink-0 items-end gap-1 border-t border-border/60 px-1.5 py-0.5 text-xs"
+      style={isFixed ? { height: fixed } : undefined}
+      className="relative flex shrink-0 items-end gap-1 border-t border-border/60 px-1.5 py-0.5 text-xs"
     >
+      <ComposeBarResizeHandle
+        getHeight={getHeight}
+        areaHeight={areaHeight}
+        onResize={onResize}
+        onCommit={onCommit}
+        onReset={onReset}
+      />
       {/* data-ime="native"：输入法跟随你自己的中英文状态（只有终端里切英文，见 terminal/imeFocus.ts） */}
       <textarea
         ref={inputRef}
@@ -173,7 +200,10 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
           setValue(event.target.value);
         }}
         onKeyDown={onKeyDown}
-        className="block min-w-0 flex-1 resize-none rounded border border-input bg-transparent px-2 py-0.5 font-mono text-xs leading-[18px] placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        className={cn(
+          "block min-w-0 flex-1 resize-none rounded border border-input bg-transparent px-2 py-0.5 font-mono text-xs leading-[18px] placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          isFixed && "self-stretch overflow-y-auto",
+        )}
       />
       <button
         type="button"

@@ -99,6 +99,8 @@ export const SETTING_DEFAULTS = {
   "layout.ai_input_height": 75,
   // 终端底部快捷命令栏的高度（拖栏的上边框调，默认一行），同样是本机布局、不同步
   "layout.quick_bar_height": 28,
+  // 终端底部撰写栏的高度（UI-19，拖栏的上沿调）：0 = 自动增高（默认），大于 0 = 固定高度；本机布局、不同步
+  "layout.compose_bar_height": 0,
   // 主机页左边树的展开状态（逗号分隔的分组键），同样是本机布局、不同步
   "layout.vault_expanded": "",
   // 主机页左边树收起没有，同样是本机布局、不同步
@@ -182,6 +184,7 @@ export interface SettingValues {
   "layout.host_tree_width": number;
   "layout.ai_input_height": number;
   "layout.quick_bar_height": number;
+  "layout.compose_bar_height": number;
   "layout.vault_expanded": string;
   "layout.vault_sidebar_collapsed": boolean;
   "layout.vault_view_mode": string;

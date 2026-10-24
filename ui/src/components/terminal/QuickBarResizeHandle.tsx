@@ -17,7 +17,7 @@ import {
 } from "./quickBarHeight";
 
 /** 终端区域（命令栏所在的标签页容器）的高度；量不到时退到窗口高度。 */
-function useAreaHeight(barRef: RefObject<HTMLElement | null>): number {
+export function useAreaHeight(barRef: RefObject<HTMLElement | null>): number {
   const [height, setHeight] = useState(() =>
     typeof window === "undefined" ? 800 : window.innerHeight,
   );
