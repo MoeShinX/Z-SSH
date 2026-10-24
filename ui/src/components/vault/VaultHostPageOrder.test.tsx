@@ -272,17 +272,24 @@ for (const layout of ["grid", "list"] as const) {
       expect(reorderHosts).not.toHaveBeenCalled();
     });
 
-    it("拖到不同分组的主机上：不响应（没有插入线，不换分组、不排序）", async () => {
+    it("拖到不同分组的主机上：有插入线、提示写明去向，松手先换分组再按位置排", async () => {
       render(<VaultView {...props()} />);
-      const restore = await dragOver(item("a1"), item("b1"), ...before);
+      const target = item("b1");
+      const restore = await dragOver(item("a1"), target, ...before);
       try {
-        expect(dropLines().length).toBe(0);
+        expect(target.querySelector('[data-section="drop-line"]')?.getAttribute("data-position")).toBe("before");
+        const label = document.querySelector('[data-section="host-drag-ghost"]')?.textContent ?? "";
+        expect(label).toContain("→");
         await release();
       } finally {
         restore();
       }
-      expect(reorderHosts).not.toHaveBeenCalled();
-      expect(saveHost).not.toHaveBeenCalled();
+      // 先换到目标所在的分组，再把目标那一层按新位置整层重新编号
+      expect(saveHost).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(saveHost).mock.calls[0][0]).toMatchObject({ id: idOf("a1"), group_id: treeHosts.find((h) => h.name === "b1")?.group_id });
+      expect(reorderHosts).toHaveBeenCalledTimes(1);
+      const ids = vi.mocked(reorderHosts).mock.calls[0][0] as number[];
+      expect(ids.indexOf(idOf("a1"))).toBe(ids.indexOf(idOf("b1")) - 1);
     });
 
     it("顶层主机之间也能排序", async () => {

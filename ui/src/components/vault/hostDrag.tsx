@@ -13,8 +13,9 @@
 //!   树的根元素带 `data-order-locked="true"`（搜索框里有字）时不响应排序拖动，换分组照旧。
 //! - 主机页右边的卡片 / 列表（UI-16）：每张卡片 / 行带 `data-page-host`（主机 id）和 `data-page-group`
 //!   （所在分组），容器带 `data-page-layout`（grid 看左右半、list 看上下半）和 `data-page-order`：
-//!   `manual` 才能排序，`mode`（不是手动排序）/ `search`（搜索中）不响应。只能在同一分组的主机之间
-//!   调整，拖到别的分组的卡片上不响应；松手仍然走 `dropHostAt`（整层重新编号）。
+//!   `manual` 才能排序，`mode`（不是手动排序）/ `search`（搜索中）不响应。拖到同一分组的主机前 / 后 =
+//!   调整顺序；拖到**别的分组**的主机前 / 后 = 移到那个分组并插在那个位置（和左边的树一致，提示标签
+//!   写明去向）。松手都走 `dropHostAt`（整层重新编号）。
 
 import { Folder, Server } from "lucide-react";
 import { create } from "zustand";
@@ -278,8 +279,8 @@ export function startHostDrag(host: Host, event: React.PointerEvent) {
           const targetId = Number(pageCard.getAttribute("data-page-host"));
           if (!Number.isFinite(targetId) || targetId === host.id) return { over: undefined, insert: null };
           if (state === "mode") return { over: undefined, insert: null, blockedByMode: true };
-          const sameGroup = pageCard.getAttribute("data-page-group") === String(host.group_id ?? "none");
-          if (state !== "manual" || !sameGroup) return { over: undefined, insert: null };
+          // 别的分组的主机也可以放：`dropHostAt` 会先换分组再按位置排（提示标签会写「→ 分组名」）
+          if (state !== "manual") return { over: undefined, insert: null };
           const after =
             container?.getAttribute("data-page-layout") === "grid"
               ? inRightHalf(pageCard, x)
