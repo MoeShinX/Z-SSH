@@ -61,6 +61,8 @@ const SIZES = {
   tree: { box: 16, logo: 11, radius: 4 },
   /** 主机卡片 */
   card: { box: 34, logo: 18, radius: 6 },
+  /** 主机卡片（紧凑） */
+  cardCompact: { box: 28, logo: 15, radius: 5 },
 } as const;
 
 export default function OsIcon({ hostId, size }: { hostId: number; size: keyof typeof SIZES }) {

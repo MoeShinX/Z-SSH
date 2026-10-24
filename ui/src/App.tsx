@@ -72,7 +72,7 @@ import {
 } from "./state/editorModel";
 import { useHostTreeWidth, useWindowWidth } from "./components/ui/resize-handle";
 import { computeDockLayout } from "./state/dockLayout";
-import { deleteGroupMessage, isUngroupedFlat } from "./state/ungroupedFlat";
+import { deleteGroupMessage, isUngroupedFlat, watchFlatDefault } from "./state/ungroupedFlat";
 import { canDockOnto, carryPaths, newDockSessionDefaults, OTHER_HOST_NOTICE } from "./state/dock";
 import { useTerminalCwd } from "./state/followCwd";
 import { sessionCwd, termWrite } from "./api/session";
@@ -500,6 +500,9 @@ export default function App() {
   useEffect(() => {
     void useSettings.getState().load();
   }, []);
+
+  // 新用户默认平铺（UI-16）：设置和主机库都读完后判断一次——这项设置没存过且主机库是空的才打开
+  useEffect(() => watchFlatDefault(), []);
 
   // 配置同步：读一次状态并订阅后端推送（状态栏和同步页共用）。
   useEffect(() => {

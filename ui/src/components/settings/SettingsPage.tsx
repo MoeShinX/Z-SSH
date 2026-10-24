@@ -263,6 +263,29 @@ function WindowCard() {
   );
 }
 
+/**
+ * 主机树（UI-16）：不显示「未分组」文件夹，不分组的主机直接放在最下面。
+ * 和主机树里「重命名「未分组」」设置的是同一项（vault_ungrouped_flat），互不冲突；跟着配置同步。
+ */
+function HostTreeCard() {
+  const flat = useSettings((state) => state.vault_ungrouped_flat);
+  const update = useSettings((state) => state.update);
+  return (
+    <SectionCard title="主机树">
+      <SettingRow
+        title="主机树里不显示「未分组」文件夹，不分组的主机直接放在最下面"
+        description="打开后，没有分组的主机排在所有分组下面，中间用一条线隔开。"
+      >
+        <Switch
+          data-testid="ungrouped-flat"
+          checked={flat}
+          onCheckedChange={(checked) => void update("vault_ungrouped_flat", checked)}
+        />
+      </SettingRow>
+    </SectionCard>
+  );
+}
+
 function AppearanceSection() {
   return (
     <>
@@ -286,6 +309,7 @@ function AppearanceSection() {
         </SettingRow>
         <TerminalMismatchHint />
       </SectionCard>
+      <HostTreeCard />
       <WindowCard />
     </>
   );

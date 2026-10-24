@@ -11,6 +11,10 @@
 //! - 平铺模式（UI-14，「未分组」改过名）：树里没有「未分组」行，滚动区域带 `data-drop-blank="none"`：
 //!   拖到树的空白处（不在任何一行上）= 移到顶层；拖到根层主机之间 = 移到顶层并插在那个位置。
 //!   树的根元素带 `data-order-locked="true"`（搜索框里有字）时不响应排序拖动，换分组照旧。
+//! - 主机页右边的卡片 / 列表（UI-16）：每张卡片 / 行带 `data-page-host`（主机 id）和 `data-page-group`
+//!   （所在分组），容器带 `data-page-layout`（grid 看左右半、list 看上下半）和 `data-page-order`：
+//!   `manual` 才能排序，`mode`（不是手动排序）/ `search`（搜索中）不响应。只能在同一分组的主机之间
+//!   调整，拖到别的分组的卡片上不响应；松手仍然走 `dropHostAt`（整层重新编号）。
 
 import { Folder, Server } from "lucide-react";
 import { create } from "zustand";
@@ -33,6 +37,8 @@ export interface InsertMark {
   kind: "host" | "group";
   id: number;
   after: boolean;
+  /** 画在主机页右边的卡片 / 行上（不是左边的树）；树里同一台主机的行不跟着画线。 */
+  scope?: "page";
 }
 
 interface DragState {
@@ -119,13 +125,15 @@ export async function dropGroupAt(group: Group, targetId: number, after: boolean
 interface Probe {
   over: DropGroup | undefined;
   insert: InsertMark | null;
+  /** 指针在右边的卡片上，但现在不是手动排序：松手时提示一次（不响应）。 */
+  blockedByMode?: boolean;
 }
 
 interface DragSpec {
   kind: "host" | "group";
   id: number;
   label: string;
-  probe: (target: Element | null, y: number) => Probe;
+  probe: (target: Element | null, y: number, x: number) => Probe;
   commit: (probe: Probe) => void;
 }
 
@@ -135,6 +143,26 @@ const isLocked = (el: Element) => el.closest('[data-order-locked="true"]') !== n
 function inLowerHalf(row: Element, y: number): boolean {
   const rect = row.getBoundingClientRect();
   return y >= rect.top + rect.height / 2;
+}
+
+/** 指针在这张卡片的右半部分吗（网格里卡片是左右并排的）。 */
+function inRightHalf(card: Element, x: number): boolean {
+  const rect = card.getBoundingClientRect();
+  return x >= rect.left + rect.width / 2;
+}
+
+let modeHintShown = false;
+
+/** 不是手动排序时想在右边拖动：提示一次（同一次页面内最多一次）。 */
+function showModeHint() {
+  if (modeHintShown) return;
+  modeHintShown = true;
+  toast.info("切换到「手动」排序后才能拖动");
+}
+
+/** 测试用：清掉「已经提示过」的记号。 */
+export function resetModeHintForTests() {
+  modeHintShown = false;
 }
 
 /** 按下鼠标后：拖过门槛才算拖，不然就是普通单击 / 双击。 */
@@ -149,9 +177,17 @@ function beginDrag(spec: DragSpec, event: React.PointerEvent) {
       active = true;
       document.body.classList.add("zz-host-dragging");
     }
-    probed = spec.probe(document.elementFromPoint(e.clientX, e.clientY), e.clientY);
+    probed = spec.probe(document.elementFromPoint(e.clientX, e.clientY), e.clientY, e.clientX);
     useHostDrag.setState({
-      drag: { kind: spec.kind, id: spec.id, label: spec.label, x: e.clientX, y: e.clientY, ...probed },
+      drag: {
+        kind: spec.kind,
+        id: spec.id,
+        label: spec.label,
+        x: e.clientX,
+        y: e.clientY,
+        over: probed.over,
+        insert: probed.insert,
+      },
     });
   };
   const finish = (commit: boolean) => {
@@ -188,7 +224,23 @@ export function startHostDrag(host: Host, event: React.PointerEvent) {
       kind: "host",
       id: host.id,
       label: host.name,
-      probe: (el, y) => {
+      probe: (el, y, x) => {
+        // 右边的卡片 / 行：只管同一分组内的排序，不是换分组的目标
+        const pageCard = el?.closest("[data-page-host]");
+        if (pageCard) {
+          const container = pageCard.closest("[data-page-order]");
+          const state = container?.getAttribute("data-page-order");
+          const targetId = Number(pageCard.getAttribute("data-page-host"));
+          if (!Number.isFinite(targetId) || targetId === host.id) return { over: undefined, insert: null };
+          if (state === "mode") return { over: undefined, insert: null, blockedByMode: true };
+          const sameGroup = pageCard.getAttribute("data-page-group") === String(host.group_id ?? "none");
+          if (state !== "manual" || !sameGroup) return { over: undefined, insert: null };
+          const after =
+            container?.getAttribute("data-page-layout") === "grid"
+              ? inRightHalf(pageCard, x)
+              : inLowerHalf(pageCard, y);
+          return { over: undefined, insert: { kind: "host", id: targetId, after, scope: "page" } };
+        }
         let over = parseTarget(el?.closest("[data-drop-group]")?.getAttribute("data-drop-group"));
         // 平铺模式：树的空白处（不在任何一行 / 按钮上）= 顶层
         if (over === undefined && el && !el.closest("button") && el.closest("[data-drop-blank]")) over = null;
@@ -199,9 +251,10 @@ export function startHostDrag(host: Host, event: React.PointerEvent) {
         }
         return { over, insert: { kind: "host", id: targetId, after: inLowerHalf(row, y) } };
       },
-      commit: ({ over, insert }) => {
+      commit: ({ over, insert, blockedByMode }) => {
         if (insert) void dropHostAt(host, insert.id, insert.after);
         else if (over !== undefined) void moveHostToGroup(host, over);
+        else if (blockedByMode) showModeHint();
       },
     },
     event,
@@ -249,24 +302,38 @@ export function useIsDropTarget(target: DropGroup): boolean {
 }
 
 /** 这一行前面 / 后面有没有插入线。 */
-export function useInsertMark(kind: "host" | "group", id: number): "before" | "after" | null {
+export function useInsertMark(
+  kind: "host" | "group",
+  id: number,
+  scope: "tree" | "page" = "tree",
+): "before" | "after" | null {
   return useHostDrag((state) => {
     const insert = state.drag?.insert;
-    if (!insert || insert.kind !== kind || insert.id !== id) return null;
+    if (!insert || insert.kind !== kind || insert.id !== id || (insert.scope ?? "tree") !== scope) return null;
     return insert.after ? "after" : "before";
   });
 }
 
 /** 一条细的插入线，画在带 `relative` 的行里面。 */
-export function InsertLine({ mark }: { mark: "before" | "after" | null }) {
+export function InsertLine({
+  mark,
+  vertical = false,
+}: {
+  mark: "before" | "after" | null;
+  /** 网格里卡片左右并排：画竖线（前面 = 左边缘、后面 = 右边缘）。 */
+  vertical?: boolean;
+}) {
   if (!mark) return null;
   return (
     <span
       data-section="drop-line"
       data-position={mark}
+      data-orientation={vertical ? "vertical" : undefined}
       className={cn(
-        "pointer-events-none absolute inset-x-1 z-10 h-0.5 rounded-full bg-primary",
-        mark === "before" ? "top-0" : "bottom-0",
+        "pointer-events-none absolute z-10 rounded-full bg-primary",
+        vertical
+          ? cn("inset-y-1 w-0.5", mark === "before" ? "left-0" : "right-0")
+          : cn("inset-x-1 h-0.5", mark === "before" ? "top-0" : "bottom-0"),
       )}
     />
   );

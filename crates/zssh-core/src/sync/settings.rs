@@ -97,6 +97,10 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("layout.vault_sidebar_collapsed", SyncMode::LocalOnly),
     // 主机页右边用卡片还是列表：本机的使用习惯
     ("layout.vault_view_mode", SyncMode::LocalOnly),
+    // 主机页卡片 / 列表的疏密（紧凑或舒适，UI-16）：本机的使用习惯
+    ("layout.vault_density", SyncMode::LocalOnly),
+    // 主机页右边按手动 / 最近打开 / 名称排序（UI-16）：本机的使用习惯
+    ("layout.vault_sort_mode", SyncMode::LocalOnly),
     // 主机页卡片按最近打开排：每台电脑用的不一样
     ("layout.recent_hosts", SyncMode::LocalOnly),
     ("layout.overview_width", SyncMode::LocalOnly),

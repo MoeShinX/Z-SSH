@@ -9,6 +9,7 @@ import {
   ArrowDownAZ,
   ArrowLeftRight,
   ArrowUp,
+  ArrowUpDown,
   Check,
   ChevronDown,
   ChevronRight,
@@ -26,6 +27,8 @@ import {
   Pencil,
   Play,
   Plus,
+  Rows2,
+  Rows3,
   Search,
   Server,
   Trash2,
@@ -46,13 +49,20 @@ import {
   parseExpanded,
   parseRecent,
   serializeExpanded,
-  sortByRecent,
   toggleExpanded,
   totalUnder,
   treeFilterFor,
   UNGROUPED_KEY,
   type TreeFilter,
 } from "../../state/hostTree";
+import {
+  nextSortMode,
+  pageHosts,
+  parseDensity,
+  parseSortMode,
+  SORT_LABELS,
+  type VaultDensity,
+} from "../../state/hostPage";
 import { ungroupedLabel, ungroupedMoveLabel, useUngroupedFlat } from "../../state/ungroupedFlat";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -163,6 +173,13 @@ export default function VaultView({
   const mode: ViewMode = useSettings((state) => state["layout.vault_view_mode"]) === "list" ? "list" : "grid";
   const updateSetting = useSettings((state) => state.update);
   const setMode = (next: ViewMode) => void updateSetting("layout.vault_view_mode", next);
+  // 卡片 / 列表的疏密（UI-16）：默认紧凑
+  const density = parseDensity(useSettings((state) => state["layout.vault_density"]));
+  // 排序方式（UI-16）：手动 = 和左边的树一个顺序（默认）/ 最近打开 / 名称
+  const sortMode = parseSortMode(useSettings((state) => state["layout.vault_sort_mode"]));
+  const cycleSortMode = () => void updateSetting("layout.vault_sort_mode", nextSortMode(sortMode));
+  const toggleDensity = () =>
+    void updateSetting("layout.vault_density", density === "compact" ? "comfortable" : "compact");
   const [installHost, setInstallHost] = useState<Host | null>(null);
 
   const groupName = useMemo(() => {
@@ -173,20 +190,12 @@ export default function VaultView({
 
 
   const recentRaw = useSettings((state) => state["layout.recent_hosts"]);
-  const filtered = useMemo(() => {
-    const text = query.trim().toLowerCase();
-    const matched = hosts.filter((host) => {
-        if (selectedGroup !== "all" && host.group_id !== selectedGroup) return false;
-        if (text === "") return true;
-        return (
-          host.name.toLowerCase().includes(text) ||
-          host.host.toLowerCase().includes(text) ||
-          host.username.toLowerCase().includes(text) ||
-          host.tags.some((tag) => tag.toLowerCase().includes(text))
-        );
-      });
-    return sortByRecent(matched, parseRecent(recentRaw));
-  }, [hosts, query, selectedGroup, recentRaw]);
+  const filtered = useMemo(
+    () => pageHosts(groups, hosts, { query, selectedGroup, mode: sortMode, recent: parseRecent(recentRaw) }),
+    [groups, hosts, query, selectedGroup, sortMode, recentRaw],
+  );
+  // 右边能不能拖动 / 上移下移：只有手动排序、没在搜索时可以（见 hostDrag.tsx 的 data-page-order）
+  const orderState: PageOrderState = sortMode !== "manual" ? "mode" : query.trim() !== "" ? "search" : "manual";
 
   const handleSearchKey = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Enter") return;
@@ -289,6 +298,34 @@ export default function VaultView({
                 <List size={15} />
               </button>
             </div>
+            <div className="mr-1 flex items-center rounded-md border border-border/60 p-0.5">
+              <button
+                onClick={toggleDensity}
+                title={density === "compact" ? "紧凑（点击切换到舒适）" : "舒适（点击切换到紧凑）"}
+                aria-label="紧凑 / 舒适"
+                aria-pressed={density === "compact"}
+                data-action="toggle-density"
+                className={cn(
+                  "cursor-pointer rounded p-1.5 transition-colors",
+                  density === "compact"
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {density === "compact" ? <Rows3 size={15} /> : <Rows2 size={15} />}
+              </button>
+            </div>
+            <button
+              onClick={cycleSortMode}
+              title={`排序方式：${SORT_LABELS[sortMode]}（点击切换：手动 / 最近打开 / 名称）`}
+              aria-label="排序方式"
+              data-action="cycle-sort"
+              data-sort-mode={sortMode}
+              className="mr-1 flex h-8 cursor-pointer items-center gap-1 rounded-md border border-border/60 px-2 text-[13px] text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ArrowUpDown size={14} />
+              {SORT_LABELS[sortMode]}
+            </button>
             <Button variant="outline" size="sm" className="h-8 px-2.5 text-[13px]" onClick={onOpenIdentities}>
               <KeyRound size={13} /> 凭据
             </Button>
@@ -309,10 +346,22 @@ export default function VaultView({
               onNewHost={() => onNewHost(selectedGroup === "all" ? null : selectedGroup)}
             />
           ) : mode === "grid" ? (
-            <div data-view="grid" className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
+            <div
+              data-view="grid"
+              data-page-layout="grid"
+              data-page-order={orderState}
+              data-density={density}
+              className={
+                density === "compact"
+                  ? "grid grid-cols-[repeat(auto-fill,minmax(210px,1fr))] gap-2.5"
+                  : "grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3"
+              }
+            >
               {filtered.map((host) => (
                 <HostCard
                   key={host.id}
+                  density={density}
+                  order={orderState}
                   host={host}
                   groupName={host.group_id === null ? null : groupName.get(host.group_id) ?? null}
                   onConnect={() => onOpenHost(host)}
@@ -330,10 +379,18 @@ export default function VaultView({
               ))}
             </div>
           ) : (
-            <div data-view="list" className="overflow-hidden rounded-lg border border-border/60">
+            <div
+              data-view="list"
+              data-page-layout="list"
+              data-page-order={orderState}
+              data-density={density}
+              className="overflow-hidden rounded-lg border border-border/60"
+            >
               {filtered.map((host, index) => (
                 <HostRow
                   key={host.id}
+                  density={density}
+                  order={orderState}
                   host={host}
                   groupName={host.group_id === null ? null : groupName.get(host.group_id) ?? null}
                   last={index === filtered.length - 1}
@@ -431,6 +488,9 @@ export function HostTreeAside({
     () => (filter ? filteredHostOrder(groups, hosts, filter) : []),
     [groups, hosts, filter],
   );
+  // 根分组和顶层（不分组）的主机：平铺模式下两者之间画分隔线
+  const rootGroups = useMemo(() => groupsUnder(groups, null, filter), [groups, filter]);
+  const rootHosts = useMemo(() => hostsUnder(hosts, null, filter), [hosts, filter]);
   // 高亮的那台必须还在结果里（主机被删、搜索词变了都算没有）
   const activeHostId = order.some((host) => host.id === activeId) ? activeId : null;
   useEffect(() => {
@@ -545,7 +605,7 @@ export function HostTreeAside({
               active={selectedGroup === "all"}
               onClick={() => onSelectGroup("all")}
             />
-            {groupsUnder(groups, null, filter)
+            {rootGroups
               .map((group) => (
                 <GroupBranch
                   key={group.id}
@@ -608,9 +668,17 @@ export function HostTreeAside({
                   searchActive={activeHostId === host.id}
                 />
               ))}
-            {/* 平铺模式：不分组的主机直接排在所有根分组下面，和根分组同一缩进，没有连接线 */}
+            {/* 平铺模式：不分组的主机直接排在所有根分组下面，和根分组同一缩进，没有连接线；
+                根分组和顶层主机之间画一条细线隔开（两边都有内容才画） */}
+            {flat && rootGroups.length > 0 && rootHosts.length > 0 && (
+              <div
+                role="separator"
+                data-section="tree-flat-divider"
+                className="mx-1.5 my-1 border-t border-border/60"
+              />
+            )}
             {flat &&
-              hostsUnder(hosts, null, filter).map((host) => (
+              rootHosts.map((host) => (
                 <HostLeaf
                   key={host.id}
                   host={host}
@@ -1059,7 +1127,15 @@ function hostKeyDown(event: React.KeyboardEvent, onConnect: () => void, onEdit: 
 }
 
 /** 卡片 / 行上的编辑（铅笔）按钮：点它打开详情，点击和双击都不冒泡成卡片的单击 / 双击。 */
-function EditButton({ onEdit, className }: { onEdit: () => void; className?: string }) {
+function EditButton({
+  onEdit,
+  className,
+  iconSize = 13,
+}: {
+  onEdit: () => void;
+  className?: string;
+  iconSize?: number;
+}) {
   return (
     <Button
       size="icon-sm"
@@ -1075,13 +1151,27 @@ function EditButton({ onEdit, className }: { onEdit: () => void; className?: str
       }}
       onDoubleClick={(event) => event.stopPropagation()}
     >
-      <Pencil size={13} />
+      <Pencil size={iconSize} />
     </Button>
   );
 }
 
+/** 紧凑时「编辑」「连接」小一档的按钮：24px 见方，点击区不再小。 */
+const COMPACT_ICON_BUTTON = "h-6 w-6";
+
+/** 右边卡片 / 列表现在能不能调整顺序：手动排序且没在搜索才行。 */
+export type PageOrderState = "manual" | "mode" | "search";
+
+const ORDER_HINTS: Record<PageOrderState, string | undefined> = {
+  manual: undefined,
+  mode: "切到手动排序才能调整",
+  search: "清空搜索后才能调整",
+};
+
 /** 主机卡片（网格视图）。单击选中，双击连接，右键出菜单，悬停显示「编辑」和「连接」。 */
 function HostCard({
+  density,
+  order,
   host,
   groupName,
   selected,
@@ -1096,6 +1186,9 @@ function HostCard({
   onInstallKey,
   onForwards,
 }: {
+  density: VaultDensity;
+  /** 现在能不能在右边调整顺序（拖动 / 右键上移下移）。 */
+  order: PageOrderState;
   host: Host;
   groupName: string | null;
   selected: boolean;
@@ -1110,12 +1203,58 @@ function HostCard({
   onInstallKey: () => void;
   onForwards: () => void;
 }) {
+  const compact = density === "compact";
+  const insertMark = useInsertMark("host", host.id, "page");
+  // 紧凑：没有标签 / 分组徽标时不占单独一行，按钮直接放在名字那一行右边
+  const hasBadges = groupName !== null || host.tags.length > 0 || Boolean(host.legacy_algorithms);
+  const buttons = (
+    <div className={cn("flex shrink-0 items-center", compact ? "gap-1.5" : "gap-2")}>
+      <EditButton
+        onEdit={onEdit}
+        className={compact ? COMPACT_ICON_BUTTON : undefined}
+        iconSize={compact ? 12 : 13}
+      />
+      <Button
+        size="icon-sm"
+        variant="secondary"
+        title="连接"
+        className={compact ? COMPACT_ICON_BUTTON : undefined}
+        onClick={(event) => {
+          event.stopPropagation();
+          onConnect();
+        }}
+      >
+        <Play size={compact ? 12 : 13} />
+      </Button>
+    </div>
+  );
+  const badges = (
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+      {groupName && (
+        <Badge variant="secondary" className={compact ? "px-2 py-0 text-[11px]" : undefined}>
+          {groupName}
+        </Badge>
+      )}
+      {host.tags.map((tag) => (
+        <Badge key={tag} variant="outline" className={compact ? "px-2 py-0 text-[11px]" : undefined}>
+          {tag}
+        </Badge>
+      ))}
+      {host.legacy_algorithms && (
+        <Badge variant="outline" className={compact ? "px-2 py-0 text-[11px]" : undefined}>
+          旧算法
+        </Badge>
+      )}
+    </div>
+  );
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
           data-section="host-card"
           data-host-id={host.id}
+          data-page-host={host.id}
+          data-page-group={host.group_id ?? "none"}
           data-selected={selected ? "true" : undefined}
           tabIndex={0}
           onPointerDown={(event) => startHostDrag(host, event)}
@@ -1123,46 +1262,30 @@ function HostCard({
           onDoubleClick={onConnect}
           onKeyDown={(event) => hostKeyDown(event, onConnect, onEdit)}
           className={cn(
-            "group flex cursor-pointer flex-col rounded-lg border bg-card p-4 shadow-sm outline-none transition-colors hover:border-ring/60 hover:bg-accent/30 focus-visible:ring-1 focus-visible:ring-ring/60",
+            "group relative flex cursor-pointer flex-col rounded-lg border bg-card shadow-sm outline-none transition-colors hover:border-ring/60 hover:bg-accent/30 focus-visible:ring-1 focus-visible:ring-ring/60",
+            compact ? "p-2.5" : "p-4",
             selected ? "border-ring/70 bg-accent/40" : "border-border/60",
           )}
         >
-          <div className="flex items-start gap-3">
-            <OsIcon hostId={host.id} size="card" />
+          <InsertLine mark={insertMark} vertical />
+          <div className={compact ? "flex items-center gap-2.5" : "flex items-start gap-3"}>
+            <OsIcon hostId={host.id} size={compact ? "cardCompact" : "card"} />
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium">{host.name}</div>
               <div className="truncate font-mono text-xs text-muted-foreground">
                 {host.username}@{host.host}:{host.port}
               </div>
             </div>
+            {compact && !hasBadges && buttons}
           </div>
           {/* 底行贴着卡片底部（mt-auto）：左边标签，右下角常驻「编辑」「连接」。放这里不挤名字，
-              同一排卡片高度不一样时按钮也对齐 */}
-          <div className="mt-auto flex items-end gap-2 pt-3">
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
-              {groupName && <Badge variant="secondary">{groupName}</Badge>}
-              {host.tags.map((tag) => (
-                <Badge key={tag} variant="outline">
-                  {tag}
-                </Badge>
-              ))}
-              {host.legacy_algorithms && <Badge variant="outline">旧算法</Badge>}
+              同一排卡片高度不一样时按钮也对齐。紧凑且没有标签时这一行不存在，按钮在名字那一行 */}
+          {(!compact || hasBadges) && (
+            <div className={cn("mt-auto flex items-end gap-2", compact ? "pt-2" : "pt-3")}>
+              {badges}
+              {buttons}
             </div>
-            <div className="flex shrink-0 items-center gap-2">
-              <EditButton onEdit={onEdit} />
-              <Button
-                size="icon-sm"
-                variant="secondary"
-                title="连接"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onConnect();
-                }}
-              >
-                <Play size={13} />
-              </Button>
-            </div>
-          </div>
+          )}
         </div>
       </ContextMenuTrigger>
       <HostMenu
@@ -1176,6 +1299,8 @@ function HostCard({
         onCopyInfo={onCopyInfo}
         onInstallKey={onInstallKey}
         onForwards={onForwards}
+        orderLocked={order !== "manual"}
+        orderHint={ORDER_HINTS[order]}
       />
     </ContextMenu>
   );
@@ -1183,6 +1308,8 @@ function HostCard({
 
 /** 主机行（列表视图）。单击选中，双击连接；右侧常显「编辑」「连接」。 */
 function HostRow({
+  density,
+  order,
   host,
   groupName,
   last,
@@ -1198,6 +1325,9 @@ function HostRow({
   onInstallKey,
   onForwards,
 }: {
+  density: VaultDensity;
+  /** 现在能不能在右边调整顺序（拖动 / 右键上移下移）。 */
+  order: PageOrderState;
   host: Host;
   groupName: string | null;
   last: boolean;
@@ -1214,12 +1344,16 @@ function HostRow({
   onForwards: () => void;
 }) {
   const flat = useUngroupedFlat();
+  const compact = density === "compact";
+  const insertMark = useInsertMark("host", host.id, "page");
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
           data-section="host-row"
           data-host-id={host.id}
+          data-page-host={host.id}
+          data-page-group={host.group_id ?? "none"}
           data-selected={selected ? "true" : undefined}
           tabIndex={0}
           onPointerDown={(event) => startHostDrag(host, event)}
@@ -1227,27 +1361,34 @@ function HostRow({
           onDoubleClick={onConnect}
           onKeyDown={(event) => hostKeyDown(event, onConnect, onEdit)}
           className={cn(
-            "group grid cursor-pointer grid-cols-[minmax(0,1.4fr)_minmax(0,1.6fr)_minmax(0,0.8fr)_auto] items-center gap-3 px-4 py-2.5 text-sm outline-none transition-colors hover:bg-accent/30 focus-visible:bg-accent/30",
+            "group relative grid cursor-pointer grid-cols-[minmax(0,1.4fr)_minmax(0,1.6fr)_minmax(0,0.8fr)_auto] items-center gap-3 px-4 text-sm outline-none transition-colors hover:bg-accent/30 focus-visible:bg-accent/30",
+            compact ? "py-1" : "py-2.5",
             selected && "bg-accent/60",
             !last && "border-b border-border/40",
           )}
         >
+          <InsertLine mark={insertMark} />
           <span className="truncate font-medium">{host.name}</span>
           <span className="truncate font-mono text-xs text-muted-foreground">
             {host.username}@{host.host}:{host.port}
           </span>
           <span className="truncate text-xs text-muted-foreground">{groupName ?? ungroupedLabel(flat)}</span>
-          <div className="flex shrink-0 items-center gap-2">
-            <EditButton onEdit={onEdit} />
+          <div className={cn("flex shrink-0 items-center", compact ? "gap-1.5" : "gap-2")}>
+            <EditButton
+              onEdit={onEdit}
+              className={compact ? COMPACT_ICON_BUTTON : undefined}
+              iconSize={compact ? 12 : 13}
+            />
             <Button
               size="sm"
               variant="secondary"
+              className={compact ? "h-6 px-2 text-xs" : undefined}
               onClick={(event) => {
                 event.stopPropagation();
                 onConnect();
               }}
             >
-              <Play size={13} /> 连接
+              <Play size={compact ? 12 : 13} /> 连接
             </Button>
           </div>
         </div>
@@ -1263,6 +1404,8 @@ function HostRow({
         onCopyInfo={onCopyInfo}
         onInstallKey={onInstallKey}
         onForwards={onForwards}
+        orderLocked={order !== "manual"}
+        orderHint={ORDER_HINTS[order]}
       />
     </ContextMenu>
   );
@@ -1315,18 +1458,21 @@ function MoveToGroupMenu({ host }: { host: Host }) {
 }
 
 /** 右键「上移 / 下移」（树里的主机）：第一个的上移、最后一个的下移置灰；搜索时过滤后的列表不连续，全部置灰。 */
-function HostOrderItems({ host, locked }: { host: Host; locked: boolean }) {
+function HostOrderItems({ host, locked, hint }: { host: Host; locked: boolean; hint?: string }) {
   const hosts = useVault((state) => state.hosts);
   const flat = useUngroupedFlat();
   const [canUp, canDown] = canStepHost(hosts, host);
   return (
     <>
-      <ContextMenuItem disabled={locked || !canUp} data-order-action="up" onSelect={() => void stepHost(host, -1)}>
-        <ArrowUp className="mr-2 h-3.5 w-3.5" /> 上移
-      </ContextMenuItem>
-      <ContextMenuItem disabled={locked || !canDown} data-order-action="down" onSelect={() => void stepHost(host, 1)}>
-        <ArrowDown className="mr-2 h-3.5 w-3.5" /> 下移
-      </ContextMenuItem>
+      {/* 置灰的菜单项收不到鼠标事件，悬停提示挂在外面这一层 */}
+      <div title={locked ? hint : undefined} data-section="order-items">
+        <ContextMenuItem disabled={locked || !canUp} data-order-action="up" onSelect={() => void stepHost(host, -1)}>
+          <ArrowUp className="mr-2 h-3.5 w-3.5" /> 上移
+        </ContextMenuItem>
+        <ContextMenuItem disabled={locked || !canDown} data-order-action="down" onSelect={() => void stepHost(host, 1)}>
+          <ArrowDown className="mr-2 h-3.5 w-3.5" /> 下移
+        </ContextMenuItem>
+      </div>
       {/* 平铺模式：根层主机的「按名字重新排序」原来挂在「未分组」行上，现在挂在它们自己的右键菜单里 */}
       {flat && host.group_id === null && (
         <ContextMenuItem data-order-action="reset" onSelect={() => void resetLayerOrder(null)}>
@@ -1368,6 +1514,7 @@ function HostMenu({
   onInstallKey,
   onForwards,
   orderLocked,
+  orderHint,
 }: {
   host: Host;
   onConnect: () => void;
@@ -1381,6 +1528,8 @@ function HostMenu({
   onForwards?: () => void;
   /** 给了就在菜单里显示「上移 / 下移」（树里的主机行）；值 = 当前是不是在搜索（搜索时置灰）。 */
   orderLocked?: boolean;
+  /** 置灰时的悬停提示（主机页右边：切到手动排序 / 清空搜索）。 */
+  orderHint?: string;
 }) {
   const identities = useVault((state) => state.identities);
   return (
@@ -1419,7 +1568,7 @@ function HostMenu({
         </ContextMenuItem>
       )}
       <MoveToGroupMenu host={host} />
-      {orderLocked !== undefined && <HostOrderItems host={host} locked={orderLocked} />}
+      {orderLocked !== undefined && <HostOrderItems host={host} locked={orderLocked} hint={orderHint} />}
       <ContextMenuSeparator />
       <ContextMenuItem destructive onSelect={onDelete}>
         <Trash2 className="mr-2 h-3.5 w-3.5" /> 删除

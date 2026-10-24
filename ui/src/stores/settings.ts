@@ -105,6 +105,10 @@ export const SETTING_DEFAULTS = {
   "layout.vault_sidebar_collapsed": false,
   // 主机页右边的显示方式：grid 卡片 / list 列表（本机布局、不同步）
   "layout.vault_view_mode": "grid",
+  // 主机页卡片 / 列表的疏密（UI-16）：compact 紧凑（默认）/ comfortable 舒适（原来的样子）；本机布局、不同步
+  "layout.vault_density": "compact",
+  // 主机页右边的排序方式（UI-16）：manual 手动（和左边的树一个顺序，默认）/ recent 最近打开 / name 名称；本机布局、不同步
+  "layout.vault_sort_mode": "manual",
   // 最近打开的主机（id，逗号分隔，最近的在前），主机页卡片按它排；本机布局、不同步
   "layout.recent_hosts": "",
   // 服务器概览面板的宽度（拖左边缘调），本机布局、不同步
@@ -176,6 +180,8 @@ export interface SettingValues {
   "layout.vault_expanded": string;
   "layout.vault_sidebar_collapsed": boolean;
   "layout.vault_view_mode": string;
+  "layout.vault_density": string;
+  "layout.vault_sort_mode": string;
   "layout.recent_hosts": string;
   "layout.overview_width": number;
   quick_commands: string;
@@ -240,6 +246,15 @@ async function readSetting<K extends SettingKey>(
   }
 }
 
+/** 库里存没存过这一项（值读不读得懂不管）：存过 true、没存过 false、读库出错 null。 */
+async function isStored(key: SettingKey): Promise<boolean | null> {
+  try {
+    return (await settingsGet(key)) !== null;
+  } catch {
+    return null;
+  }
+}
+
 /** 写进后端。失败就抛出去，由调用方回滚界面上的值。 */
 async function writeSetting(key: SettingKey, value: unknown): Promise<void> {
   await settingsSet(key, JSON.stringify(value));
@@ -259,6 +274,11 @@ const writesInFlight = new Map<string, number>();
 
 interface SettingsState extends SettingValues {
   loaded: boolean;
+  /**
+   * 库里有没有存过 `vault_ungrouped_flat`（UI-16：只有「没存过」的新用户才按空库默认平铺）。
+   * true = 存过；false = 没存过；null = 读库出错、不知道（这时什么都不决定）。不存库。
+   */
+  ungroupedFlatStored: boolean | null;
   /** 系统现在是不是深色模式（主题选"系统"时用；不存库）。 */
   systemDark: boolean;
   load: () => Promise<void>;
@@ -284,12 +304,14 @@ const systemDarkQuery =
 export const useSettings = create<SettingsState>((set, get) => ({
   ...SETTING_DEFAULTS,
   loaded: false,
+  ungroupedFlatStored: null,
   systemDark: systemDarkQuery?.matches ?? true,
 
   load: async () => {
-    const pairs = await Promise.all(
-      KEYS.map(async (key) => [key, await readSetting(key)] as const),
-    );
+    const [pairs, flatStored] = await Promise.all([
+      Promise.all(KEYS.map(async (key) => [key, await readSetting(key)] as const)),
+      isStored("vault_ungrouped_flat"),
+    ]);
     const values: SettingValues = { ...SETTING_DEFAULTS };
     for (const [key, value] of pairs) {
       if (value !== null) {
@@ -309,7 +331,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
     values.close_action = parseCloseAction(values.close_action);
     values.file_window_close = parseFileWindowCloseAction(values.file_window_close);
     confirmed = { ...values };
-    set({ ...values, loaded: true });
+    set({ ...values, loaded: true, ungroupedFlatStored: flatStored });
     applyAppearance(get());
     // 旧版本自带的两条示例规则一点没改过：换成现在的整组常用规则（写回库里）
     const upgraded = upgradeLegacySamples(values.terminal_highlight_rules);
