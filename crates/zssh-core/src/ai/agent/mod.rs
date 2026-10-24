@@ -123,6 +123,11 @@ pub trait AgentConversation: Send + Sync {
         Some(self.session_id().to_string())
     }
 
+    /// 驱动动态生成的密钥也要从历史文本中抹掉，包括已经撤销的 session 密钥。
+    fn history_secrets(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// 查可用模型。
     fn models<'a>(&'a self) -> BoxFuture<'a, Result<AgentModelCatalog, AgentError>>;
 

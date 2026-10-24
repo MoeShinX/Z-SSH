@@ -494,15 +494,17 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 pub struct Scope {
     pub(crate) id: String,
     capability: String,
-    targets: Mutex<BTreeMap<String, TargetSummary>>,
-    destroyed: AtomicBool,
+    targets: Arc<Mutex<BTreeMap<String, TargetSummary>>>,
+    destroyed: Arc<AtomicBool>,
+    /// 单个智能体 session 的授权可以独立撤销，目标列表和整个对话的生命周期仍共用。
+    revoked: AtomicBool,
     /// 停止按钮按了几次。请求开始时记下它，之后变了就说明用户叫停了这个回合（R-9 F12）。
-    stop_epoch: AtomicU64,
+    stop_epoch: Arc<AtomicU64>,
     /// 每个目标被移出过几次。请求开始时记下它，审批之后变了（哪怕又被加回来）就不能再按
     /// 旧的批准去执行（R-9 F11）。
-    removals: Mutex<HashMap<String, u64>>,
+    removals: Arc<Mutex<HashMap<String, u64>>>,
     /// 销毁、停止、移出目标都通知它：等审批 / 等执行的请求据此提前结束。
-    notify: Notify,
+    notify: Arc<Notify>,
 }
 
 /// 一条请求开始时的作用范围状态，用来判断它后来有没有失效（停止、目标移出、作用范围销毁）。
@@ -691,7 +693,7 @@ impl Scope {
     }
 
     fn is_destroyed(&self) -> bool {
-        self.destroyed.load(Ordering::SeqCst)
+        self.destroyed.load(Ordering::SeqCst) || self.revoked.load(Ordering::SeqCst)
     }
 
     fn destroy(&self) {
@@ -710,7 +712,51 @@ pub struct ScopeHandle {
     scope: Arc<Scope>,
 }
 
+/// 一个智能体 session 使用的独立密钥。撤销后旧模型发起的新请求和已取得 scope 的在途请求
+/// 都失效；新 session 使用新密钥，仍看到同一套主机和 scope id。
+pub struct ScopeCapability {
+    registry: Arc<Registry>,
+    scope: Arc<Scope>,
+}
+
+impl ScopeCapability {
+    pub fn value(&self) -> &str {
+        &self.scope.capability
+    }
+
+    pub fn revoke(&self) {
+        if !self.scope.revoked.swap(true, Ordering::SeqCst) {
+            self.scope.stop();
+            self.registry.remove(&self.scope.capability);
+        }
+    }
+}
+
+impl Drop for ScopeCapability {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
 impl ScopeHandle {
+    pub fn agent_capability(&self) -> Arc<ScopeCapability> {
+        let scope = Arc::new(Scope {
+            id: self.scope.id.clone(),
+            capability: random_hex(CAPABILITY_BYTES),
+            targets: Arc::clone(&self.scope.targets),
+            destroyed: Arc::clone(&self.scope.destroyed),
+            revoked: AtomicBool::new(false),
+            stop_epoch: Arc::clone(&self.scope.stop_epoch),
+            removals: Arc::clone(&self.scope.removals),
+            notify: Arc::clone(&self.scope.notify),
+        });
+        self.registry.register(Arc::clone(&scope));
+        Arc::new(ScopeCapability {
+            registry: Arc::clone(&self.registry),
+            scope,
+        })
+    }
+
     pub fn scope_id(&self) -> &str {
         &self.scope.id
     }
@@ -872,11 +918,12 @@ impl Bridge {
         let scope = Arc::new(Scope {
             id: random_hex(8),
             capability: random_hex(CAPABILITY_BYTES),
-            targets: Mutex::new(BTreeMap::new()),
-            destroyed: AtomicBool::new(false),
-            stop_epoch: AtomicU64::new(0),
-            removals: Mutex::new(HashMap::new()),
-            notify: Notify::new(),
+            targets: Arc::new(Mutex::new(BTreeMap::new())),
+            destroyed: Arc::new(AtomicBool::new(false)),
+            revoked: AtomicBool::new(false),
+            stop_epoch: Arc::new(AtomicU64::new(0)),
+            removals: Arc::new(Mutex::new(HashMap::new())),
+            notify: Arc::new(Notify::new()),
         });
         self.registry.register(Arc::clone(&scope));
         ScopeHandle {
@@ -2054,6 +2101,126 @@ mod tests {
         assert_eq!(sessions[0]["id"], "s1");
         assert_eq!(sessions[0]["current"], true);
         assert_eq!(sessions[0]["pinned"], false);
+    }
+
+    #[tokio::test]
+    async fn retired_opencode_tools_are_denied_and_recovery_gets_a_fresh_capability() {
+        use crate::ai::agent::AgentConversation;
+        let h = harness(ExecMode::Auto, ApproverBehavior::Allow, short_wait()).await;
+        let scope = h.bridge.create_scope();
+        scope.add_target("s1", "web-1", "root", "connected", true, false);
+        let (conversation, old_key) =
+            crate::ai::agent::opencode::tests::retired_tool_scope_fixture(scope.clone()).await;
+        let mut old_client =
+            Client::authenticated(h.port, h.bridge.connection_token(), &old_key).await;
+        let response = old_client
+            .request(
+                1,
+                METHOD_RUN_COMMAND,
+                json!({"target_id":"s1", "command":"echo old-turn"}),
+            )
+            .await;
+        assert!(error_of(&response).contains("能力密钥无效"));
+        assert!(h.host.last_exec().is_none());
+
+        conversation.send("继续", None).await.unwrap();
+        let secrets = conversation.history_secrets();
+        let new_key = secrets.last().unwrap();
+        assert_ne!(new_key, &old_key);
+        assert_ne!(new_key, scope.capability(), "根密钥不能交给模型");
+        assert!(secrets.contains(&old_key), "撤销的密钥仍须从历史中抹掉");
+        let mut fresh = Client::authenticated(h.port, h.bridge.connection_token(), new_key).await;
+        let response = fresh
+            .request(
+                2,
+                METHOD_RUN_COMMAND,
+                json!({"target_id":"s1", "command":"echo new-turn"}),
+            )
+            .await;
+        assert_eq!(result_of(&response)["exit_code"], 0);
+        assert_eq!(h.host.last_exec().unwrap().1, "echo new-turn");
+
+        let response = old_client
+            .request(
+                3,
+                METHOD_RUN_COMMAND,
+                json!({"target_id":"s1", "command":"echo late-old-turn"}),
+            )
+            .await;
+        assert!(error_of(&response).contains("能力密钥无效"));
+        assert_eq!(h.host.last_exec().unwrap().1, "echo new-turn");
+    }
+
+    #[test]
+    fn session_capability_revocation_invalidates_acquired_scopes_and_pending_tickets() {
+        let bridge = manual_bridge(
+            Arc::new(MockApprover::new(ApproverBehavior::Allow)),
+            Arc::new(MockHost::new()),
+        );
+        let root = bridge.create_scope();
+        root.add_target("s1", "web-1", "root", "connected", true, false);
+        let old = root.agent_capability();
+        let acquired = bridge.registry.lookup(old.value()).unwrap();
+        let ticket = acquired.ticket("s1");
+        let gate = ExecGate::new(&acquired, &ticket);
+        assert!(gate.check().is_ok());
+        old.revoke();
+        assert!(gate.check().is_err(), "查表后、执行前才撤销也必须拦住");
+        assert!(bridge.registry.lookup(old.value()).is_none());
+        let fresh = root.agent_capability();
+        let active = bridge.registry.lookup(fresh.value()).unwrap();
+        let gate = ExecGate::new(&active, &active.ticket("s1"));
+        old.revoke();
+        assert!(gate.check().is_ok(), "重复撤销旧密钥不能误伤新会话");
+        root.remove_target("s1");
+        assert!(
+            gate.check().is_err(),
+            "界面的目标变更必须同步到 session 授权"
+        );
+        root.add_target("s1", "web-1", "root", "connected", true, false);
+        let gate = ExecGate::new(&active, &active.ticket("s1"));
+        bridge.stop_scope(root.scope_id());
+        assert!(gate.check().is_err(), "手动停止也必须作用于子授权");
+        root.destroy();
+        assert!(active.is_destroyed(), "关对话后所有子授权必须失效");
+    }
+
+    #[tokio::test]
+    async fn revoking_session_capability_ends_its_pending_approval() {
+        let h = harness(
+            ExecMode::Manual,
+            ApproverBehavior::Never,
+            Duration::from_secs(30),
+        )
+        .await;
+        let root = h.bridge.create_scope();
+        root.add_target("s1", "web-1", "root", "connected", true, false);
+        let grant = root.agent_capability();
+        let mut client =
+            Client::authenticated(h.port, h.bridge.connection_token(), grant.value()).await;
+        let pending = tokio::spawn(async move {
+            client
+                .request(
+                    1,
+                    METHOD_RUN_COMMAND,
+                    json!({"target_id":"s1", "command":"ls"}),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while h.approver.calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        grant.revoke();
+        let response = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(error_of(&response).contains("拒绝"));
+        assert!(h.host.last_exec().is_none());
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ use super::discovery::{self, AgentInstall};
 use super::retry::{retry_limit_message, retry_limit_reached, RETRY_STOP_GRACE};
 use super::translate::{translate_event, TranslateState};
 use super::{AgentConversation, AgentError, AgentEvent, AgentModel, AgentModelCatalog};
+use crate::ai::bridge::{ScopeCapability, ScopeHandle};
 
 /// 默认启动超时：Windows 上冷启动要几十秒（实测 3~8 秒，留足余量）。
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -113,6 +114,9 @@ struct Conversation {
 }
 
 struct ConvInner {
+    tool_scope: Option<ScopeHandle>,
+    tool_capability: Option<Arc<ScopeCapability>>,
+    history_secrets: Vec<String>,
     session_id: String,
     /// 自动停止过的 session 永不复用：abort 和 SSE 都没有回合 id，迟到时无法分辨归属。
     retired: bool,
@@ -342,6 +346,9 @@ impl AgentRuntime {
         let entry = Arc::new(Conversation {
             events,
             inner: Mutex::new(ConvInner {
+                tool_scope: None,
+                tool_capability: None,
+                history_secrets: Vec::new(),
                 session_id: session_id.clone(),
                 retired: false,
                 detached: false,
@@ -409,6 +416,20 @@ pub struct OpenCodeConversation {
 }
 
 impl OpenCodeConversation {
+    /// 在第一次发送之前绑定工具授权。对话 id / 主机列表保持稳定，模型只得到可独立撤销的
+    /// session 密钥，永远不把能重新签发授权的根密钥交给它。
+    pub fn bind_tool_scope(&self, scope: ScopeHandle) -> Result<(), AgentError> {
+        let mut inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.turn_seq != 0 || inner.detached || self.entry.busy.load(Ordering::SeqCst) {
+            return Err(AgentError::Other("工具授权必须在对话开始前绑定".into()));
+        }
+        let capability = scope.agent_capability();
+        inner.history_secrets.push(capability.value().to_owned());
+        inner.tool_capability = Some(capability);
+        inner.tool_scope = Some(scope);
+        Ok(())
+    }
+
     /// 进程号（诊断用，取的是共用进程的）。
     pub fn pid(&self) -> Option<u32> {
         self.runtime.pid()
@@ -425,11 +446,13 @@ impl OpenCodeConversation {
     }
 
     fn detach(&self) {
-        self.entry
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .detached = true;
+        {
+            let mut inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner.detached = true;
+            if let Some(capability) = inner.tool_capability.take() {
+                capability.revoke();
+            }
+        }
         if let Ok(mut map) = self.runtime.shared.conversations.lock() {
             map.retain(|_, entry| !Arc::ptr_eq(entry, &self.entry));
         }
@@ -477,7 +500,6 @@ impl OpenCodeConversation {
         // 系统提示里带上能力密钥：模型每次调 zssh 工具都要把它作为 capability 参数。
         let mut body = json!({
             "parts": [{ "type": "text", "text": text }],
-            "system": system_prompt(&self.capability),
         });
         if let Some(model_ref) = model {
             let parsed = {
@@ -523,6 +545,11 @@ impl OpenCodeConversation {
             inner.session_id = session_id.clone();
             inner.translate = TranslateState::default();
             inner.retired = false;
+            if let Some(scope) = &inner.tool_scope {
+                let capability = scope.agent_capability();
+                inner.history_secrets.push(capability.value().to_owned());
+                inner.tool_capability = Some(capability);
+            }
             map.insert(session_id, Arc::clone(&self.entry));
             // 历史消息还在界面上，但新 session 没有旧上下文，沿用现有提示说明这一点。
             self.entry.emit(AgentEvent::ResumeFailed);
@@ -534,6 +561,19 @@ impl OpenCodeConversation {
             .unwrap_or_else(|p| p.into_inner())
             .session_id
             .clone();
+        {
+            let inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let capability = match (&inner.tool_scope, &inner.tool_capability) {
+                (_, Some(capability)) => capability.value(),
+                (None, None) => &self.capability,
+                (Some(_), None) => {
+                    return Err(AgentError::Other(
+                        "旧会话的工具授权已撤销，请重新发送".into(),
+                    ))
+                }
+            };
+            body["system"] = json!(system_prompt(capability));
+        }
 
         let url = format!(
             "{}/session/{}/prompt_async",
@@ -569,6 +609,15 @@ impl AgentConversation for OpenCodeConversation {
     fn resume_id(&self) -> Option<String> {
         let inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
         (!inner.retired).then(|| inner.session_id.clone())
+    }
+
+    fn history_secrets(&self) -> Vec<String> {
+        self.entry
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .history_secrets
+            .clone()
     }
 
     fn models<'a>(&'a self) -> crate::ssh::BoxFuture<'a, Result<AgentModelCatalog, AgentError>> {
@@ -1346,6 +1395,9 @@ fn handle_event(shared: &Shared, event: &Value) {
                     emit = false;
                     inner.turn.aborted = true;
                     inner.turn.retry_stop = Some(retry_limit_message(reason));
+                    if let Some(capability) = inner.tool_capability.take() {
+                        capability.revoke();
+                    }
                     retry_stop_now = true;
                 }
             }
@@ -1373,6 +1425,9 @@ fn end_turn(conv: &Conversation, inner: &mut ConvInner) -> bool {
     let flags = std::mem::take(&mut inner.turn);
     if let Some(message) = flags.retry_stop {
         inner.retired = true;
+        if let Some(capability) = inner.tool_capability.take() {
+            capability.revoke();
+        }
         conv.emit(AgentEvent::Error { message });
     } else if !flags.content && !flags.failed && !flags.aborted {
         conv.emit(AgentEvent::Error {
@@ -1470,7 +1525,7 @@ async fn idle_watch(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
@@ -1969,6 +2024,9 @@ mod tests {
             Arc::new(Conversation {
                 events: tx,
                 inner: Mutex::new(ConvInner {
+                    tool_scope: None,
+                    tool_capability: None,
+                    history_secrets: Vec::new(),
                     session_id: "ses_a".into(),
                     retired: false,
                     detached: false,
@@ -2383,6 +2441,39 @@ mod tests {
             capability: "test-capability".into(),
             entry,
         }
+    }
+
+    /// 工具桥的集成回归使用真实驱动收尾路径，HTTP 仅走本地替身。
+    pub(crate) async fn retired_tool_scope_fixture(
+        scope: ScopeHandle,
+    ) -> (OpenCodeConversation, String) {
+        let (url, _) = canned_http("200 OK", r#"{"id":"ses_new"}"#).await;
+        let (mut shared, _rx) = fake_shared();
+        Arc::get_mut(&mut shared).unwrap().http = test_http(url);
+        let conversation = fake_conversation(shared);
+        conversation.entry.busy.store(false, Ordering::SeqCst);
+        conversation.bind_tool_scope(scope).unwrap();
+        let old_key = conversation.history_secrets()[0].clone();
+        conversation.entry.busy.store(true, Ordering::SeqCst);
+        // 第 4 条重试到来时即撤销，不必等 1.5 秒兜底。
+        for attempt in 1..=4 {
+            handle_event(
+                &conversation.runtime.shared,
+                &retry_event(attempt, "Overloaded"),
+            );
+        }
+        assert!(conversation
+            .entry
+            .inner
+            .lock()
+            .unwrap()
+            .tool_capability
+            .is_none());
+        {
+            let mut inner = conversation.entry.inner.lock().unwrap();
+            assert!(end_turn(&conversation.entry, &mut inner));
+        }
+        (conversation, old_key)
     }
 
     #[tokio::test]

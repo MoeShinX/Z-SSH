@@ -60,6 +60,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const ABANDONED_TURN_LIMIT: usize = 64;
+const PENDING_NOTIFICATION_LIMIT: usize = 128;
 
 /// 等 MCP 启动状态的最长时间（AI-3 验收 0.2；超时按失败关闭处理）。
 const MCP_GATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -194,6 +195,7 @@ struct ThreadInner {
     abandoned_turns: VecDeque<String>,
     awaiting_start: bool,
     start_uncertain: bool,
+    pending_notifications: VecDeque<(String, Value)>,
 }
 
 impl ThreadInner {
@@ -222,6 +224,7 @@ impl ThreadEntry {
         inner.turn = TurnStats::default();
         inner.turn_seq += 1;
         inner.awaiting_start = true;
+        inner.pending_notifications.clear();
         *self.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.stop_requested.store(false, Ordering::SeqCst);
         Ok(inner.turn_seq)
@@ -235,6 +238,9 @@ impl ThreadEntry {
             inner.awaiting_start = false;
         }
         if !current || !self.busy.load(Ordering::SeqCst) {
+            if current {
+                inner.pending_notifications.clear();
+            }
             inner.abandon(id);
             return Some(id.to_owned());
         }
@@ -694,6 +700,7 @@ impl CodexRuntime {
                 abandoned_turns: VecDeque::new(),
                 awaiting_start: false,
                 start_uncertain: false,
+                pending_notifications: VecDeque::new(),
             }),
             busy: AtomicBool::new(false),
             turn_id: Mutex::new(None),
@@ -872,7 +879,9 @@ impl CodexConversation {
         match result {
             Ok(value) => {
                 if let Some(id) = value["turn"]["id"].as_str() {
-                    if let Some(turn_id) = self.entry.finish_start(seq, id) {
+                    let interrupt = self.entry.finish_start(seq, id);
+                    replay_start_notifications(shared, &self.thread_id, &self.entry, seq);
+                    if let Some(turn_id) = interrupt {
                         let _ = shared
                             .request(
                                 method::TURN_INTERRUPT,
@@ -899,6 +908,7 @@ impl CodexConversation {
             return Ok(());
         }
         inner.awaiting_start = false;
+        inner.pending_notifications.clear();
         // 启动超时 / 坏应答可能意味着服务端已经开了回合；没有 id 就无法隔离它。
         inner.start_uncertain = true;
         // 兜底已报过错并结束的请求，不再让迟到的错误把界面收尾第二次。
@@ -1257,6 +1267,16 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
         return;
     };
     shared.touch();
+    handle_thread_notification(shared, thread_id, &thread, method_name, params);
+}
+
+fn handle_thread_notification(
+    shared: &Arc<Shared>,
+    thread_id: &str,
+    thread: &Arc<ThreadEntry>,
+    method_name: &str,
+    params: &Value,
+) {
     let retry_stop_seq = {
         let mut inner = thread
             .inner
@@ -1273,10 +1293,29 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
             if current.as_deref().is_some_and(|active| active != id) {
                 return;
             }
-            // app-server 可能在 turn/start 的应答被 send 处理之前就发通知。先记 id，
-            // 兜底便能按 id 隔离；未决的启动应答会阻止另一轮与它重叠。
             if current.is_none() {
                 if !inner.awaiting_start {
+                    return;
+                }
+                // 任意旧完成 / 正文通知都不能认领刚启动的回合。只有服务端明确的开始通知或
+                // 与本次 RPC 配对的启动响应才能确定 id，其余通知暂存后按确定的 id 重放。
+                if method_name != method::TURN_STARTED {
+                    if inner.pending_notifications.len() >= PENDING_NOTIFICATION_LIMIT {
+                        inner.pending_notifications.clear();
+                        inner.start_uncertain = true;
+                        thread.busy.store(false, Ordering::SeqCst);
+                        thread.emit(vec![
+                            AgentEvent::Error {
+                                message: "无法确认 AI 回合的启动状态，已停止接收，请新开一个对话"
+                                    .into(),
+                            },
+                            AgentEvent::TurnEnd,
+                        ]);
+                    } else {
+                        inner
+                            .pending_notifications
+                            .push_back((method_name.to_owned(), params.clone()));
+                    }
                     return;
                 }
                 *current = Some(id.to_owned());
@@ -1285,45 +1324,95 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
             // 统一事件都属于某一回合；没有 id 就无法证明归属。
             return;
         }
-        let seq = inner.turn_seq;
-        let ThreadInner { state, turn, .. } = &mut *inner;
-        let mut events = Vec::new();
-        let mut stop = false;
-        for event in translate::translate(method_name, params, state, turn) {
-            if let AgentEvent::Retrying {
-                attempt, reason, ..
-            } = &event
-            {
-                if turn.aborted {
-                    continue;
-                }
-                if retry_limit_reached(*attempt) {
-                    turn.aborted = true;
-                    turn.retry_stop = Some(retry_limit_message(reason));
-                    stop = true;
-                    continue;
-                }
-            }
-            events.push(event);
-        }
-        if method_name == method::TURN_COMPLETED {
-            if let Some(id) = thread
-                .turn_id
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-            {
-                inner.abandon(&id);
-            }
-            thread.busy.store(false, Ordering::SeqCst);
-            thread.stop_requested.store(false, Ordering::SeqCst);
-        }
-        // 收尾和发事件仍在同一把锁里：新回合不能插在清 busy 和旧 TurnEnd 之间。
-        thread.emit(events);
-        stop.then_some(seq)
+        // 先前暂存的通知先处理，后来的通知不能赶在它们前面出字或结束回合。
+        let pending_stop = apply_pending_notifications(thread, &mut inner);
+        apply_known_notification(thread, &mut inner, method_name, params).or(pending_stop)
     };
     if let Some(seq) = retry_stop_seq {
-        stop_after_retry_limit(shared, thread_id, &thread, seq);
+        stop_after_retry_limit(shared, thread_id, thread, seq);
+    }
+}
+
+fn apply_pending_notifications(thread: &ThreadEntry, inner: &mut ThreadInner) -> Option<u64> {
+    let mut stop = None;
+    for (method, params) in std::mem::take(&mut inner.pending_notifications) {
+        stop = apply_known_notification(thread, inner, &method, &params).or(stop);
+    }
+    stop
+}
+
+/// 持有 inner 锁、且 id 已经由开始通知 / RPC 应答确定后才翻译通知。
+fn apply_known_notification(
+    thread: &ThreadEntry,
+    inner: &mut ThreadInner,
+    method_name: &str,
+    params: &Value,
+) -> Option<u64> {
+    if !thread.busy.load(Ordering::SeqCst) {
+        return None;
+    }
+    let id = turn_id_of(params)?;
+    if thread
+        .turn_id
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_deref()
+        != Some(id)
+    {
+        return None;
+    }
+    let seq = inner.turn_seq;
+    let ThreadInner { state, turn, .. } = inner;
+    let mut events = Vec::new();
+    let mut stop = false;
+    for event in translate::translate(method_name, params, state, turn) {
+        if let AgentEvent::Retrying {
+            attempt, reason, ..
+        } = &event
+        {
+            if turn.aborted {
+                continue;
+            }
+            if retry_limit_reached(*attempt) {
+                turn.aborted = true;
+                turn.retry_stop = Some(retry_limit_message(reason));
+                stop = true;
+                continue;
+            }
+        }
+        events.push(event);
+    }
+    if method_name == method::TURN_COMPLETED {
+        if let Some(id) = thread
+            .turn_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            inner.abandon(&id);
+        }
+        thread.busy.store(false, Ordering::SeqCst);
+        thread.stop_requested.store(false, Ordering::SeqCst);
+    }
+    thread.emit(events);
+    stop.then_some(seq)
+}
+
+fn replay_start_notifications(
+    shared: &Arc<Shared>,
+    thread_id: &str,
+    thread: &Arc<ThreadEntry>,
+    seq: u64,
+) {
+    let retry_stop_seq = {
+        let mut inner = thread.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.turn_seq != seq || !thread.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        apply_pending_notifications(thread, &mut inner)
+    };
+    if let Some(seq) = retry_stop_seq {
+        stop_after_retry_limit(shared, thread_id, thread, seq);
     }
 }
 
@@ -1552,6 +1641,7 @@ mod tests {
                 abandoned_turns: VecDeque::new(),
                 awaiting_start: false,
                 start_uncertain: false,
+                pending_notifications: VecDeque::new(),
             }),
             busy: AtomicBool::new(true),
             turn_id: Mutex::new(Some("turn-1".to_string())),
@@ -1563,6 +1653,148 @@ mod tests {
             .unwrap()
             .insert("t1".to_string(), Arc::clone(&entry));
         (entry, rx)
+    }
+
+    #[tokio::test]
+    async fn evicted_old_completion_cannot_claim_a_starting_turn() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.inner.lock().unwrap().turn.retry_stop = Some("E".into());
+        retry_stop_fallback_now(&thread, 1);
+        drain(&mut rx);
+        for n in 2..=65 {
+            let seq = thread.begin_turn().unwrap();
+            thread.finish_start(seq, &format!("turn-{n}"));
+            handle_notification(
+                &shared,
+                method::TURN_COMPLETED,
+                &completed(&format!("turn-{n}"), "completed"),
+            )
+            .await;
+            drain(&mut rx);
+        }
+        assert!(!thread
+            .inner
+            .lock()
+            .unwrap()
+            .abandoned_turns
+            .iter()
+            .any(|id| id == "turn-1"));
+        let seq = thread.begin_turn().unwrap();
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-1", "completed"),
+        )
+        .await;
+        assert!(drain(&mut rx).is_empty());
+        assert!(thread.busy.load(Ordering::SeqCst));
+        assert!(thread.turn_id.lock().unwrap().is_none());
+        assert_eq!(thread.finish_start(seq, "turn-66"), None);
+        replay_start_notifications(&shared, "t1", &thread, seq);
+        assert!(drain(&mut rx).is_empty());
+        assert!(thread.busy.load(Ordering::SeqCst));
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-66", "completed"),
+        )
+        .await;
+        assert_eq!(drain(&mut rx), vec![AgentEvent::TurnEnd]);
+    }
+
+    #[tokio::test]
+    async fn early_text_and_completion_replay_after_the_matching_start_response() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.busy.store(false, Ordering::SeqCst);
+        let seq = thread.begin_turn().unwrap();
+        handle_notification(
+            &shared,
+            "item/agentMessage/delta",
+            &json!({"threadId":"t1", "turnId":"turn-2", "itemId":"msg-2", "delta":"早到正文"}),
+        )
+        .await;
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-2", "completed"),
+        )
+        .await;
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(thread.finish_start(seq, "turn-2"), None);
+        replay_start_notifications(&shared, "t1", &thread, seq);
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                AgentEvent::TextDelta {
+                    text: "早到正文".into()
+                },
+                AgentEvent::TurnEnd
+            ]
+        );
+        assert!(!thread.busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn later_notifications_cannot_overtake_buffered_text_after_start_response() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.busy.store(false, Ordering::SeqCst);
+        let seq = thread.begin_turn().unwrap();
+        let early = json!({"threadId":"t1", "turnId":"turn-2", "itemId":"msg-2", "delta":"先"});
+        handle_notification(&shared, "item/agentMessage/delta", &early).await;
+        thread.finish_start(seq, "turn-2");
+        // 启动响应已绑定 id，但 send 还没主动重放；read_loop 又读到了后续通知。
+        let mut later = early;
+        later["delta"] = json!("后");
+        handle_notification(&shared, "item/agentMessage/delta", &later).await;
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-2", "completed"),
+        )
+        .await;
+        replay_start_notifications(&shared, "t1", &thread, seq);
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                AgentEvent::TextDelta { text: "先".into() },
+                AgentEvent::TextDelta { text: "后".into() },
+                AgentEvent::TurnEnd
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_start_buffer_has_a_limit_and_late_response_is_interrupted() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.busy.store(false, Ordering::SeqCst);
+        let seq = thread.begin_turn().unwrap();
+        for _ in 0..=PENDING_NOTIFICATION_LIMIT {
+            handle_notification(
+                &shared,
+                "item/agentMessage/delta",
+                &json!({"threadId":"t1", "turnId":"unknown", "itemId":"msg", "delta":"x"}),
+            )
+            .await;
+        }
+        assert!(thread
+            .inner
+            .lock()
+            .unwrap()
+            .pending_notifications
+            .is_empty());
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [AgentEvent::Error { .. }, AgentEvent::TurnEnd]
+        ));
+        assert_eq!(
+            thread.finish_start(seq, "actual-id").as_deref(),
+            Some("actual-id")
+        );
+        assert!(thread.begin_turn().is_err());
     }
 
     fn retry_notice(n: u32) -> Value {
@@ -1747,6 +1979,12 @@ mod tests {
         let (thread, mut rx) = running_thread(&shared);
         *thread.turn_id.lock().unwrap() = None;
         thread.inner.lock().unwrap().awaiting_start = true;
+        handle_notification(
+            &shared,
+            method::TURN_STARTED,
+            &json!({ "threadId": "t1", "turn": {"id": "turn-1"} }),
+        )
+        .await;
         for n in 1..=4 {
             handle_notification(&shared, "error", &retry_notice(n)).await;
         }

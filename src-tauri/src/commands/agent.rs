@@ -611,6 +611,9 @@ pub async fn ai_agent_start(
                         .open_conversation_resuming(capability, tx, resume.as_deref())
                         .await
                         .map_err(|e| e.to_string())?;
+                    conversation
+                        .bind_tool_scope(scope.clone())
+                        .map_err(|e| e.to_string())?;
                     (conversation as Arc<dyn AgentConversation>, resumed)
                 }
                 SharedRuntime::Codex(runtime) => {
@@ -903,7 +906,7 @@ pub async fn ai_history_save(
     draft: HistoryDraft,
 ) -> Result<Option<HistorySummary>, String> {
     let kind = parse_agent(&agent)?;
-    let (resume_id, capability) = match session_key.as_deref() {
+    let (resume_id, capability, driver_secrets) = match session_key.as_deref() {
         Some(key) => registry
             .conversations()
             .get(key)
@@ -911,10 +914,11 @@ pub async fn ai_history_save(
                 (
                     c.conversation.resume_id(),
                     Some(c.scope.capability().to_string()),
+                    c.conversation.history_secrets(),
                 )
             })
-            .unwrap_or((None, None)),
-        None => (None, None),
+            .unwrap_or((None, None, Vec::new())),
+        None => (None, None, Vec::new()),
     };
     let token = bridge.connection_token().to_string();
     let store = history_store(&app)?;
@@ -923,6 +927,7 @@ pub async fn ai_history_save(
         if let Some(capability) = capability.as_deref() {
             secrets.push(capability);
         }
+        secrets.extend(driver_secrets.iter().map(String::as_str));
         store.save(kind.id(), draft, resume_id, &secrets, history::now_ms())
     })
     .await
