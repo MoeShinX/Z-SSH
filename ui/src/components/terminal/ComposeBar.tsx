@@ -44,14 +44,24 @@ export interface ComposeBarProps {
   onEscape: () => void;
   /** 这个标签有几个分屏（只有一个时「所有分屏」没意义，开关灰掉）。 */
   paneCount: number;
+  /** 这个标签开着键盘广播：Enter 实际发到所有分屏（和快捷命令一致），开关只显示这个事实。 */
+  broadcast?: boolean;
   /** 发送历史（旧 → 新）；App 传一个 ref 让所有终端标签共用，不传就只在这个栏里。只在内存里。 */
   history?: MutableRefObject<string[]>;
 }
 
-export default function ComposeBar({ onSend, onEscape, paneCount, history }: ComposeBarProps) {
+export default function ComposeBar({
+  onSend,
+  onEscape,
+  paneCount,
+  broadcast = false,
+  history,
+}: ComposeBarProps) {
   const [value, setValue] = useState("");
   /** Enter 和发送按钮发到所有分屏（Ctrl+Enter 不看这个，始终是所有分屏）。 */
   const [allPanes, setAllPanes] = useState(false);
+  /** 实际发送目标：开关的选择，或标签正在广播（广播时 Enter 一定发所有分屏）。 */
+  const effectiveAll = allPanes || broadcast;
   const ownHistory = useRef<string[]>([]);
   const historyRef = history ?? ownHistory;
   const navRef = useRef<HistoryNav>(IDLE_NAV);
@@ -141,7 +151,7 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
     if (event.key === "Enter") {
       if (event.shiftKey) return; // 换行
       event.preventDefault();
-      submit(event.ctrlKey || event.metaKey ? true : allPanes);
+      submit(event.ctrlKey || event.metaKey ? true : effectiveAll);
       return;
     }
     if (event.key === "Escape") {
@@ -208,35 +218,37 @@ export default function ComposeBar({ onSend, onEscape, paneCount, history }: Com
       <button
         type="button"
         data-action="compose-target"
-        aria-pressed={allPanes}
-        disabled={paneCount < 2 && !allPanes}
+        aria-pressed={effectiveAll}
+        disabled={paneCount < 2 && !effectiveAll}
         onClick={() => setAllPanes((on) => !on)}
         title={
-          paneCount < 2 && !allPanes
-            ? "发送目标：先分屏（Ctrl+Shift+D / E）才能选「所有分屏」"
-            : allPanes
-              ? "Enter 和发送按钮现在发到这个标签的所有分屏（点一下改回当前窗格）"
-              : "Enter 和发送按钮现在发到当前窗格（点一下改成所有分屏）"
+          broadcast
+            ? "这个标签正在广播输入，Enter 和发送按钮实际发到所有分屏（先关广播才能只发当前窗格）"
+            : paneCount < 2 && !effectiveAll
+              ? "发送目标：先分屏（Ctrl+Shift+D / E）才能选「所有分屏」"
+              : effectiveAll
+                ? "Enter 和发送按钮现在发到这个标签的所有分屏（点一下改回当前窗格）"
+                : "Enter 和发送按钮现在发到当前窗格（点一下改成所有分屏）"
         }
         className={cn(
           "h-6 shrink-0 rounded px-2 disabled:opacity-40",
-          allPanes
+          effectiveAll
             ? "bg-amber-500/20 text-amber-600 hover:bg-amber-500/30"
             : "text-muted-foreground hover:bg-accent hover:text-foreground",
         )}
       >
-        {allPanes ? "所有分屏" : "当前窗格"}
+        {effectiveAll ? "所有分屏" : "当前窗格"}
       </button>
       <Button
         variant="ghost"
         size="icon"
         className="h-6 w-6 shrink-0"
         data-action="compose-send"
-        title={allPanes ? "发送到所有分屏（Enter）" : "发送到当前窗格（Enter）；Ctrl+Enter 发到所有分屏"}
+        title={effectiveAll ? "发送到所有分屏（Enter）" : "发送到当前窗格（Enter）；Ctrl+Enter 发到所有分屏"}
         aria-label="发送"
         disabled={!canSend}
         onClick={() => {
-          submit(allPanes);
+          submit(effectiveAll);
           inputRef.current?.focus();
         }}
       >

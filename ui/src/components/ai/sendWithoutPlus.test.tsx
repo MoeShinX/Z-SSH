@@ -94,3 +94,33 @@ describe("不点 + 直接发消息", () => {
     await waitFor(() => expect(document.querySelector('[data-section="ai-thinking"]')).toBeNull());
   });
 });
+
+describe("输入法组合期间的 Enter 不发送", () => {
+  it("选候选字的 Enter 只交给输入法；组合结束后的 Enter 才发送", async () => {
+    render(
+      <AIChatPanel
+        tabId="tab-1"
+        sessions={[{ sessionId: "sess-1", hostId: 1, hostLabel: "web-1", username: "root" }]}
+        hostStates={{}}
+        firstUse={false}
+        onMarkUsed={() => {}}
+        onOpenSettings={() => {}}
+        onClose={() => {}}
+      />,
+    );
+    const input = screen.getByPlaceholderText(/让 AI 在服务器上做什么/);
+    await waitFor(() => expect((input as HTMLTextAreaElement).disabled).toBe(false));
+
+    // 正在打中文：isComposing / keyCode 229 的 Enter 是选字，不发送、内容保留
+    fireEvent.change(input, { target: { value: "看下磁盘" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(mocks.aiAgentStart).not.toHaveBeenCalled();
+    expect(mocks.aiAgentSend).not.toHaveBeenCalled();
+    expect((input as HTMLTextAreaElement).value).toBe("看下磁盘");
+
+    // 组合结束后的 Enter 正常发送
+    fireEvent.keyDown(input, { key: "Enter", isComposing: false });
+    await waitFor(() => expect(mocks.aiAgentSend).toHaveBeenCalledTimes(1));
+  });
+});

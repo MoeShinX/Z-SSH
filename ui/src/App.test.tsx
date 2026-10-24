@@ -975,6 +975,40 @@ describe("终端底部的撰写栏（UI-17）", () => {
     expect(composeInput().value).toBe("");
   });
 
+  it("分屏后：Enter 只发焦点窗格，Ctrl+Enter 发到所有分屏", async () => {
+    await openTerminal({ connected: true });
+    // Ctrl+Shift+D 垂直分屏：新窗格复制当前会话（sessionDuplicate → sess-dup）
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "D", ctrlKey: true, shiftKey: true });
+    });
+    const ready2 = [...mocks.ready.values()].at(-1);
+    if (!ready2) throw new Error("分屏后没有第二个窗格");
+    await act(async () => ready2(100, 30));
+    await waitFor(() => expect(mocks.sessionDuplicate).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      for (const handler of mocks.stateHandlers) handler({ session_id: "sess-dup", state: "connected" });
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(document.querySelectorAll('[data-pane-id][data-phase="connected"]').length).toBe(2),
+    );
+    mocks.termWrite.mockClear();
+
+    // Ctrl+Enter：两个窗格各发一条
+    fireEvent.change(composeInput(), { target: { value: "uptime" } });
+    fireEvent.keyDown(composeInput(), { key: "Enter", ctrlKey: true });
+    const targets = (mocks.termWrite.mock.calls as unknown as [string, string][])
+      .map((call) => `${call[0]}:${call[1]}`)
+      .sort();
+    expect(targets).toEqual(["sess-1:uptime" + String.fromCharCode(13), "sess-dup:uptime" + String.fromCharCode(13)]);
+
+    // Enter：只发焦点窗格（分屏后焦点在新窗格上）
+    fireEvent.change(composeInput(), { target: { value: "date" } });
+    fireEvent.keyDown(composeInput(), { key: "Enter" });
+    expect(mocks.termWrite).toHaveBeenCalledTimes(3);
+    expect(mocks.termWrite).toHaveBeenLastCalledWith("sess-dup", "date" + String.fromCharCode(13));
+  });
+
   it("窗格没连上：什么都不发，内容留着", async () => {
     await openTerminal({ connected: false });
     fireEvent.change(composeInput(), { target: { value: "ls" } });

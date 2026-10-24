@@ -3195,6 +3195,7 @@ export default function App() {
                           onSend={runComposeText}
                           onEscape={() => focusTerminalOf(tab.focus)}
                           paneCount={paneIds(tab.tree).length}
+                          broadcast={Boolean(tab.broadcast)}
                           history={composeHistoryRef}
                         />
                       </div>

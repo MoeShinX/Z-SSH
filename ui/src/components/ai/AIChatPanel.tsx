@@ -1515,6 +1515,8 @@ export default function AIChatPanel({
               if (value.endsWith("@") && !picker) openPicker();
             }}
             onKeyDown={(event) => {
+              // 输入法组合期间（选候选字、翻页）的 Enter 是选字，不是发送（同撰写栏）
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 void send();

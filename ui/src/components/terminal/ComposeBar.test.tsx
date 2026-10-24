@@ -496,3 +496,31 @@ describe("撰写栏高度拖动条", () => {
     expect(isPanelDragging()).toBe(false);
   });
 });
+
+describe("标签开着广播时", () => {
+  it("开关显示实际目标（所有分屏）并说明原因；Enter 按所有分屏发送", () => {
+    const { input, onSend, type, press } = setup({ broadcast: true });
+    const toggle = document.querySelector('[data-action="compose-target"]') as HTMLElement;
+    expect(toggle.textContent).toBe("所有分屏");
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    expect(toggle.getAttribute("title")).toContain("正在广播输入");
+
+    type("ls");
+    press("Enter");
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0].slice(0, 2)).toEqual(["ls", true]);
+    expect(input.value).toBe("");
+  });
+
+  it("广播关掉后回到开关自己的选择", () => {
+    const onSend = vi.fn<SendFn>((_text, _all, afterSend) => afterSend(1));
+    const props: ComposeBarProps = { onSend, onEscape: vi.fn(), paneCount: 2 };
+    const view = render(<ComposeBar {...props} />);
+    const toggle = () => document.querySelector('[data-action="compose-target"]') as HTMLElement;
+    expect(toggle().textContent).toBe("当前窗格");
+    view.rerender(<ComposeBar {...props} broadcast />);
+    expect(toggle().textContent).toBe("所有分屏");
+    view.rerender(<ComposeBar {...props} />);
+    expect(toggle().textContent).toBe("当前窗格");
+  });
+});
