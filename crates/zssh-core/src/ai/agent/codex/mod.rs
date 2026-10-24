@@ -24,7 +24,7 @@ pub mod protocol;
 pub mod startup;
 pub mod translate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -58,6 +58,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 打断回合的超时（打断不成就报错，回合自己会结束）。
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+const ABANDONED_TURN_LIMIT: usize = 64;
 
 /// 等 MCP 启动状态的最长时间（AI-3 验收 0.2；超时按失败关闭处理）。
 const MCP_GATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -187,16 +189,61 @@ struct ThreadInner {
     /// 回合序号（每次发消息加一）：重试超限后的延时收尾任务靠它确认还是同一个回合，
     /// 别误伤用户马上发的下一条消息。
     turn_seq: u64,
-    /// 重试超限、兜底收尾时放弃的回合 id：codex 之后再发的、属于这个回合的通知
-    /// （包括晚到的 `turn/completed`）一律丢掉，免得误伤之后的新回合。
-    abandoned_turn: Option<String>,
-    /// 被放弃回合的回合序号：兜底时可能还不知道回合 id（`abandoned_turn` 为空），这时靠
-    /// 「序号没变 = 还是同一个回合」认出晚到的 `turn/completed`。新回合一开始序号就变了，
-    /// 不会误伤；0 表示没有放弃中的回合。
-    abandoned_seq: u64,
+    /// 保留多个回合的墓碑。即使完成通知已到，仍可能有迟到的正文；上限外的旧 id 由当前
+    /// turn_id 的匹配拦住。还没拿到 id 时不允许另起一次 turn/start。
+    abandoned_turns: VecDeque<String>,
+    awaiting_start: bool,
+    start_uncertain: bool,
+}
+
+impl ThreadInner {
+    fn abandon(&mut self, id: &str) {
+        if !self.abandoned_turns.iter().any(|known| known == id) {
+            self.abandoned_turns.push_back(id.to_owned());
+            if self.abandoned_turns.len() > ABANDONED_TURN_LIMIT {
+                self.abandoned_turns.pop_front();
+            }
+        }
+    }
 }
 
 impl ThreadEntry {
+    fn begin_turn(&self) -> Result<u64, AgentError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.start_uncertain {
+            return Err(AgentError::Transport(
+                "无法确认上一轮是否已启动，请新开一个对话".into(),
+            ));
+        }
+        // 旧 turn/start 还没应答时不知道它的 id，不能让新一轮与它重叠。
+        if inner.awaiting_start || self.busy.swap(true, Ordering::SeqCst) {
+            return Err(AgentError::Busy);
+        }
+        inner.turn = TurnStats::default();
+        inner.turn_seq += 1;
+        inner.awaiting_start = true;
+        *self.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.stop_requested.store(false, Ordering::SeqCst);
+        Ok(inner.turn_seq)
+    }
+
+    /// 返回需要补发中断的 id。过期的应答只登记墓碑，绝不能改写新回合的 id / 停止标记。
+    fn finish_start(&self, seq: u64, id: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let current = inner.turn_seq == seq;
+        if current {
+            inner.awaiting_start = false;
+        }
+        if !current || !self.busy.load(Ordering::SeqCst) {
+            inner.abandon(id);
+            return Some(id.to_owned());
+        }
+        *self.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.to_owned());
+        self.stop_requested
+            .swap(false, Ordering::SeqCst)
+            .then(|| id.to_owned())
+    }
+
     fn emit(&self, events: Vec<AgentEvent>) {
         for event in events {
             let _ = self.events.send(event);
@@ -644,8 +691,9 @@ impl CodexRuntime {
                 state: TranslateState::default(),
                 turn: TurnStats::default(),
                 turn_seq: 0,
-                abandoned_turn: None,
-                abandoned_seq: 0,
+                abandoned_turns: VecDeque::new(),
+                awaiting_start: false,
+                start_uncertain: false,
             }),
             busy: AtomicBool::new(false),
             turn_id: Mutex::new(None),
@@ -812,15 +860,8 @@ impl CodexConversation {
         }
         // 确认 MCP 里只有 zssh 之后才放行回合（AI-3 验收 0.2）。
         self.await_mcp_ready().await?;
-        if self.entry.busy.swap(true, Ordering::SeqCst) {
-            return Err(AgentError::Busy);
-        }
+        let seq = self.entry.begin_turn()?;
         shared.touch();
-        if let Ok(mut inner) = self.entry.inner.lock() {
-            inner.turn = TurnStats::default();
-            inner.turn_seq += 1;
-        }
-        *self.entry.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
         let cwd = shared.workspace.to_string_lossy().into_owned();
         let (model_id, effort) = parse_model_ref(model);
@@ -830,11 +871,8 @@ impl CodexConversation {
             .await;
         match result {
             Ok(value) => {
-                let turn_id = value["turn"]["id"].as_str().map(str::to_string);
-                *self.entry.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = turn_id.clone();
-                // 停止请求早于回合 id 到达：现在补打断。
-                if self.entry.stop_requested.swap(false, Ordering::SeqCst) {
-                    if let Some(turn_id) = turn_id {
+                if let Some(id) = value["turn"]["id"].as_str() {
+                    if let Some(turn_id) = self.entry.finish_start(seq, id) {
                         let _ = shared
                             .request(
                                 method::TURN_INTERRUPT,
@@ -843,18 +881,44 @@ impl CodexConversation {
                             )
                             .await;
                     }
+                } else {
+                    return self.start_failed(
+                        seq,
+                        AgentError::Transport("turn/start 没有返回回合 id".into()),
+                    );
                 }
                 Ok(())
             }
-            Err(err) => {
-                self.entry.busy.store(false, Ordering::SeqCst);
-                Err(err)
-            }
+            Err(err) => self.start_failed(seq, err),
         }
     }
 
+    fn start_failed(&self, seq: u64, err: AgentError) -> Result<(), AgentError> {
+        let mut inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.turn_seq != seq {
+            return Ok(());
+        }
+        inner.awaiting_start = false;
+        // 启动超时 / 坏应答可能意味着服务端已经开了回合；没有 id 就无法隔离它。
+        inner.start_uncertain = true;
+        // 兜底已报过错并结束的请求，不再让迟到的错误把界面收尾第二次。
+        if !self.entry.busy.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(id) = self
+            .entry
+            .turn_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            inner.abandon(&id);
+        }
+        Err(err)
+    }
+
     async fn stop_inner(&self) -> Result<(), AgentError> {
-        stop_turn(&self.runtime.shared, &self.thread_id, &self.entry).await
+        stop_turn(&self.runtime.shared, &self.thread_id, &self.entry, None).await
     }
 }
 
@@ -864,18 +928,26 @@ async fn stop_turn(
     shared: &Shared,
     thread_id: &str,
     entry: &ThreadEntry,
+    expected_seq: Option<u64>,
 ) -> Result<(), AgentError> {
-    if !entry.busy.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    if let Ok(mut inner) = entry.inner.lock() {
+    let turn_id = {
+        let mut inner = entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !entry.busy.load(Ordering::SeqCst)
+            || expected_seq.is_some_and(|seq| inner.turn_seq != seq)
+        {
+            return Ok(());
+        }
         inner.turn.aborted = true;
-    }
-    let turn_id = entry
-        .turn_id
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
+        let id = entry
+            .turn_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if id.is_none() {
+            entry.stop_requested.store(true, Ordering::SeqCst);
+        }
+        id
+    };
     match turn_id {
         Some(turn_id) => shared
             .request(
@@ -885,11 +957,7 @@ async fn stop_turn(
             )
             .await
             .map(|_| ()),
-        None => {
-            // 回合还在启动：标记一下，send 拿到 id 后立即打断。
-            entry.stop_requested.store(true, Ordering::SeqCst);
-            Ok(())
-        }
+        None => Ok(()),
     }
 }
 
@@ -915,16 +983,7 @@ fn stop_after_retry_limit(
         let thread = Arc::clone(thread);
         let thread_id = thread_id.to_string();
         handle.spawn(async move {
-            // 这个回合已经收尾、用户开了新回合：别把打断打到新回合上。
-            let same_turn = thread
-                .inner
-                .lock()
-                .map(|i| i.turn_seq == seq)
-                .unwrap_or(false);
-            if !same_turn {
-                return;
-            }
-            if let Err(err) = stop_turn(&shared, &thread_id, &thread).await {
+            if let Err(err) = stop_turn(&shared, &thread_id, &thread, Some(seq)).await {
                 tracing::warn!(error = %err, "重试超限后打断回合失败");
             }
         });
@@ -952,7 +1011,7 @@ fn stop_after_retry_limit(
 /// 兜底收尾：还是同一个回合、而且 `turn/completed` 还没来，就由我们发 `Error` + `TurnEnd`，
 /// 并把这个回合记成「已放弃」（它晚到的通知不再认）。返回被放弃的回合 id（如果知道）。
 fn retry_stop_fallback_now(thread: &ThreadEntry, seq: u64) -> Option<String> {
-    let (message, abandoned) = {
+    {
         let mut inner = thread
             .inner
             .lock()
@@ -966,17 +1025,15 @@ fn retry_stop_fallback_now(thread: &ThreadEntry, seq: u64) -> Option<String> {
             .turn_id
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        inner.abandoned_turn = abandoned.clone();
-        inner.abandoned_seq = seq;
-        (message, abandoned)
-    };
-    thread.stop_requested.store(false, Ordering::SeqCst);
-    if thread.busy.swap(false, Ordering::SeqCst) {
-        *thread.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            .take();
+        if let Some(id) = &abandoned {
+            inner.abandon(id);
+        }
+        thread.stop_requested.store(false, Ordering::SeqCst);
+        thread.busy.store(false, Ordering::SeqCst);
         thread.emit(vec![AgentEvent::Error { message }, AgentEvent::TurnEnd]);
+        abandoned
     }
-    abandoned
 }
 
 impl AgentConversation for CodexConversation {
@@ -1200,33 +1257,35 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
         return;
     };
     shared.touch();
-    let (events, retry_stop_seq) = {
+    let retry_stop_seq = {
         let mut inner = thread
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // 重试超限时被我们放弃的回合：它之后发的通知（含晚到的 turn/completed）不认，
-        // 免得误伤之后开的新回合。知道回合 id 按 id 认；兜底时还不知道 id 的按回合序号认
-        // （序号没变就是同一个回合）——不然晚到的 turn/completed 会再发一次 TurnEnd。
-        if method_name == method::TURN_COMPLETED
-            && inner.abandoned_seq != 0
-            && inner.abandoned_seq == inner.turn_seq
-        {
-            inner.abandoned_seq = 0;
-            inner.abandoned_turn = None;
+        if !thread.busy.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(abandoned) = inner.abandoned_turn.as_deref() {
-            if turn_id_of(params) == Some(abandoned) {
-                if method_name == method::TURN_COMPLETED {
-                    inner.abandoned_turn = None;
-                    inner.abandoned_seq = 0;
-                }
+        if let Some(id) = turn_id_of(params) {
+            if inner.abandoned_turns.iter().any(|known| known == id) {
                 return;
             }
+            let mut current = thread.turn_id.lock().unwrap_or_else(|p| p.into_inner());
+            if current.as_deref().is_some_and(|active| active != id) {
+                return;
+            }
+            // app-server 可能在 turn/start 的应答被 send 处理之前就发通知。先记 id，
+            // 兜底便能按 id 隔离；未决的启动应答会阻止另一轮与它重叠。
+            if current.is_none() {
+                if !inner.awaiting_start {
+                    return;
+                }
+                *current = Some(id.to_owned());
+            }
+        } else {
+            // 统一事件都属于某一回合；没有 id 就无法证明归属。
+            return;
         }
         let seq = inner.turn_seq;
-        let busy = thread.busy.load(Ordering::SeqCst);
         let ThreadInner { state, turn, .. } = &mut *inner;
         let mut events = Vec::new();
         let mut stop = false;
@@ -1235,13 +1294,10 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
                 attempt, reason, ..
             } = &event
             {
-                // 回合不在跑 / 已被停止（用户点停止，或已经因超限停掉）时晚到的重试
-                // 状态：忽略。
-                if !busy || turn.aborted {
+                if turn.aborted {
                     continue;
                 }
                 if retry_limit_reached(*attempt) {
-                    // 第 3 次重试也失败了：这条不给界面看，直接停掉这一轮。
                     turn.aborted = true;
                     turn.retry_stop = Some(retry_limit_message(reason));
                     stop = true;
@@ -1250,13 +1306,22 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
             }
             events.push(event);
         }
-        (events, stop.then_some(seq))
+        if method_name == method::TURN_COMPLETED {
+            if let Some(id) = thread
+                .turn_id
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                inner.abandon(&id);
+            }
+            thread.busy.store(false, Ordering::SeqCst);
+            thread.stop_requested.store(false, Ordering::SeqCst);
+        }
+        // 收尾和发事件仍在同一把锁里：新回合不能插在清 busy 和旧 TurnEnd 之间。
+        thread.emit(events);
+        stop.then_some(seq)
     };
-    thread.emit(events);
-    if method_name == method::TURN_COMPLETED {
-        thread.busy.store(false, Ordering::SeqCst);
-        *thread.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    }
     if let Some(seq) = retry_stop_seq {
         stop_after_retry_limit(shared, thread_id, &thread, seq);
     }
@@ -1484,8 +1549,9 @@ mod tests {
                 state: TranslateState::default(),
                 turn: TurnStats::default(),
                 turn_seq: 1,
-                abandoned_turn: None,
-                abandoned_seq: 0,
+                abandoned_turns: VecDeque::new(),
+                awaiting_start: false,
+                start_uncertain: false,
             }),
             busy: AtomicBool::new(true),
             turn_id: Mutex::new(Some("turn-1".to_string())),
@@ -1615,7 +1681,13 @@ mod tests {
         }
         assert!(!thread.busy.load(Ordering::SeqCst));
         assert_eq!(
-            thread.inner.lock().unwrap().abandoned_turn.as_deref(),
+            thread
+                .inner
+                .lock()
+                .unwrap()
+                .abandoned_turns
+                .front()
+                .map(String::as_str),
             Some("turn-1")
         );
 
@@ -1643,7 +1715,13 @@ mod tests {
             Some("turn-2"),
             "新回合的 id 不能被清掉"
         );
-        assert!(thread.inner.lock().unwrap().abandoned_turn.is_none());
+        assert!(thread
+            .inner
+            .lock()
+            .unwrap()
+            .abandoned_turns
+            .iter()
+            .any(|id| id == "turn-1"));
 
         // 新回合自己的重试从头放行，自己的 turn/completed 正常收尾。
         let mut notice = retry_notice(1);
@@ -1662,13 +1740,13 @@ mod tests {
         assert_eq!(drain(&mut rx), vec![AgentEvent::TurnEnd]);
     }
 
-    /// 兜底时还不知道回合 id（turn_id 是 None）：晚到的 turn/completed 按回合序号认出来
-    /// 丢掉，不能再发一次 TurnEnd。
+    /// turn/start 应答还没被 send 处理时，也从重试通知记住 id；应答晚到不能再写回它。
     #[tokio::test]
-    async fn fallback_without_turn_id_ignores_late_completion_by_seq() {
+    async fn retry_before_start_response_is_quarantined_by_id() {
         let shared = test_shared();
         let (thread, mut rx) = running_thread(&shared);
         *thread.turn_id.lock().unwrap() = None;
+        thread.inner.lock().unwrap().awaiting_start = true;
         for n in 1..=4 {
             handle_notification(&shared, "error", &retry_notice(n)).await;
         }
@@ -1680,31 +1758,20 @@ mod tests {
             }
             other => panic!("要兜底 Error + TurnEnd：{other:?}"),
         }
-        // 没有回合 id 可记，只记了序号。
-        assert!(thread.inner.lock().unwrap().abandoned_turn.is_none());
-        assert_ne!(thread.inner.lock().unwrap().abandoned_seq, 0);
-
-        // 晚到的 turn/completed（还是同一个回合，序号没变）：不能再发 TurnEnd。
+        assert!(matches!(thread.begin_turn(), Err(AgentError::Busy)));
+        assert_eq!(thread.finish_start(1, "turn-1").as_deref(), Some("turn-1"));
+        let seq = thread.begin_turn().unwrap();
+        assert_eq!(thread.finish_start(seq, "turn-2"), None);
+        // 新一轮已开始，旧回合才完成，不能结束新一轮。
         handle_notification(
             &shared,
             method::TURN_COMPLETED,
-            &completed("turn-9", "interrupted"),
+            &completed("turn-1", "interrupted"),
         )
         .await;
         assert!(drain(&mut rx).is_empty());
-        assert_eq!(
-            thread.inner.lock().unwrap().abandoned_seq,
-            0,
-            "吞掉后清掉记录"
-        );
-
-        // 序号变了的下一个回合不受影响，照常收尾。
-        {
-            let mut inner = thread.inner.lock().unwrap();
-            inner.turn = TurnStats::default();
-            inner.turn_seq += 1;
-        }
-        thread.busy.store(true, Ordering::SeqCst);
+        assert!(thread.busy.load(Ordering::SeqCst));
+        assert_eq!(thread.turn_id.lock().unwrap().as_deref(), Some("turn-2"));
         handle_notification(
             &shared,
             method::TURN_COMPLETED,
@@ -1712,6 +1779,134 @@ mod tests {
         )
         .await;
         assert_eq!(drain(&mut rx), vec![AgentEvent::TurnEnd]);
+    }
+
+    /// turn/start 超时或应答坏掉：报错、结束回合、放弃已知 id；这个对话之后一律拒绝发送，
+    /// 提示新开对话（服务端可能已经开了回合，没有 id 就无法隔离它）。
+    #[tokio::test]
+    async fn start_failure_locks_the_thread_until_a_new_conversation() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        let conversation = CodexConversation {
+            runtime: Arc::new(CodexRuntime {
+                shared: Arc::clone(&shared),
+                reader_task: Mutex::new(None),
+                shutdown_tx: watch::channel(false).0,
+                idle_task: Mutex::new(None),
+            }),
+            thread_id: "t1".to_owned(),
+            capability: String::new(),
+            entry: Arc::clone(&thread),
+        };
+        let error = conversation
+            .start_failed(1, AgentError::Transport("请求超时".to_owned()))
+            .unwrap_err();
+        assert!(error.to_string().contains("请求超时"));
+        assert!(!conversation.is_busy());
+        assert!(thread.inner.lock().unwrap().start_uncertain);
+        assert_eq!(thread.turn_id.lock().unwrap().as_deref(), None);
+        // 被放弃回合晚到的完成：不能产生事件，也不能把锁解开。
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-1", "interrupted"),
+        )
+        .await;
+        assert!(drain(&mut rx).is_empty());
+        // 之后的发送一律拒绝，提示新开对话；拒绝时不能顺手把 busy 置上。
+        match thread.begin_turn() {
+            Err(AgentError::Transport(message)) => {
+                assert!(message.contains("新开一个对话"), "{message}");
+            }
+            other => panic!("要提示新开对话：{other:?}"),
+        }
+        assert!(!thread.busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn consecutive_fallbacks_keep_all_old_turns_out_of_the_next_turn() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        for n in 1..=3 {
+            if n > 1 {
+                let seq = thread.begin_turn().unwrap();
+                assert_eq!(thread.finish_start(seq, &format!("turn-{n}")), None);
+            }
+            thread.inner.lock().unwrap().turn.retry_stop = Some("E".into());
+            assert_eq!(
+                retry_stop_fallback_now(&thread, n).as_deref(),
+                Some(format!("turn-{n}").as_str())
+            );
+            assert_eq!(drain(&mut rx).len(), 2);
+        }
+        let seq = thread.begin_turn().unwrap();
+        thread.finish_start(seq, "turn-4");
+        for n in [2, 1, 3, 1] {
+            handle_notification(
+                &shared,
+                method::TURN_COMPLETED,
+                &completed(&format!("turn-{n}"), "failed"),
+            )
+            .await;
+            handle_notification(&shared, "item/agentMessage/delta", &json!({
+                "threadId": "t1", "turnId": format!("turn-{n}"), "itemId": "old", "delta": "旧正文"
+            })).await;
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(thread.busy.load(Ordering::SeqCst));
+        assert_eq!(thread.turn_id.lock().unwrap().as_deref(), Some("turn-4"));
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-4", "completed"),
+        )
+        .await;
+        assert_eq!(drain(&mut rx), vec![AgentEvent::TurnEnd]);
+    }
+
+    #[tokio::test]
+    async fn stale_start_response_and_stop_cannot_overwrite_or_interrupt_new_turn() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.inner.lock().unwrap().turn.retry_stop = Some("E".into());
+        retry_stop_fallback_now(&thread, 1);
+        drain(&mut rx);
+        let seq = thread.begin_turn().unwrap();
+        thread.finish_start(seq, "turn-2");
+        assert_eq!(thread.finish_start(1, "turn-1").as_deref(), Some("turn-1"));
+        stop_turn(&shared, "t1", &thread, Some(1)).await.unwrap();
+        assert_eq!(thread.turn_id.lock().unwrap().as_deref(), Some("turn-2"));
+        assert!(!thread.inner.lock().unwrap().turn.aborted);
+        assert!(!thread.stop_requested.load(Ordering::SeqCst));
+        assert!(thread.busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn fallback_without_any_id_waits_for_its_start_response() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        *thread.turn_id.lock().unwrap() = None;
+        {
+            let mut inner = thread.inner.lock().unwrap();
+            inner.awaiting_start = true;
+            inner.turn.retry_stop = Some("E".into());
+        }
+        retry_stop_fallback_now(&thread, 1);
+        drain(&mut rx);
+        assert!(matches!(thread.begin_turn(), Err(AgentError::Busy)));
+        assert_eq!(
+            thread.finish_start(1, "late-id").as_deref(),
+            Some("late-id")
+        );
+        assert!(thread.turn_id.lock().unwrap().is_none());
+        assert!(thread
+            .inner
+            .lock()
+            .unwrap()
+            .abandoned_turns
+            .iter()
+            .any(|id| id == "late-id"));
+        assert!(thread.begin_turn().is_ok());
     }
 
     /// 兜底不误伤新回合：宽限期内用户已经开了下一个回合，兜底什么都不做。

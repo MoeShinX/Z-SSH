@@ -113,6 +113,10 @@ struct Conversation {
 }
 
 struct ConvInner {
+    session_id: String,
+    /// 自动停止过的 session 永不复用：abort 和 SSE 都没有回合 id，迟到时无法分辨归属。
+    retired: bool,
+    detached: bool,
     translate: TranslateState,
     turn: TurnFlags,
     /// 回合序号（每次发消息加一）：延时收尾任务靠它确认还是同一个回合，别误伤下一回合。
@@ -338,6 +342,9 @@ impl AgentRuntime {
         let entry = Arc::new(Conversation {
             events,
             inner: Mutex::new(ConvInner {
+                session_id: session_id.clone(),
+                retired: false,
+                detached: false,
                 translate: TranslateState::default(),
                 turn: TurnFlags::default(),
                 turn_seq: 0,
@@ -418,8 +425,13 @@ impl OpenCodeConversation {
     }
 
     fn detach(&self) {
+        self.entry
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .detached = true;
         if let Ok(mut map) = self.runtime.shared.conversations.lock() {
-            map.remove(&self.session_id);
+            map.retain(|_, entry| !Arc::ptr_eq(entry, &self.entry));
         }
     }
 
@@ -430,14 +442,37 @@ impl OpenCodeConversation {
                 "opencode 事件流已断开，请新开一个对话".to_string(),
             ));
         }
-        if self.entry.busy.swap(true, Ordering::SeqCst) {
-            return Err(AgentError::Busy);
-        }
-        shared.touch();
-        if let Ok(mut inner) = self.entry.inner.lock() {
+        let (seq, retired) = {
+            let mut inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if inner.detached {
+                return Err(AgentError::Transport("这个对话已经结束".to_string()));
+            }
+            if self.entry.busy.swap(true, Ordering::SeqCst) {
+                return Err(AgentError::Busy);
+            }
             inner.turn = TurnFlags::default();
             inner.turn_seq += 1;
+            (inner.turn_seq, inner.retired)
+        };
+        shared.touch();
+        let result = self.send_turn(text, model, retired).await;
+        if result.is_err() {
+            let inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if inner.turn_seq != seq || !self.entry.busy.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.entry.busy.store(false, Ordering::SeqCst);
         }
+        result
+    }
+
+    async fn send_turn(
+        &self,
+        text: &str,
+        model: Option<&str>,
+        retired: bool,
+    ) -> Result<(), AgentError> {
+        let shared = &self.runtime.shared;
 
         // 系统提示里带上能力密钥：模型每次调 zssh 工具都要把它作为 capability 参数。
         let mut body = json!({
@@ -471,9 +506,38 @@ impl OpenCodeConversation {
             body["tools"] = Value::Object(tools);
         }
 
+        if retired {
+            let session_id = create_session(&shared.http).await?;
+            let mut inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if inner.detached || shared.closed.load(Ordering::SeqCst) {
+                return Err(AgentError::Transport("这个对话已经结束".to_string()));
+            }
+            if inner.turn.aborted {
+                return Err(AgentError::Transport("已停止".to_string()));
+            }
+            let mut map = shared
+                .conversations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            map.retain(|_, entry| !Arc::ptr_eq(entry, &self.entry));
+            inner.session_id = session_id.clone();
+            inner.translate = TranslateState::default();
+            inner.retired = false;
+            map.insert(session_id, Arc::clone(&self.entry));
+            // 历史消息还在界面上，但新 session 没有旧上下文，沿用现有提示说明这一点。
+            self.entry.emit(AgentEvent::ResumeFailed);
+        }
+        let session_id = self
+            .entry
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .session_id
+            .clone();
+
         let url = format!(
             "{}/session/{}/prompt_async",
-            shared.http.base_url, self.session_id
+            shared.http.base_url, session_id
         );
         let result = shared
             .http
@@ -488,17 +552,11 @@ impl OpenCodeConversation {
 
         match result {
             Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => {
-                self.entry.busy.store(false, Ordering::SeqCst);
-                Err(AgentError::Transport(format!(
-                    "发送失败：HTTP {}",
-                    resp.status()
-                )))
-            }
-            Err(err) => {
-                self.entry.busy.store(false, Ordering::SeqCst);
-                Err(AgentError::Transport(err.to_string()))
-            }
+            Ok(resp) => Err(AgentError::Transport(format!(
+                "发送失败：HTTP {}",
+                resp.status()
+            ))),
+            Err(err) => Err(AgentError::Transport(err.to_string())),
         }
     }
 }
@@ -506,6 +564,11 @@ impl OpenCodeConversation {
 impl AgentConversation for OpenCodeConversation {
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    fn resume_id(&self) -> Option<String> {
+        let inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (!inner.retired).then(|| inner.session_id.clone())
     }
 
     fn models<'a>(&'a self) -> crate::ssh::BoxFuture<'a, Result<AgentModelCatalog, AgentError>> {
@@ -522,13 +585,15 @@ impl AgentConversation for OpenCodeConversation {
 
     fn stop<'a>(&'a self) -> crate::ssh::BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
-            if !self.entry.busy.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            if let Ok(mut inner) = self.entry.inner.lock() {
+            let session_id = {
+                let mut inner = self.entry.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if !self.entry.busy.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
                 inner.turn.aborted = true;
-            }
-            post_abort(&self.runtime.shared.http, &self.session_id).await
+                inner.session_id.clone()
+            };
+            post_abort(&self.runtime.shared.http, &session_id).await
         })
     }
 
@@ -1251,6 +1316,10 @@ fn handle_event(shared: &Shared, event: &Value) {
     let Ok(mut inner) = conv.inner.lock() else {
         return;
     };
+    // map 查询和拿锁之间可能刚换了 session，或旧 session 已被封存。
+    if inner.retired || inner.detached || inner.session_id != session_id {
+        return;
+    }
     let mut retry_stop_now = false;
     for out in translate_event(event, &mut inner.translate) {
         let mut emit = true;
@@ -1303,6 +1372,7 @@ fn end_turn(conv: &Conversation, inner: &mut ConvInner) -> bool {
     }
     let flags = std::mem::take(&mut inner.turn);
     if let Some(message) = flags.retry_stop {
+        inner.retired = true;
         conv.emit(AgentEvent::Error { message });
     } else if !flags.content && !flags.failed && !flags.aborted {
         conv.emit(AgentEvent::Error {
@@ -1899,6 +1969,9 @@ mod tests {
             Arc::new(Conversation {
                 events: tx,
                 inner: Mutex::new(ConvInner {
+                    session_id: "ses_a".into(),
+                    retired: false,
+                    detached: false,
                     translate: TranslateState::default(),
                     turn: TurnFlags::default(),
                     turn_seq: 0,
@@ -2159,21 +2232,179 @@ mod tests {
         );
     }
 
-    #[test]
-    fn counter_restarts_with_a_new_turn() {
-        let (shared, mut rx) = fake_shared();
+    /// 读完整的 HTTP 请求（头部 + `content-length` 的 body）。只读一次就回的话，body 还没
+    /// 读完就关连接，Windows 会发 RST，客户端偶尔会把成功的响应当成连接错误——上面的测试
+    /// 曾经因此约十次挂一次。
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+            let body_len: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if buf.len() >= header_end + body_len {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn retired_session_recovers_without_reusing_the_old_abort_target() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut release = Some(release_rx);
+            let mut started = Some(abort_tx);
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let wait = if path == "/session/ses_a/abort" {
+                    started.take().unwrap().send(()).unwrap();
+                    release.take()
+                } else {
+                    None
+                };
+                tasks.spawn(async move {
+                    let body = match path.as_str() {
+                        "/session/ses_a/abort" => {
+                            wait.unwrap().await.unwrap();
+                            "false"
+                        }
+                        "/session" => r#"{"id":"ses_new"}"#,
+                        "/session/ses_new/prompt_async" => "{}",
+                        other => panic!("请求不该落到这里：{other}"),
+                    };
+                    let status = if path.ends_with("/abort") { "500 Failed" } else { "200 OK" };
+                    let reply = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.flush().await.unwrap();
+                });
+            }
+            while let Some(task) = tasks.join_next().await {
+                task.unwrap();
+            }
+        });
+        let (mut shared, mut rx) = fake_shared();
+        Arc::get_mut(&mut shared).unwrap().http = test_http(url);
+        let conversation = fake_conversation(Arc::clone(&shared));
+        let shared = &conversation.runtime.shared;
         for attempt in 1..=4 {
-            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+            handle_event(shared, &retry_event(attempt, "Overloaded"));
+        }
+        tokio::time::timeout(Duration::from_secs(3), abort_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drain(&mut rx);
+        // 没有 idle，abort HTTP 也未返回：由兜底结束本轮。
+        let error = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(error, AgentEvent::Error { .. }));
+        assert_eq!(rx.recv().await, Some(AgentEvent::TurnEnd));
+        assert_eq!(conversation.resume_id(), None);
+        conversation.send("继续", None).await.unwrap();
+        assert_eq!(conversation.resume_id().as_deref(), Some("ses_new"));
+        assert_eq!(drain(&mut rx), vec![AgentEvent::ResumeFailed]);
+        handle_event(shared, &text_event("旧正文"));
+        handle_event(shared, &idle_event());
+        assert!(drain(&mut rx).is_empty());
+        assert!(conversation.is_busy());
+        // 中止请求晚到或失败，也只能命中 ses_a。
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fresh = retry_event(1, "Overloaded");
+        fresh["properties"]["sessionID"] = json!("ses_new");
+        handle_event(shared, &fresh);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [AgentEvent::Retrying { attempt: 1, .. }]
+        ));
+        conversation.detach();
+        assert_eq!(shared.conversation_count(), 0);
+    }
+
+    #[test]
+    fn even_a_timely_idle_retires_the_session_before_a_delayed_abort() {
+        let (shared, mut rx) = fake_shared();
+        let conv = conv_of(&shared);
+        conv.inner.lock().unwrap().turn.retry_stop = Some("E".into());
+        handle_event(&shared, &idle_event());
+        assert_eq!(drain(&mut rx).len(), 2);
+        assert!(conv.inner.lock().unwrap().retired);
+        handle_event(&shared, &text_event("旧正文"));
+        handle_event(&shared, &idle_event());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    fn fake_conversation(shared: Arc<Shared>) -> OpenCodeConversation {
+        let entry = conv_of(&shared);
+        OpenCodeConversation {
+            runtime: Arc::new(AgentRuntime {
+                shared,
+                sse_task: Mutex::new(None),
+                shutdown_tx: watch::channel(false).0,
+                idle_task: Mutex::new(None),
+            }),
+            session_id: "ses_a".into(),
+            capability: "test-capability".into(),
+            entry,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_leaves_the_old_session_quarantined_and_can_be_retried() {
+        let (url, _) = canned_http("500 Failed", "{}").await;
+        let (mut shared, mut rx) = fake_shared();
+        Arc::get_mut(&mut shared).unwrap().http = test_http(url);
+        let conversation = fake_conversation(Arc::clone(&shared));
+        {
+            let mut inner = conversation.entry.inner.lock().unwrap();
+            inner.turn.retry_stop = Some("E".into());
+            assert!(end_turn(&conversation.entry, &mut inner));
         }
         drain(&mut rx);
-        // 新回合：第 1~3 次重试照常放行。
-        begin_new_turn(&shared);
-        for attempt in 1..=3 {
-            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        for _ in 0..2 {
+            assert!(conversation.send("继续", None).await.is_err());
+            assert!(!conversation.is_busy());
+            assert_eq!(conversation.resume_id(), None);
+            handle_event(&shared, &text_event("旧正文"));
+            handle_event(&shared, &idle_event());
+            assert!(drain(&mut rx).is_empty());
         }
-        let got = drain(&mut rx);
-        assert_eq!(got.len(), 3);
-        assert!(got.iter().all(|e| matches!(e, AgentEvent::Retrying { .. })));
     }
 
     #[test]
