@@ -20,6 +20,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 
 import { aboutStatusText } from "../../state/updateModel";
+import { useUngroupedFlat } from "../../state/ungroupedFlat";
 import { useUpdater } from "../../stores/updater";
 import UpdateProgress from "../sync/UpdateProgress";
 import NOTICE_TEXT from "../../assets/NOTICE.txt?raw";
@@ -265,11 +266,12 @@ function WindowCard() {
 
 /**
  * 主机树（UI-16）：不显示「未分组」文件夹，不分组的主机直接放在最下面。
- * 和主机树里「重命名「未分组」」设置的是同一项（vault_ungrouped_flat），互不冲突；跟着配置同步。
+ * 显示的是有效值（新用户的本机默认也算，UI-18）；点开关是用户的明确选择，写 vault_ungrouped_flat
+ * （和主机树里「重命名「未分组」」同一项，跟着配置同步），关掉也会真的写下 false。
  */
 function HostTreeCard() {
-  const flat = useSettings((state) => state.vault_ungrouped_flat);
-  const update = useSettings((state) => state.update);
+  const flat = useUngroupedFlat();
+  const setUngroupedFlat = useSettings((state) => state.setUngroupedFlat);
   return (
     <SectionCard title="主机树">
       <SettingRow
@@ -279,7 +281,7 @@ function HostTreeCard() {
         <Switch
           data-testid="ungrouped-flat"
           checked={flat}
-          onCheckedChange={(checked) => void update("vault_ungrouped_flat", checked)}
+          onCheckedChange={(checked) => void setUngroupedFlat(checked)}
         />
       </SettingRow>
     </SectionCard>

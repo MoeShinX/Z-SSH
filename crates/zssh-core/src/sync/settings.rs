@@ -103,6 +103,9 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("layout.vault_density", SyncMode::LocalOnly),
     // 主机页右边按手动 / 最近打开 / 名称排序（UI-16）：本机的使用习惯
     ("layout.vault_sort_mode", SyncMode::LocalOnly),
+    // 主机树「不分组的主机平铺」的本机默认（UI-18）：首次启动按「是不是新用户」判断一次，只存本机，
+    // 不能进同步包（不然几台电脑各判各的、合并时被当成冲突）；用户的明确选择在同步键 vault_ungrouped_flat
+    ("layout.vault_flat_default", SyncMode::LocalOnly),
     // 主机页卡片按最近打开排：每台电脑用的不一样
     ("layout.recent_hosts", SyncMode::LocalOnly),
     ("layout.overview_width", SyncMode::LocalOnly),
@@ -646,6 +649,28 @@ pub fn is_synced(key: &str) -> bool {
     sync_mode(key) == Some(SyncMode::Synced)
 }
 
+/// 主机树平铺的本机默认（UI-18）的键。值是 JSON 字符串。
+pub const VAULT_FLAT_DEFAULT_KEY: &str = "layout.vault_flat_default";
+
+/// [`VAULT_FLAT_DEFAULT_KEY`] 接受的值：空串 = 还没判断，`flat` = 新用户默认平铺，`classic` = 照旧。
+pub const VAULT_FLAT_DEFAULT_VALUES: &[&str] = &["", "flat", "classic"];
+
+/// 检查一个**仅本机**键要写进库的值（`value` 是 JSON 文本）。目前只有 [`VAULT_FLAT_DEFAULT_KEY`] 有规则：
+/// 只接受 [`VAULT_FLAT_DEFAULT_VALUES`] 里的字符串；别的键不检查。
+pub fn validate_local_value(key: &str, value: &str) -> Result<(), String> {
+    if key != VAULT_FLAT_DEFAULT_KEY {
+        return Ok(());
+    }
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::String(text))
+            if VAULT_FLAT_DEFAULT_VALUES.contains(&text.as_str()) =>
+        {
+            Ok(())
+        }
+        _ => Err("只能是空串、flat 或 classic".to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1125,9 +1150,43 @@ mod tests {
         accepts("terminal_highlight_enabled", json!(true));
     }
 
+    /// UI-18：新用户默认平铺只存本机（登记为仅本机、没有同步取值规则），写库时只收三个值。
+    #[test]
+    fn vault_flat_default_is_local_only_and_checks_its_values() {
+        assert_eq!(sync_mode(VAULT_FLAT_DEFAULT_KEY), Some(SyncMode::LocalOnly));
+        assert!(!is_synced(VAULT_FLAT_DEFAULT_KEY));
+        assert!(validate_value(VAULT_FLAT_DEFAULT_KEY, &json!("flat")).is_err());
+        // 会同步的用户明确选择仍然是同步键
+        assert!(is_synced("vault_ungrouped_flat"));
+        for ok in ["\"\"", "\"flat\"", "\"classic\""] {
+            assert!(
+                validate_local_value(VAULT_FLAT_DEFAULT_KEY, ok).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "\"Flat\"",
+            "\"other\"",
+            "true",
+            "1",
+            "null",
+            "flat",
+            "[]",
+            "",
+        ] {
+            assert!(
+                validate_local_value(VAULT_FLAT_DEFAULT_KEY, bad).is_err(),
+                "{bad}"
+            );
+        }
+        // 别的键不检查
+        assert!(validate_local_value("layout.vault_density", "42").is_ok());
+    }
+
     #[test]
     fn machine_specific_settings_are_not_synced() {
         for key in [
+            "layout.vault_flat_default",
             "layout.ai_panel_width",
             "layout.aside_panel_width",
             "layout.sftp_panel_width",

@@ -84,8 +84,8 @@ export default function GroupFormDialog({
       });
       if (adoptUngrouped && ungroupedIds.length > 0) await moveHosts(ungroupedIds, saved.id);
       // 「未分组」改名成功：树里不再有「未分组」这一行，之后不分组的主机直接排在树的根层（UI-14）。
-      // 设置写失败 update 自己会提示并回滚，分组已经建好了，不影响关窗口
-      if (adoptUngrouped) await useSettings.getState().update("vault_ungrouped_flat", true);
+      // 设置写失败 setUngroupedFlat 自己会提示并回滚，分组已经建好了，不影响关窗口
+      if (adoptUngrouped) await useSettings.getState().setUngroupedFlat(true);
       onClose();
     } catch (error: unknown) {
       onError(String(error));

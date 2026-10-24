@@ -109,6 +109,9 @@ export const SETTING_DEFAULTS = {
   "layout.vault_density": "compact",
   // 主机页右边的排序方式（UI-16）：manual 手动（和左边的树一个顺序，默认）/ recent 最近打开 / name 名称；本机布局、不同步
   "layout.vault_sort_mode": "manual",
+  // 主机树「不分组的主机平铺」的本机默认（UI-18）：空 = 还没判断；flat = 新用户默认平铺；classic = 照旧。
+  // 首次启动判断一次（state/ungroupedFlat.ts），只存本机、不同步；用户的明确选择在同步设置 vault_ungrouped_flat
+  "layout.vault_flat_default": "",
   // 最近打开的主机（id，逗号分隔，最近的在前），主机页卡片按它排；本机布局、不同步
   "layout.recent_hosts": "",
   // 服务器概览面板的宽度（拖左边缘调），本机布局、不同步
@@ -184,6 +187,7 @@ export interface SettingValues {
   "layout.vault_view_mode": string;
   "layout.vault_density": string;
   "layout.vault_sort_mode": string;
+  "layout.vault_flat_default": string;
   "layout.recent_hosts": string;
   "layout.overview_width": number;
   quick_commands: string;
@@ -278,8 +282,9 @@ const writesInFlight = new Map<string, number>();
 interface SettingsState extends SettingValues {
   loaded: boolean;
   /**
-   * 库里有没有存过 `vault_ungrouped_flat`（UI-16：只有「没存过」的新用户才按空库默认平铺）。
-   * true = 存过；false = 没存过；null = 读库出错、不知道（这时什么都不决定）。不存库。
+   * 库里有没有存过 `vault_ungrouped_flat`（用户的明确选择，同步过来的也算）。UI-18：存过就用它，
+   * 没存过就看本机默认 `layout.vault_flat_default`（见 state/ungroupedFlat.ts 的 effectiveUngroupedFlat）。
+   * true = 存过；false = 没存过；null = 读库出错、不知道（这时不判断本机默认）。不存库。
    */
   ungroupedFlatStored: boolean | null;
   /** 系统现在是不是深色模式（主题选"系统"时用；不存库）。 */
@@ -293,7 +298,15 @@ interface SettingsState extends SettingValues {
   update: <K extends SettingKey>(
     key: K,
     value: SettingValue<K>,
+    /** 值没变也照样写库（让库里有这一项）。只有 setUngroupedFlat 用。 */
+    force?: boolean,
   ) => Promise<boolean>;
+  /**
+   * 用户明确选择「不分组的主机平铺」开 / 关（设置页的开关、重命名「未分组」）：写同步键
+   * `vault_ungrouped_flat`，关掉也一定落库（即使和代码默认值一样），并马上让它成为生效值。
+   * 写失败回滚到原来的状态，返回有没有保存成功。
+   */
+  setUngroupedFlat: (value: boolean) => Promise<boolean>;
 }
 
 /** 外观相关的设置：改了要重新套一次配色。 */
@@ -341,10 +354,10 @@ export const useSettings = create<SettingsState>((set, get) => ({
     if (upgraded !== null) void get().update("terminal_highlight_rules", upgraded);
   },
 
-  update: (key, value) => {
+  update: (key, value, force = false) => {
     const inFlight = writesInFlight.get(key) ?? 0;
-    // 界面、数据库、没有待写入，三者都已经是这个值：什么都不用做。
-    if (inFlight === 0 && get()[key] === value && confirmed[key] === value) {
+    // 界面、数据库、没有待写入，三者都已经是这个值：什么都不用做（force 除外）。
+    if (!force && inFlight === 0 && get()[key] === value && confirmed[key] === value) {
       return Promise.resolve(true);
     }
     set({ [key]: value } as Partial<SettingsState>);
@@ -380,6 +393,15 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const next = (writeChains.get(key) ?? Promise.resolve()).then(run);
     writeChains.set(key, next);
     return next;
+  },
+
+  setUngroupedFlat: async (value) => {
+    const wasStored = get().ungroupedFlatStored;
+    // 先标成「存过」，生效值马上改用这一项；写失败再退回去
+    set({ ungroupedFlatStored: true });
+    const saved = await get().update("vault_ungrouped_flat", value, true);
+    if (!saved && wasStored !== true) set({ ungroupedFlatStored: wasStored });
+    return saved;
   },
 }));
 

@@ -19,7 +19,7 @@ afterEach(cleanup);
 
 beforeEach(() => {
   vi.mocked(settingsSet).mockClear();
-  useSettings.setState({ vault_ungrouped_flat: false });
+  useSettings.setState({ vault_ungrouped_flat: false, ungroupedFlatStored: false });
 });
 
 const host = (id: number, group_id: number | null) => ({ id, group_id, name: `h${id}` }) as unknown as Host;
@@ -50,6 +50,8 @@ describe("重命名「未分组」", () => {
     await act(async () => fireEvent.click(screen.getByText("保存")));
     expect(useSettings.getState().vault_ungrouped_flat).toBe(true);
     expect(settingsSet).toHaveBeenCalledWith("vault_ungrouped_flat", "true");
+    // 存进库以后马上按这一项生效
+    expect(useSettings.getState().ungroupedFlatStored).toBe(true);
   });
 
   it("没有未分组主机时重命名同样把开关设成 true", async () => {

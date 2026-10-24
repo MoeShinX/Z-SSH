@@ -982,6 +982,23 @@ fn default_proxy_setting_roundtrips() {
 }
 
 #[test]
+fn vault_flat_default_only_accepts_its_three_values() {
+    let db = memory_db();
+    let key = crate::sync::settings::VAULT_FLAT_DEFAULT_KEY;
+    for ok in ["\"\"", "\"flat\"", "\"classic\""] {
+        db.setting_set(key, ok).expect("合格的值能写");
+        assert_eq!(db.setting_get(key).expect("读回来").as_deref(), Some(ok));
+    }
+    assert!(db.setting_set(key, "\"nope\"").is_err());
+    assert!(db.setting_set(key, "true").is_err());
+    // 坏值没写进去
+    assert_eq!(
+        db.setting_get(key).expect("读回来").as_deref(),
+        Some("\"classic\"")
+    );
+}
+
+#[test]
 fn ai_exec_mode_defaults_to_manual_and_roundtrips() {
     let db = memory_db();
     assert_eq!(db.ai_exec_mode().expect("读默认模式"), "manual");

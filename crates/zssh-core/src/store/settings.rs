@@ -65,6 +65,9 @@ impl Database {
 
     /// 写一个设置项。
     pub fn setting_set(&self, key: &str, value: &str) -> Result<(), ZsshError> {
+        crate::sync::settings::validate_local_value(key, value).map_err(|reason| {
+            ZsshError::InvalidInput(format!("设置 {key} 的值不合格：{reason}"))
+        })?;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2) \
