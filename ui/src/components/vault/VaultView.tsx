@@ -120,7 +120,6 @@ interface VaultViewProps {
   onDeleteGroup: (group: Group) => void;
   onDeleteHost: (host: Host) => void;
   /** 打开凭据 / 代理面板 */
-  onOpenIdentities: () => void;
   onOpenProxies: () => void;
   /** 打开端口转发面板；带主机 ID 时只看这台 */
   onOpenForwards: (hostId: number | null) => void;
@@ -147,7 +146,6 @@ export default function VaultView({
   onEditGroup,
   onDeleteGroup,
   onDeleteHost,
-  onOpenIdentities,
   onOpenProxies,
   onOpenForwards,
   onNotice,
@@ -326,9 +324,6 @@ export default function VaultView({
               <ArrowUpDown size={14} />
               {SORT_LABELS[sortMode]}
             </button>
-            <Button variant="outline" size="sm" className="h-8 px-2.5 text-[13px]" onClick={onOpenIdentities}>
-              <KeyRound size={13} /> 凭据
-            </Button>
             <Button variant="outline" size="sm" className="h-8 px-2.5 text-[13px]" onClick={onOpenProxies}>
               <Network size={13} /> 代理
             </Button>

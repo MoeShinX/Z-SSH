@@ -2949,6 +2949,10 @@ export default function App() {
         onSftpDragHover={handleSftpDragHover}
         editorDirty={(editId) => dirtyEditIds.includes(editId)}
         sftpOpen={sftpDockOpen}
+        keychainOpen={sidePanel === "identities"}
+        onToggleKeychain={() =>
+          setSidePanel((current) => (current === "identities" ? "none" : "identities"))
+        }
         onToggleSftp={() => {
           if (view !== "terminal" || !activeTab || activeTab.sftp) {
             toast.info("文件面板只在终端标签下可用");
@@ -3003,7 +3007,6 @@ export default function App() {
               onDeleteHost={askDeleteHost}
               // 主机详情正在编辑时打开凭据 / 代理面板：不关主机详情，只把它藏到下面
               // （见下面 after 里的 hidden），关掉面板回来时没保存的编辑还在。
-              onOpenIdentities={() => setSidePanel("identities")}
               onOpenProxies={() => setSidePanel("proxies")}
               onOpenForwards={(hostId) => {
                 setForwardHostId(hostId);

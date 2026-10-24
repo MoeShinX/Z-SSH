@@ -18,20 +18,21 @@ import {
   FileText,
   FolderOpen,
   FolderTree,
+  KeyRound,
   LayoutGrid,
   Minus,
+  Palette,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelTop,
-  Palette,
   Plus,
   RotateCw,
   Settings,
   Square,
   SquarePen,
   Trash2,
-  X,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -79,6 +80,9 @@ interface TopTabsProps {
   onToggleAI: () => void;
   /** SFTP 面板（"文件"按钮）是否展开（M3-3）。 */
   sftpOpen: boolean;
+  /** 右上角的凭据按钮：打开 / 关上凭据面板。 */
+  keychainOpen?: boolean;
+  onToggleKeychain?: () => void;
   onToggleSftp: () => void;
   /** 终端底部的快捷命令栏开着没有。 */
   quickBarOpen?: boolean;
@@ -121,6 +125,8 @@ export default function TopTabs({
   onToggleAI,
   sftpOpen,
   onToggleSftp,
+  keychainOpen = false,
+  onToggleKeychain,
   quickBarOpen = false,
   onToggleQuickBar,
   composeBarOpen = false,
@@ -453,6 +459,25 @@ export default function TopTabs({
             </TooltipTrigger>
             <TooltipContent>文件 (Ctrl+Shift+F)</TooltipContent>
           </Tooltip>
+          {onToggleKeychain && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  data-tauri-drag-region={false}
+                  data-action="toggle-keychain"
+                  title="凭据"
+                  onClick={onToggleKeychain}
+                  className={cn(
+                    "top-tab-utility-btn mb-1 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md",
+                    keychainOpen && "bg-foreground/10 text-foreground",
+                  )}
+                >
+                  <KeyRound size={16} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>凭据（密码、私钥）</TooltipContent>
+            </Tooltip>
+          )}
           {onToggleQuickBar && (
             <Tooltip>
               <TooltipTrigger asChild>

@@ -129,7 +129,6 @@ describe("主机树宽度", () => {
         onEditGroup={noop}
         onDeleteGroup={noop}
         onDeleteHost={noop}
-        onOpenIdentities={noop}
         onOpenProxies={noop}
         onOpenForwards={noop}
         onNotice={noop}

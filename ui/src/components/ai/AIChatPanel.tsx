@@ -1673,7 +1673,7 @@ const TextMessage = memo(function TextMessage({
   if (kind === "user") {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground">
+        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground">
           {text}
         </div>
       </div>

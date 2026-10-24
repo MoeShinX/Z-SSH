@@ -45,7 +45,6 @@ const props = () => ({
   onEditGroup: vi.fn(),
   onDeleteGroup: vi.fn(),
   onDeleteHost: vi.fn(),
-  onOpenIdentities: vi.fn(),
   onOpenProxies: vi.fn(),
   onOpenForwards: vi.fn(),
   onNotice: vi.fn(),

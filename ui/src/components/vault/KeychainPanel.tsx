@@ -13,6 +13,7 @@ import {
   AsidePanelSection,
 } from "../ui/aside-panel";
 import { Badge } from "../ui/badge";
+import { pickKeyFile } from "../../api/dialog";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -245,13 +246,27 @@ export default function KeychainPanel({ onClose, onError }: KeychainPanelProps) 
             {kind === "key_file" && (
               <div className="space-y-1.5">
                 <Label>私钥文件路径</Label>
-                <Input
-                  value={keyPath}
-                  onChange={(event) => setKeyPath(event.target.value)}
-                  className="h-9 font-mono text-xs"
-                  placeholder="C:\\Users\\me\\.ssh\\id_ed25519"
-                  spellCheck={false}
-                />
+                <div className="flex gap-1.5">
+                  <Input
+                    value={keyPath}
+                    onChange={(event) => setKeyPath(event.target.value)}
+                    className="h-9 font-mono text-xs"
+                    placeholder="C:\\Users\\me\\.ssh\\id_ed25519"
+                    spellCheck={false}
+                  />
+                  <Button
+                    variant="outline"
+                    className="h-9 shrink-0"
+                    disabled={busy}
+                    onClick={() => {
+                      void pickKeyFile().then((picked) => {
+                        if (picked) setKeyPath(picked);
+                      });
+                    }}
+                  >
+                    浏览…
+                  </Button>
+                </div>
               </div>
             )}
             {kind === "key_inline" && (

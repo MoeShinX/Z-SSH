@@ -53,7 +53,10 @@ export const useVault = create<VaultState>((set, get) => ({
       api.listIdentities(),
       api.listProxies(),
     ]);
-    // 列表、树、下拉框都用这份顺序：数字 → 英文 → 中文 → 其他符号（见 compareNames）
+    // 凭据按创建时间倒序（本机的自增 id 就是本机的创建顺序）：新建的在最上面，方便接着编辑；
+    // 凭据面板、主机详情的凭据下拉框都用这份顺序
+    identities.sort((a, b) => b.id - a.id);
+    // 主机和分组：列表、树、下拉框都用这份顺序：数字 → 英文 → 中文 → 其他符号（见 compareNames）
     groups.sort((a, b) => compareNames(a.name, b.name));
     hosts.sort((a, b) => compareNames(a.name, b.name));
     set({ groups, hosts, identities, proxies, loaded: true });

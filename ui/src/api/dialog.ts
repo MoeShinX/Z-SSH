@@ -21,6 +21,12 @@ export async function pickBackupFile(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
+/** 选一个私钥文件（不做扩展名过滤：私钥多半没有后缀，比如 id_ed25519）；取消返回 null。 */
+export async function pickKeyFile(): Promise<string | null> {
+  const picked = await open({ multiple: false, directory: false, title: "选择私钥文件" });
+  return typeof picked === "string" ? picked : null;
+}
+
 /** 选离线备份的保存位置；取消返回 null。 */
 export async function pickBackupSavePath(defaultName: string): Promise<string | null> {
   return save({ defaultPath: defaultName, filters: BACKUP_FILTERS });
