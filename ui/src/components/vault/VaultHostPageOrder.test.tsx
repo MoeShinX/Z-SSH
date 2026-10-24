@@ -215,6 +215,28 @@ for (const layout of ["grid", "list"] as const) {
       expect(dropLines().length).toBe(0);
     });
 
+    it("拖动时整张卡片的影子跟着指针走，原来那张变淡；松手后都还原", async () => {
+      render(<VaultView {...props()} />);
+      const source = item("a3");
+      const sourceName = source.querySelector(".truncate")?.textContent;
+      const restore = await dragOver(source, item("a1"), ...before);
+      try {
+        const card = document.querySelector('[data-section="host-drag-card"]') as HTMLElement;
+        expect(card).not.toBeNull();
+        // 影子是卡片的样子（有主机名），而且不带 data-* 属性，不会和真的卡片混淆
+        expect(card.textContent).toContain(sourceName);
+        expect(card.querySelector("[data-page-host], [data-section=host-card], [data-section=host-row]")).toBeNull();
+        expect(source.style.opacity).toBe("0.35");
+        // 小标签还在，挂在影子下面
+        expect(document.querySelector('[data-section="host-drag-ghost"]')).not.toBeNull();
+        await release();
+      } finally {
+        restore();
+      }
+      expect(document.querySelector('[data-section="host-drag-card"]')).toBeNull();
+      expect(source.style.opacity).toBe("");
+    });
+
     it("后半：插到它后面", async () => {
       render(<VaultView {...props()} />);
       const target = item("a1");

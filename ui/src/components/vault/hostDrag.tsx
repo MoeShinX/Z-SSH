@@ -41,6 +41,17 @@ export interface InsertMark {
   scope?: "page";
 }
 
+/** 拖右边的卡片 / 行时跟着指针走的「影子」：把整张卡片的样子复制一份。 */
+interface DragGhostInfo {
+  /** 卡片的 HTML（已去掉 data-* 等属性，免得和真的卡片混淆）。 */
+  html: string;
+  width: number;
+  height: number;
+  /** 按下的位置相对卡片左上角的偏移，影子按同样的位置抓在指针下。 */
+  offsetX: number;
+  offsetY: number;
+}
+
 interface DragState {
   kind: "host" | "group";
   id: number;
@@ -51,6 +62,8 @@ interface DragState {
   over: DropGroup | undefined;
   /** 指针下面的排序插入位置；null = 不在排序目标上 */
   insert: InsertMark | null;
+  /** 拖的是右边的卡片 / 行时才有：跟着指针走的卡片影子。 */
+  ghost?: DragGhostInfo | null;
 }
 
 export const useHostDrag = create<{ drag: DragState | null }>(() => ({ drag: null }));
@@ -165,10 +178,34 @@ export function resetModeHintForTests() {
   modeHintShown = false;
 }
 
+/** 复制一张卡片的样子给拖动用：去掉所有 data-* / id / tabindex，免得和真的卡片混淆。 */
+function makeCardGhost(source: HTMLElement, start: { x: number; y: number }): DragGhostInfo {
+  const rect = source.getBoundingClientRect();
+  const clone = source.cloneNode(true) as HTMLElement;
+  const strip = (el: Element) => {
+    for (const name of el.getAttributeNames()) {
+      if (name.startsWith("data-") || name === "id" || name === "tabindex") el.removeAttribute(name);
+    }
+  };
+  strip(clone);
+  clone.querySelectorAll("*").forEach(strip);
+  clone.style.opacity = "";
+  return {
+    html: clone.outerHTML,
+    width: rect.width,
+    height: rect.height,
+    offsetX: start.x - rect.left,
+    offsetY: start.y - rect.top,
+  };
+}
+
 /** 按下鼠标后：拖过门槛才算拖，不然就是普通单击 / 双击。 */
 function beginDrag(spec: DragSpec, event: React.PointerEvent) {
   const start = { x: event.clientX, y: event.clientY };
+  const source = event.currentTarget as HTMLElement;
   let active = false;
+  let ghost: DragGhostInfo | null = null;
+  let sourceOpacity: string | null = null;
   let probed: Probe = { over: undefined, insert: null };
 
   const move = (e: PointerEvent) => {
@@ -176,6 +213,12 @@ function beginDrag(spec: DragSpec, event: React.PointerEvent) {
       if (Math.hypot(e.clientX - start.x, e.clientY - start.y) < DRAG_THRESHOLD) return;
       active = true;
       document.body.classList.add("zz-host-dragging");
+      // 右边的卡片 / 行：整张卡片的影子跟着指针走，原来的那张变淡留在原地
+      if (spec.kind === "host" && source.hasAttribute?.("data-page-host")) {
+        ghost = makeCardGhost(source, start);
+        sourceOpacity = source.style.opacity;
+        source.style.opacity = "0.35";
+      }
     }
     probed = spec.probe(document.elementFromPoint(e.clientX, e.clientY), e.clientY, e.clientX);
     useHostDrag.setState({
@@ -187,6 +230,7 @@ function beginDrag(spec: DragSpec, event: React.PointerEvent) {
         y: e.clientY,
         over: probed.over,
         insert: probed.insert,
+        ghost,
       },
     });
   };
@@ -197,6 +241,7 @@ function beginDrag(spec: DragSpec, event: React.PointerEvent) {
     window.removeEventListener("keydown", key, true);
     if (!active) return;
     document.body.classList.remove("zz-host-dragging");
+    if (sourceOpacity !== null) source.style.opacity = sourceOpacity;
     useHostDrag.setState({ drag: null });
     suppressClick = true;
     window.setTimeout(() => (suppressClick = false), 0);
@@ -367,14 +412,36 @@ export function HostDragGhost() {
           : (groups.find((group) => group.id === drag.over)?.name ?? null);
     text = name ? `${drag.label} → ${name}` : `${drag.label}（拖到左边的分组上）`;
   }
+  const card = drag.ghost;
   return (
-    <div
-      data-section="host-drag-ghost"
-      className="pointer-events-none fixed z-[300000] flex items-center gap-1.5 rounded-md border border-primary/60 bg-background/95 px-2 py-1 text-xs shadow-lg"
-      style={{ left: drag.x + 12, top: drag.y + 8 }}
-    >
-      <Icon size={12} className="text-muted-foreground" />
-      {text}
-    </div>
+    <>
+      {card && (
+        <div
+          data-section="host-drag-card"
+          aria-hidden="true"
+          className="pointer-events-none fixed z-[300000] overflow-hidden rounded-lg opacity-90 shadow-xl ring-1 ring-primary/60 [&>*]:h-full [&>*]:w-full"
+          style={{
+            left: drag.x - card.offsetX,
+            top: drag.y - card.offsetY,
+            width: card.width,
+            height: card.height,
+          }}
+          dangerouslySetInnerHTML={{ __html: card.html }}
+        />
+      )}
+      <div
+        data-section="host-drag-ghost"
+        className="pointer-events-none fixed z-[300001] flex items-center gap-1.5 rounded-md border border-primary/60 bg-background/95 px-2 py-1 text-xs shadow-lg"
+        // 有卡片影子时，提示小标签挂在影子下面，不盖住它
+        style={
+          card
+            ? { left: drag.x - card.offsetX, top: drag.y - card.offsetY + card.height + 6 }
+            : { left: drag.x + 12, top: drag.y + 8 }
+        }
+      >
+        <Icon size={12} className="text-muted-foreground" />
+        {text}
+      </div>
+    </>
   );
 }
