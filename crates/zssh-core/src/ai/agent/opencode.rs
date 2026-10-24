@@ -50,6 +50,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EMPTY_RESPONSE_HINT: &str =
     "opencode 没有返回任何内容。请在终端运行 opencode 完成登录和模型配置，然后再试。";
 
+/// 同一回合里最多放行几次 opencode 的自动重试；第 4 次重试状态（attempt >= 4，说明第 3 次
+/// 重试也失败了）一到就停掉这一轮。
+const MAX_RETRIES: u32 = 3;
+
+/// 因重试超限而停止时，等 opencode 自己收尾（发 idle）的宽限；到点还没收到就由我们收尾。
+const RETRY_STOP_GRACE: Duration = Duration::from_millis(1500);
+
+/// 这条重试状态是否已经超过放行次数。
+fn retry_limit_reached(attempt: u32) -> bool {
+    attempt > MAX_RETRIES
+}
+
+/// 重试超限时给用户的错误文字（`reason` 是已经友好化的原因）。
+fn retry_limit_message(reason: &str) -> String {
+    format!("重试了 {MAX_RETRIES} 次仍然失败：{reason}。已停止这一轮，可以稍后再试或换一个模型。")
+}
+
 /// 启动参数（进程级：所有对话共用）。
 pub struct StartOptions {
     /// 找到的 opencode 安装。
@@ -76,6 +93,7 @@ pub struct AgentRuntime {
 }
 
 /// HTTP 连接信息（进程级）。
+#[derive(Clone)]
 struct Http {
     base_url: String,
     /// Basic 鉴权的 header 值（`Basic xxx`）。
@@ -113,6 +131,8 @@ struct Conversation {
 struct ConvInner {
     translate: TranslateState,
     turn: TurnFlags,
+    /// 回合序号（每次发消息加一）：延时收尾任务靠它确认还是同一个回合，别误伤下一回合。
+    turn_seq: u64,
 }
 
 /// 当前回合的状态。
@@ -122,8 +142,11 @@ struct TurnFlags {
     content: bool,
     /// 这个回合出过错。
     failed: bool,
-    /// 用户点了停止。
+    /// 用户点了停止（重试超限而停止时也置位：走的是同一条停止路径）。
     aborted: bool,
+    /// 重试超限被我们停掉：收尾时先发这条错误再发 TurnEnd，并吞掉随后 abort 带来的
+    /// `session.error`（MessageAbortedError），免得用户看到第二条莫名其妙的错误。
+    retry_stop: Option<String>,
 }
 
 impl Conversation {
@@ -333,6 +356,7 @@ impl AgentRuntime {
             inner: Mutex::new(ConvInner {
                 translate: TranslateState::default(),
                 turn: TurnFlags::default(),
+                turn_seq: 0,
             }),
             busy: AtomicBool::new(false),
         });
@@ -428,6 +452,7 @@ impl OpenCodeConversation {
         shared.touch();
         if let Ok(mut inner) = self.entry.inner.lock() {
             inner.turn = TurnFlags::default();
+            inner.turn_seq += 1;
         }
 
         // 系统提示里带上能力密钥：模型每次调 zssh 工具都要把它作为 capability 参数。
@@ -519,25 +544,7 @@ impl AgentConversation for OpenCodeConversation {
             if let Ok(mut inner) = self.entry.inner.lock() {
                 inner.turn.aborted = true;
             }
-            let shared = &self.runtime.shared;
-            let url = format!("{}/session/{}/abort", shared.http.base_url, self.session_id);
-            let resp = shared
-                .http
-                .client
-                .post(url)
-                .query(&[("directory", shared.http.directory.as_str())])
-                .header("Authorization", &shared.http.auth_header)
-                .timeout(REQUEST_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| AgentError::Transport(e.to_string()))?;
-            if !resp.status().is_success() {
-                return Err(AgentError::Transport(format!(
-                    "停止回合失败：HTTP {}",
-                    resp.status()
-                )));
-            }
-            Ok(())
+            post_abort(&self.runtime.shared.http, &self.session_id).await
         })
     }
 
@@ -545,6 +552,27 @@ impl AgentConversation for OpenCodeConversation {
     fn shutdown<'a>(&'a self) -> crate::ssh::BoxFuture<'a, ()> {
         Box::pin(async move { self.detach() })
     }
+}
+
+/// 通知 opencode 中止这个会话当前的回合（用户点「停止」和重试超限自动停止共用这一条）。
+async fn post_abort(http: &Http, session_id: &str) -> Result<(), AgentError> {
+    let url = format!("{}/session/{}/abort", http.base_url, session_id);
+    let resp = http
+        .client
+        .post(url)
+        .query(&[("directory", http.directory.as_str())])
+        .header("Authorization", &http.auth_header)
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| AgentError::Transport(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(AgentError::Transport(format!(
+            "停止回合失败：HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(())
 }
 
 impl Drop for OpenCodeConversation {
@@ -1239,26 +1267,38 @@ fn handle_event(shared: &Shared, event: &Value) {
     let Ok(mut inner) = conv.inner.lock() else {
         return;
     };
+    let mut retry_stop_now = false;
     for out in translate_event(event, &mut inner.translate) {
         let mut emit = true;
         match &out {
             AgentEvent::TextDelta { .. } | AgentEvent::ToolStart { .. } => {
                 inner.turn.content = true
             }
-            AgentEvent::Error { .. } => inner.turn.failed = true,
-            AgentEvent::TurnEnd => {
-                // 只有正在跑的回合才收尾（防止多余的 idle 产生假「空回复」）。
-                if !conv.busy.load(Ordering::SeqCst) {
+            AgentEvent::Error { .. } => {
+                // 重试超限已经由我们停掉了：随后 abort 带来的 session.error 不再重复报。
+                if inner.turn.retry_stop.is_some() {
                     emit = false;
                 } else {
-                    conv.busy.store(false, Ordering::SeqCst);
-                    let flags = std::mem::take(&mut inner.turn);
-                    if !flags.content && !flags.failed && !flags.aborted {
-                        conv.emit(AgentEvent::Error {
-                            message: EMPTY_RESPONSE_HINT.to_string(),
-                        });
-                    }
+                    inner.turn.failed = true;
                 }
+            }
+            AgentEvent::Retrying {
+                attempt, reason, ..
+            } => {
+                // 回合不在跑 / 已被停止（用户点停止，或已经因超限停掉）时晚到的重试状态：忽略。
+                if !conv.busy.load(Ordering::SeqCst) || inner.turn.aborted {
+                    emit = false;
+                } else if retry_limit_reached(*attempt) {
+                    // 第 3 次重试也失败了：这条不给界面看，直接停掉这一轮。
+                    emit = false;
+                    inner.turn.aborted = true;
+                    inner.turn.retry_stop = Some(retry_limit_message(reason));
+                    retry_stop_now = true;
+                }
+            }
+            AgentEvent::TurnEnd => {
+                // 只有正在跑的回合才收尾（防止多余的 idle 产生假「空回复」）。
+                emit = end_turn(&conv, &mut inner);
             }
             _ => {}
         }
@@ -1266,6 +1306,65 @@ fn handle_event(shared: &Shared, event: &Value) {
             conv.emit(out);
         }
     }
+    if retry_stop_now {
+        stop_after_retry_limit(shared, session_id, &conv, &mut inner);
+    }
+}
+
+/// 回合收尾的共用部分：清掉「在跑」标记、按需先发一条错误提示。返回 false = 本来就没有
+/// 回合在跑（调用方不要再发 TurnEnd）。
+fn end_turn(conv: &Conversation, inner: &mut ConvInner) -> bool {
+    if !conv.busy.swap(false, Ordering::SeqCst) {
+        return false;
+    }
+    let flags = std::mem::take(&mut inner.turn);
+    if let Some(message) = flags.retry_stop {
+        conv.emit(AgentEvent::Error { message });
+    } else if !flags.content && !flags.failed && !flags.aborted {
+        conv.emit(AgentEvent::Error {
+            message: EMPTY_RESPONSE_HINT.to_string(),
+        });
+    }
+    true
+}
+
+/// 重试超限：走和用户点「停止」同一条中止路径（`post_abort`），并保证这一回合一定收尾。
+///
+/// 正常情况下 opencode 中止后会自己发 `session.idle`，由 [`end_turn`] 先发错误再发 TurnEnd；
+/// 万一它没发（中止请求失败、事件丢了），宽限期过后由我们收尾；如果当前没有 tokio
+/// 运行时可用，就立刻收尾。
+fn stop_after_retry_limit(
+    shared: &Shared,
+    session_id: &str,
+    conv: &Arc<Conversation>,
+    inner: &mut ConvInner,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if end_turn(conv, inner) {
+            conv.emit(AgentEvent::TurnEnd);
+        }
+        return;
+    };
+    let http = shared.http.clone();
+    let session_id = session_id.to_string();
+    let conv = Arc::clone(conv);
+    let seq = inner.turn_seq;
+    // 中止请求单独发，不占宽限期：它慢或失败都不影响下面的兜底收尾。
+    handle.spawn(async move {
+        if let Err(err) = post_abort(&http, &session_id).await {
+            tracing::warn!(error = %err, "重试超限后中止回合失败");
+        }
+    });
+    handle.spawn(async move {
+        tokio::time::sleep(RETRY_STOP_GRACE).await;
+        let Ok(mut inner) = conv.inner.lock() else {
+            return;
+        };
+        // 还是同一个回合、且还没收尾，才由我们收尾。
+        if inner.turn_seq == seq && end_turn(&conv, &mut inner) {
+            conv.emit(AgentEvent::TurnEnd);
+        }
+    });
 }
 
 fn event_session_id(event: &Value) -> Option<&str> {
@@ -1818,6 +1917,7 @@ mod tests {
                 inner: Mutex::new(ConvInner {
                     translate: TranslateState::default(),
                     turn: TurnFlags::default(),
+                    turn_seq: 0,
                 }),
                 busy: AtomicBool::new(true),
             }),
@@ -1903,5 +2003,235 @@ mod tests {
             "有回合在跑不该关进程"
         );
         handle.abort();
+    }
+
+    fn retry_event(attempt: u64, message: &str) -> Value {
+        json!({
+            "type": "session.status",
+            "properties": {
+                "sessionID": "ses_a",
+                "status": {"type": "retry", "attempt": attempt, "message": message, "next": Value::Null}
+            }
+        })
+    }
+
+    fn text_event(delta: &str) -> Value {
+        json!({
+            "type": "message.part.delta",
+            "properties": {"sessionID": "ses_a", "partID": "prt_1", "field": "text", "delta": delta}
+        })
+    }
+
+    fn idle_event() -> Value {
+        json!({"type": "session.idle", "properties": {"sessionID": "ses_a"}})
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn conv_of(shared: &Shared) -> Arc<Conversation> {
+        shared.conversation("ses_a").unwrap()
+    }
+
+    /// 模拟 send_inner 开新回合：重置标记、回合序号加一、置「在跑」。
+    fn begin_new_turn(shared: &Shared) {
+        let conv = conv_of(shared);
+        {
+            let mut inner = conv.inner.lock().unwrap();
+            inner.turn = TurnFlags::default();
+            inner.turn_seq += 1;
+        }
+        conv.busy.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn retry_limit_pure_logic() {
+        assert!(!retry_limit_reached(1));
+        assert!(!retry_limit_reached(3));
+        assert!(retry_limit_reached(4));
+        assert!(retry_limit_reached(9));
+        let msg = retry_limit_message("请求太频繁，被服务商限流了");
+        assert!(msg.starts_with("重试了 3 次仍然失败：请求太频繁，被服务商限流了。"));
+        assert!(msg.contains("已停止这一轮"));
+    }
+
+    #[test]
+    fn retries_one_to_three_pass_through_to_the_ui() {
+        let (shared, mut rx) = fake_shared();
+        for attempt in 1..=3 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3);
+        for (i, ev) in got.iter().enumerate() {
+            match ev {
+                AgentEvent::Retrying {
+                    attempt, reason, ..
+                } => {
+                    assert_eq!(*attempt as usize, i + 1);
+                    assert_eq!(reason, "服务商那边暂时忙不过来");
+                }
+                other => panic!("该是 Retrying，得到 {other:?}"),
+            }
+        }
+        assert!(
+            conv_of(&shared).busy.load(Ordering::SeqCst),
+            "放行阶段回合还在跑"
+        );
+    }
+
+    #[test]
+    fn fourth_retry_stops_the_turn_and_ends_it_cleanly_without_a_runtime() {
+        // 没有 tokio 运行时：没法发中止请求，直接收尾，界面也不会卡在「思考中」。
+        let (shared, mut rx) = fake_shared();
+        for attempt in 1..=4 {
+            handle_event(
+                &shared,
+                &retry_event(attempt, "Free usage exceeded, subscribe to Go"),
+            );
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 5, "3 条重试 + 错误 + 收尾: {got:?}");
+        assert!(got[..3]
+            .iter()
+            .all(|e| matches!(e, AgentEvent::Retrying { .. })));
+        match &got[3] {
+            AgentEvent::Error { message } => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+                assert!(message.contains("免费额度用完了"), "{message}");
+                assert!(message.contains("已停止这一轮"), "{message}");
+            }
+            other => panic!("该是 Error，得到 {other:?}"),
+        }
+        assert_eq!(got[4], AgentEvent::TurnEnd);
+        assert!(!conv_of(&shared).busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fourth_retry_aborts_then_idle_ends_turn_with_error_before_turn_end() {
+        let (shared, mut rx) = fake_shared();
+        for attempt in 1..=4 {
+            handle_event(&shared, &retry_event(attempt, "Rate limit reached"));
+        }
+        // 超限这一刻只放行了前 3 条，错误要等收尾时才发。
+        assert_eq!(drain(&mut rx).len(), 3);
+        // abort 带来的 session.error 要被吞掉。
+        handle_event(
+            &shared,
+            &json!({"type": "session.error", "properties": {"sessionID": "ses_a",
+                "error": {"name": "MessageAbortedError", "data": {"message": "aborted"}}}}),
+        );
+        assert!(drain(&mut rx).is_empty());
+        // opencode 中止后发 idle：先错误后收尾，各一次。
+        handle_event(&shared, &idle_event());
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(matches!(&got[0], AgentEvent::Error { message } if message.contains("请求太频繁")));
+        assert_eq!(got[1], AgentEvent::TurnEnd);
+        // 宽限期过后兜底收尾不能重复发。
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty(), "兜底收尾不该重复");
+    }
+
+    #[tokio::test]
+    async fn fourth_retry_falls_back_to_our_own_turn_end_when_no_idle_arrives() {
+        let (shared, mut rx) = fake_shared();
+        for attempt in 1..=4 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        assert_eq!(drain(&mut rx).len(), 3);
+        // 一直没有 idle：宽限期后由我们补 Error + TurnEnd。
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(1500)).await;
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            matches!(&got[0], AgentEvent::Error { message } if message.contains("暂时忙不过来"))
+        );
+        assert_eq!(got[1], AgentEvent::TurnEnd);
+        assert!(!conv_of(&shared).busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fallback_does_not_touch_a_newer_turn() {
+        let (shared, mut rx) = fake_shared();
+        for attempt in 1..=4 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        drain(&mut rx);
+        // 宽限期内 idle 收尾，随后用户马上开了新回合。
+        handle_event(&shared, &idle_event());
+        drain(&mut rx);
+        begin_new_turn(&shared);
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty());
+        assert!(
+            conv_of(&shared).busy.load(Ordering::SeqCst),
+            "新回合不能被旧的兜底收尾结束"
+        );
+    }
+
+    #[test]
+    fn counter_restarts_with_a_new_turn() {
+        let (shared, mut rx) = fake_shared();
+        for attempt in 1..=4 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        drain(&mut rx);
+        // 新回合：第 1~3 次重试照常放行。
+        begin_new_turn(&shared);
+        for attempt in 1..=3 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|e| matches!(e, AgentEvent::Retrying { .. })));
+    }
+
+    #[test]
+    fn late_retry_after_user_stop_or_turn_end_is_ignored() {
+        // 用户点了停止：之后晚到的重试（包括第 4 次）不放行、不报错、不收尾。
+        let (shared, mut rx) = fake_shared();
+        conv_of(&shared).inner.lock().unwrap().turn.aborted = true;
+        for attempt in 1..=5 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(conv_of(&shared).busy.load(Ordering::SeqCst));
+
+        // 回合已经结束（不在跑）：同样忽略。
+        let (shared, mut rx) = fake_shared();
+        conv_of(&shared).busy.store(false, Ordering::SeqCst);
+        for attempt in 1..=5 {
+            handle_event(&shared, &retry_event(attempt, "Overloaded"));
+        }
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn progress_after_retries_keeps_the_turn_going_normally() {
+        // 重试成功后出了正文：照常结束，不会有多余错误。
+        let (shared, mut rx) = fake_shared();
+        handle_event(&shared, &retry_event(1, "Overloaded"));
+        handle_event(&shared, &retry_event(2, "Overloaded"));
+        handle_event(&shared, &text_event("好了"));
+        handle_event(&shared, &idle_event());
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert!(matches!(got[0], AgentEvent::Retrying { attempt: 1, .. }));
+        assert!(matches!(got[1], AgentEvent::Retrying { attempt: 2, .. }));
+        assert!(matches!(&got[2], AgentEvent::TextDelta { text } if text == "好了"));
+        assert_eq!(got[3], AgentEvent::TurnEnd);
+        // opencode 的 attempt 按它自己的一次调用计，成功后下一次调用又从 1 开始：不会累计到超限。
+        begin_new_turn(&shared);
+        handle_event(&shared, &retry_event(1, "Overloaded"));
+        assert!(matches!(
+            drain(&mut rx)[..],
+            [AgentEvent::Retrying { attempt: 1, .. }]
+        ));
     }
 }

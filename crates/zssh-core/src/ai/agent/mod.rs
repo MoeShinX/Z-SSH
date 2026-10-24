@@ -47,6 +47,16 @@ pub enum AgentEvent {
     TurnEnd,
     /// 出错。错误文本直接面向用户展示。
     Error { message: String },
+    /// 智能体遇到额度用完 / 限流 / 服务过载之类的错误，正在带退避地自动重试（opencode 的
+    /// `session.status` 重试状态）。界面据此在「思考中」旁给提示，免得像卡死了。
+    Retrying {
+        /// 第几次重试（从 1 开始）。
+        attempt: u32,
+        /// 已经友好化的原因，直接面向用户展示。
+        reason: String,
+        /// 距离下次重试大约还有几秒；对方没给或格式不认识就是 None。
+        next_in_secs: Option<u64>,
+    },
     /// 续接历史会话失败（智能体那边的会话已经不在），已经退成新会话继续：界面提示
     /// "之前的上下文没有带给 AI，只供回看"。
     ResumeFailed,

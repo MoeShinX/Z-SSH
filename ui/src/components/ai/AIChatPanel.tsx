@@ -34,7 +34,7 @@ import {
 } from "../ui/select";
 import { cn } from "../../lib/utils";
 import { toast } from "../ui/toast";
-import ThinkingIndicator, { showThinking } from "./ThinkingIndicator";
+import ThinkingIndicator, { showThinking, type RetryNotice } from "./ThinkingIndicator";
 import {
   aiAgentAbort,
   aiAgentCatalog,
@@ -268,6 +268,8 @@ export default function AIChatPanel({
   const [running, setRunning] = useState(false);
   /** 这一轮是什么时候发出的（"思考中"后面的秒数从这里算）。 */
   const [turnStartedAt, setTurnStartedAt] = useState(0);
+  /** 智能体正在自动重试（额度用完 / 限流 / 过载）：「思考中」旁边的提示；出字、回合结束就清掉。 */
+  const [retryNotice, setRetryNotice] = useState<RetryNotice | null>(null);
   const [starting, setStarting] = useState(false);
   /** 上一次"新对话 / 换智能体"失败的原因（UI-1 0.1：要一直显示到重试成功）。 */
   const [startError, setStartError] = useState<string | null>(null);
@@ -441,6 +443,16 @@ export default function AIChatPanel({
 
   // 事件和审批都是按 key/scope 归位的，用 ref 读最新值，避免闭包旧值。
   const applyEvent = useCallback((payload: AgentEventPayload) => {
+    if (payload.kind === "retrying") {
+      setRetryNotice({
+        attempt: payload.attempt,
+        reason: payload.reason,
+        nextInSecs: payload.next_in_secs,
+      });
+      return;
+    }
+    // 重试成功（又出字 / 出思考 / 跑工具）或这一轮结束 / 出错：重试提示消失。
+    setRetryNotice(null);
     if (payload.kind === "text_delta") {
       const pending = pendingText.current;
       if (pending && pending.key === payload.session_key) pending.text += payload.text;
@@ -746,6 +758,7 @@ export default function AIChatPanel({
     setContextLost(false);
     setApprovals([]);
     setRunning(false);
+    setRetryNotice(null);
     setAiRunningInTerminal(false);
     try {
       const targetInstall = installs[target];
@@ -903,6 +916,7 @@ export default function AIChatPanel({
     scrollToBottom();
     setInput("");
     setRunning(true);
+    setRetryNotice(null);
     setTurnStartedAt(Date.now());
     if (firstUse) onMarkUsed();
     try {
@@ -1380,8 +1394,9 @@ export default function AIChatPanel({
               />
             );
           })}
-          {showThinking(running, items, approvals.length > 0) && (
-            <ThinkingIndicator since={turnStartedAt} />
+          {/* 重试期间一定要有提示：哪怕最后一条已经是 AI 的文字（showThinking 为假）。 */}
+          {(showThinking(running, items, approvals.length > 0) || (running && retryNotice)) && (
+            <ThinkingIndicator since={turnStartedAt} retry={running ? retryNotice : null} />
           )}
           {/* 没有配到工具卡片的审批（工具卡片还没到，或者同样的命令在几处同时执行、对不唯一）：
               单独显示，别丢掉；它按自己的编号回答，不会批准到别的请求上。 */}

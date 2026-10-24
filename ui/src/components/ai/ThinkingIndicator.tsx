@@ -30,27 +30,63 @@ export function elapsedText(ms: number): string {
   return `${Math.floor(secs / 60)}分${secs % 60}秒`;
 }
 
-export default function ThinkingIndicator({ since }: { since: number }) {
+/** 智能体正在自动重试时的提示内容（后端的 `retrying` 事件）。 */
+export interface RetryNotice {
+  attempt: number;
+  reason: string;
+  /** 距离下次重试大约几秒；不知道是 null。 */
+  nextInSecs: number | null;
+}
+
+/** 后端同一回合最多放行的重试次数（超过就停掉这一轮，见 opencode 驱动的 MAX_RETRIES）。 */
+export const MAX_RETRIES = 3;
+
+/** 「约 X 秒后重试」；不知道或已经到点就不说。 */
+function nextText(secs: number | null): string {
+  if (secs === null || secs <= 0) return "";
+  if (secs < 60) return `，约 ${secs} 秒后重试`;
+  if (secs < 3600) return `，约 ${Math.ceil(secs / 60)} 分钟后重试`;
+  return `，约 ${Math.ceil(secs / 3600)} 小时后重试`;
+}
+
+/** 「遇到问题，正在重试（第 N 次，最多 3 次）：原因，约 X 秒后重试」。 */
+export function retryText(notice: RetryNotice): string {
+  const attempt = Math.min(Math.max(1, Math.floor(notice.attempt)), MAX_RETRIES);
+  const reason = notice.reason.trim();
+  return `遇到问题，正在重试（第 ${attempt} 次，最多 ${MAX_RETRIES} 次）${
+    reason ? `：${reason}` : ""
+  }${nextText(notice.nextInSecs)}`;
+}
+
+export default function ThinkingIndicator({
+  since,
+  retry = null,
+}: {
+  since: number;
+  retry?: RetryNotice | null;
+}) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
   return (
-    <div
-      data-section="ai-thinking"
-      role="status"
-      aria-live="polite"
-      className="flex items-center gap-2 text-xs text-muted-foreground"
-    >
-      <span className="zz-thinking-dots flex items-center gap-0.5" aria-hidden>
-        <span />
-        <span />
-        <span />
-      </span>
-      <span className="tabular-nums">{elapsedText(now - since)}</span>
-      <span>·</span>
-      <span>思考中</span>
+    <div data-section="ai-thinking" role="status" aria-live="polite" className="flex flex-col gap-1">
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <span className="zz-thinking-dots flex items-center gap-0.5" aria-hidden>
+          <span />
+          <span />
+          <span />
+        </span>
+        <span className="tabular-nums">{elapsedText(now - since)}</span>
+        <span>·</span>
+        <span>思考中</span>
+      </div>
+      {retry && (
+        <p data-section="ai-retrying" className="text-[11px] text-amber-600">
+          {retryText(retry)}
+        </p>
+      )}
     </div>
   );
 }

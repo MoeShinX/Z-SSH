@@ -11,7 +11,9 @@
 //!   靠每个 part 的已发字符数去重；
 //! - `message.part.delta`：`properties.{partID, field, delta}`，正文和思考的
 //!   `field` 都是 `"text"`，**靠 partID 在 part.updated 里记下的类型区分**；
-//! - `session.idle` 表示回合结束；`session.error` 带 `properties.error`。
+//! - `session.idle` 表示回合结束；`session.error` 带 `properties.error`；
+//! - `session.status` 的 `status.type == "retry"` 是 opencode 在额度用完 / 限流 / 过载时的
+//!   自动重试（`attempt`、`message`、`next`=下次重试的毫秒时间戳），翻成 [`AgentEvent::Retrying`]。
 
 use std::collections::{HashMap, HashSet};
 
@@ -65,8 +67,92 @@ pub fn translate_event(event: &Value, state: &mut TranslateState) -> Vec<AgentEv
         "session.error" => vec![AgentEvent::Error {
             message: extract_error(&props["error"]),
         }],
-        // session.status / session.updated / server.connected 之类不产生事件。
+        "session.status" => session_status(props),
+        // session.updated / server.connected 之类不产生事件。
         _ => Vec::new(),
+    }
+}
+
+/// `session.status`：只有 `status.type == "retry"` 产生事件（`busy` / `idle` 等照旧不产生）。
+///
+/// 形状（opencode 1.19.x）：`properties.status = {type:"retry", attempt, message, next}`，
+/// `next` 是**下次重试的绝对时间，毫秒时间戳**（程序里是 `Clock 当前毫秒 + 退避毫秒`）。
+fn session_status(props: &Value) -> Vec<AgentEvent> {
+    let status = &props["status"];
+    if status["type"].as_str() != Some("retry") {
+        return Vec::new();
+    }
+    let attempt = status["attempt"]
+        .as_u64()
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        .unwrap_or(1)
+        .max(1);
+    let message = status["message"].as_str().unwrap_or("");
+    vec![AgentEvent::Retrying {
+        attempt,
+        reason: friendly_retry_reason(message),
+        next_in_secs: next_in_secs(&status["next"], now_millis()),
+    }]
+}
+
+/// 当前时间（毫秒时间戳）。
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// 把 `next` 换算成「还有几秒」。
+///
+/// opencode 给的是毫秒时间戳；这里再防御一下：数值小于 1e11 且大于 1e9 时当秒级时间戳；
+/// 已经过去的时间算 0 秒；缺失、非数字、其他量级（认不出单位）一律 None，绝不 panic。
+fn next_in_secs(next: &Value, now_ms: u64) -> Option<u64> {
+    let raw = next.as_f64()?;
+    if !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    let at_ms = if raw >= 1.0e11 {
+        raw
+    } else if raw >= 1.0e9 {
+        raw * 1000.0
+    } else {
+        return None;
+    };
+    let diff_ms = at_ms - now_ms as f64;
+    if diff_ms <= 0.0 {
+        return Some(0);
+    }
+    Some((diff_ms / 1000.0).ceil() as u64)
+}
+
+/// 把 opencode 重试状态里的原文换成人话（不区分大小写匹配，匹配不上就原样返回）。
+pub fn friendly_retry_reason(raw: &str) -> String {
+    let raw = raw.trim();
+    let lower = raw.to_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| lower.contains(k));
+    if has(&[
+        "free usage exceeded",
+        "usage limit",
+        "quota",
+        "credit",
+        "insufficient",
+    ]) {
+        format!("免费额度用完了（opencode 提示：{raw}）。可以换一个模型，或到 opencode.ai 查看额度 / 订阅")
+    } else if has(&["rate limit", "too many requests", "429"]) {
+        "请求太频繁，被服务商限流了".to_string()
+    } else if has(&[
+        "overloaded",
+        "unavailable",
+        "500",
+        "502",
+        "503",
+        "504",
+        "524",
+    ]) {
+        "服务商那边暂时忙不过来".to_string()
+    } else {
+        raw.to_string()
     }
 }
 
@@ -300,7 +386,7 @@ mod tests {
                     } => d.finished.push((call_id.clone(), tool.clone(), *error)),
                     AgentEvent::TurnEnd => d.turn_ends += 1,
                     AgentEvent::Error { message } => d.errors.push(message.clone()),
-                    AgentEvent::ResumeFailed => {}
+                    AgentEvent::ResumeFailed | AgentEvent::Retrying { .. } => {}
                 }
                 d.events.push(out);
             }
@@ -511,5 +597,145 @@ mod tests {
                 text: " world".to_string()
             }]
         );
+    }
+
+    fn retry_status(attempt: u64, message: &str, next: Value) -> Value {
+        serde_json::json!({
+            "type": "session.status",
+            "properties": {
+                "sessionID": "ses_x",
+                "status": {"type": "retry", "attempt": attempt, "message": message, "next": next}
+            }
+        })
+    }
+
+    #[test]
+    fn retry_status_becomes_retrying_event() {
+        let mut state = TranslateState::default();
+        let next = now_millis() + 4_000;
+        let ev = retry_status(2, "Free usage exceeded, subscribe to Go", Value::from(next));
+        let out = translate_event(&ev, &mut state);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            AgentEvent::Retrying {
+                attempt,
+                reason,
+                next_in_secs,
+            } => {
+                assert_eq!(*attempt, 2);
+                assert!(reason.contains("免费额度用完了"), "{reason}");
+                assert!(reason.contains("Free usage exceeded"), "{reason}");
+                let secs = next_in_secs.expect("毫秒时间戳应换算出秒数");
+                assert!((1..=5).contains(&secs), "约 4 秒，得到 {secs}");
+            }
+            other => panic!("该是 Retrying，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn busy_and_idle_status_produce_no_event() {
+        let mut state = TranslateState::default();
+        for status in [
+            serde_json::json!({"type": "busy"}),
+            serde_json::json!({"type": "idle"}),
+            serde_json::json!({}),
+            Value::Null,
+        ] {
+            let ev = serde_json::json!({"type": "session.status", "properties": {"sessionID": "ses_x", "status": status}});
+            assert!(translate_event(&ev, &mut state).is_empty());
+        }
+        // 连 properties 都没有也不能 panic。
+        assert!(
+            translate_event(&serde_json::json!({"type": "session.status"}), &mut state).is_empty()
+        );
+    }
+
+    #[test]
+    fn retry_status_with_odd_fields_does_not_panic() {
+        let mut state = TranslateState::default();
+        // next 缺失 / 字符串 / 负数 / 小数字 / null：都是 None，事件照出。
+        for next in [
+            Value::Null,
+            Value::from("soon"),
+            Value::from(-5),
+            Value::from(12),
+            serde_json::json!({"a": 1}),
+        ] {
+            let out = translate_event(&retry_status(1, "overloaded", next), &mut state);
+            assert_eq!(
+                out,
+                vec![AgentEvent::Retrying {
+                    attempt: 1,
+                    reason: "服务商那边暂时忙不过来".to_string(),
+                    next_in_secs: None,
+                }]
+            );
+        }
+        // attempt / message 缺失：attempt 当 1，原因为空串。
+        let bare = serde_json::json!({
+            "type": "session.status",
+            "properties": {"sessionID": "ses_x", "status": {"type": "retry"}}
+        });
+        assert_eq!(
+            translate_event(&bare, &mut state),
+            vec![AgentEvent::Retrying {
+                attempt: 1,
+                reason: String::new(),
+                next_in_secs: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn next_in_secs_handles_ms_seconds_and_past() {
+        let now = 1_800_000_000_000_u64;
+        // 毫秒时间戳，向上取整
+        assert_eq!(next_in_secs(&Value::from(now + 4_001), now), Some(5));
+        assert_eq!(next_in_secs(&Value::from(now + 2_000), now), Some(2));
+        // 秒级时间戳也认
+        assert_eq!(next_in_secs(&Value::from(now / 1000 + 7), now), Some(7));
+        // 已过去
+        assert_eq!(next_in_secs(&Value::from(now - 10_000), now), Some(0));
+        // 认不出
+        assert_eq!(next_in_secs(&Value::Null, now), None);
+        assert_eq!(next_in_secs(&Value::from(0), now), None);
+        assert_eq!(next_in_secs(&Value::from(5000), now), None);
+        assert_eq!(next_in_secs(&Value::from("x"), now), None);
+    }
+
+    #[test]
+    fn friendly_reason_branches() {
+        let quota = friendly_retry_reason("Free usage exceeded, subscribe to Go");
+        assert!(quota.starts_with("免费额度用完了（opencode 提示：Free usage exceeded"));
+        assert!(quota.contains("opencode.ai"));
+        assert!(friendly_retry_reason("You exceeded your current QUOTA").contains("免费额度"));
+        assert!(friendly_retry_reason("Insufficient credits").contains("免费额度"));
+        assert!(friendly_retry_reason("Usage Limit reached").contains("免费额度"));
+        assert_eq!(
+            friendly_retry_reason("Rate limit reached for requests"),
+            "请求太频繁，被服务商限流了"
+        );
+        assert_eq!(
+            friendly_retry_reason("Too Many Requests"),
+            "请求太频繁，被服务商限流了"
+        );
+        assert_eq!(
+            friendly_retry_reason("HTTP 429"),
+            "请求太频繁，被服务商限流了"
+        );
+        assert_eq!(
+            friendly_retry_reason("Overloaded"),
+            "服务商那边暂时忙不过来"
+        );
+        assert_eq!(
+            friendly_retry_reason("service Unavailable"),
+            "服务商那边暂时忙不过来"
+        );
+        assert_eq!(
+            friendly_retry_reason("status 503"),
+            "服务商那边暂时忙不过来"
+        );
+        assert_eq!(friendly_retry_reason("  something odd  "), "something odd");
+        assert_eq!(friendly_retry_reason(""), "");
     }
 }
