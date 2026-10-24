@@ -118,6 +118,8 @@ export const SETTING_DEFAULTS = {
   quick_commands: "[]",
   quick_commands_bar: false,
   quick_commands_group: "",
+  // 终端底部的撰写栏（UI-17）显不显示：本机习惯、不同步
+  compose_bar: false,
   // 「未分组」改过名之后，不分组的主机直接排在主机树根层（UI-14）；跟着同步，树的结构几台电脑一致
   vault_ungrouped_flat: false,
 } as const;
@@ -187,6 +189,7 @@ export interface SettingValues {
   quick_commands: string;
   quick_commands_bar: boolean;
   quick_commands_group: string;
+  compose_bar: boolean;
   vault_ungrouped_flat: boolean;
 }
 

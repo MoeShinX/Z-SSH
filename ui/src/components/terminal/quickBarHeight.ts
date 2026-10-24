@@ -56,9 +56,16 @@ export function sanitizeStoredQuickBarHeight(raw: unknown): number {
 /** 状态栏（`h-6`）的高度。 */
 const STATS_BAR_HEIGHT = 24;
 
-/** 服务器概览面板的底部偏移：让出状态栏，命令栏开着时再让出它的实际高度。 */
-export function overviewBottomOffset(quickBarOpen: boolean, quickBarHeight: number): number {
-  return STATS_BAR_HEIGHT + (quickBarOpen ? quickBarHeight : 0);
+/**
+ * 服务器概览面板的底部偏移：让出状态栏，命令栏开着时再让出它的实际高度，
+ * 撰写栏开着时再让出撰写栏的实际高度（它随输入的行数长高）。
+ */
+export function overviewBottomOffset(
+  quickBarOpen: boolean,
+  quickBarHeight: number,
+  composeBarHeight = 0,
+): number {
+  return STATS_BAR_HEIGHT + (quickBarOpen ? quickBarHeight : 0) + composeBarHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,5 +93,54 @@ export function useLiveQuickBarHeight(): number {
     },
     () => liveHeight,
     () => QUICK_BAR_DEFAULT_HEIGHT,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 撰写栏当前实际高度（随输入的行数变）：撰写栏上报，App 读去摆概览面板。没有撰写栏时是 0。
+// ---------------------------------------------------------------------------
+
+let liveComposeHeight = 0;
+const composeListeners = new Set<() => void>();
+
+/** 撰写栏上报自己现在的实际高度；卸载时传 0。 */
+export function setLiveComposeBarHeight(next: number): void {
+  if (liveComposeHeight === next) return;
+  liveComposeHeight = next;
+  for (const listener of composeListeners) listener();
+}
+
+/** 订阅撰写栏的实际高度（没有撰写栏时是 0）。 */
+export function useLiveComposeBarHeight(): number {
+  return useSyncExternalStore(
+    (listener) => {
+      composeListeners.add(listener);
+      return () => {
+        composeListeners.delete(listener);
+      };
+    },
+    () => liveComposeHeight,
+    () => 0,
+  );
+}
+
+/** 撰写栏输入框一行的内容高度（`leading-[18px]`），最多长到这么多行，再多在框内滚动。 */
+export const COMPOSE_LINE_HEIGHT = 18;
+export const COMPOSE_MAX_ROWS = 5;
+/** 输入框上下内边距（`py-0.5`）加上下边框，一共多出来的高度。 */
+export const COMPOSE_INPUT_CHROME = 6;
+/** 输入框高度不超过终端区域高度的这个比例（窗口很矮时不把终端挤没）。 */
+export const COMPOSE_MAX_RATIO = 0.3;
+
+/** 输入框只有一行时的高度，也是最小值。 */
+export const COMPOSE_INPUT_MIN_HEIGHT = COMPOSE_LINE_HEIGHT + COMPOSE_INPUT_CHROME;
+
+/** 当前终端区域高度下，撰写栏输入框最多长到多高：min(5 行, 区域的 30%)，至少一行。 */
+export function composeInputMaxHeight(areaHeight: number): number {
+  const rowsMax = COMPOSE_LINE_HEIGHT * COMPOSE_MAX_ROWS + COMPOSE_INPUT_CHROME;
+  if (!Number.isFinite(areaHeight) || areaHeight <= 0) return rowsMax;
+  return Math.max(
+    COMPOSE_INPUT_MIN_HEIGHT,
+    Math.min(rowsMax, Math.floor(areaHeight * COMPOSE_MAX_RATIO)),
   );
 }

@@ -346,3 +346,50 @@ describe("顶栏左侧块和主机树对齐（UI-5）", () => {
     ).toBe("deep");
   });
 });
+
+describe("撰写栏按钮（UI-17）", () => {
+  function renderWith(view: "vault" | "terminal" | "settings", open: boolean, onToggle = vi.fn()) {
+    render(
+      <TopTabs
+        tabs={[]}
+        activeTabId=""
+        panes={{}}
+        view={view}
+        onShowVault={() => {}}
+        onOpenSettings={() => {}}
+        onSelectTab={() => {}}
+        onCloseTab={() => {}}
+        onNewTab={() => {}}
+        aiOpen={false}
+        onToggleAI={() => {}}
+        sftpOpen={false}
+        onToggleSftp={() => {}}
+        composeBarOpen={open}
+        onToggleComposeBar={onToggle}
+      />,
+    );
+    return onToggle;
+  }
+  const button = () => document.querySelector<HTMLElement>('[data-action="toggle-compose-bar"]');
+
+  it("终端界面有这个按钮，点一下调切换；选中态跟开关走", () => {
+    const onToggle = renderWith("terminal", true);
+    expect(button()?.getAttribute("title")).toBe("撰写栏");
+    expect(button()?.getAttribute("aria-pressed")).toBe("true");
+    expect(button()?.className).toContain("bg-foreground/10");
+    expect(button()?.getAttribute("data-tauri-drag-region")).toBe("false");
+    fireEvent.click(button()!);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("关着时不是选中态", () => {
+    renderWith("terminal", false);
+    expect(button()?.getAttribute("aria-pressed")).toBe("false");
+    expect(button()?.className).not.toContain("bg-foreground/10");
+  });
+
+  it("主机页上不显示（那里没有终端）", () => {
+    renderWith("vault", false);
+    expect(button()).toBeNull();
+  });
+});

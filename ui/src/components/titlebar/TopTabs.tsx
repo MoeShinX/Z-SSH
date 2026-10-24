@@ -29,6 +29,7 @@ import {
   RotateCw,
   Settings,
   Square,
+  SquarePen,
   Trash2,
   X,
 } from "lucide-react";
@@ -82,6 +83,9 @@ interface TopTabsProps {
   /** 终端底部的快捷命令栏开着没有。 */
   quickBarOpen?: boolean;
   onToggleQuickBar?: () => void;
+  /** 终端底部的撰写栏开着没有（主机页没有终端，这个按钮不显示）。 */
+  composeBarOpen?: boolean;
+  onToggleComposeBar?: () => void;
   /** SFTP 标签能不能停靠到某个终端标签（M3-3 第 2 节）：ok / other-host（别的主机）/ none。 */
   dockVerdict?: (sftpTabId: string, targetTabId: string) => "ok" | "other-host" | "none";
   /** 松手：把 SFTP 标签停靠到终端标签上。 */
@@ -119,6 +123,8 @@ export default function TopTabs({
   onToggleSftp,
   quickBarOpen = false,
   onToggleQuickBar,
+  composeBarOpen = false,
+  onToggleComposeBar,
   dockVerdict,
   onDockSftpTab,
   onDetachSftpTab,
@@ -464,6 +470,26 @@ export default function TopTabs({
                 </button>
               </TooltipTrigger>
               <TooltipContent>{quickBarLabel}</TooltipContent>
+            </Tooltip>
+          )}
+          {onToggleComposeBar && view !== "vault" && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  data-tauri-drag-region={false}
+                  data-action="toggle-compose-bar"
+                  title="撰写栏"
+                  aria-pressed={composeBarOpen}
+                  onClick={onToggleComposeBar}
+                  className={cn(
+                    "top-tab-utility-btn mb-1 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md",
+                    composeBarOpen && "bg-foreground/10 text-foreground",
+                  )}
+                >
+                  <SquarePen size={16} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>撰写栏</TooltipContent>
             </Tooltip>
           )}
           <ThemeSwitcher />

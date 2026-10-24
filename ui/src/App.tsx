@@ -102,20 +102,21 @@ import ServerStatsBar from "./components/terminal/ServerStatsBar";
 import ServerOverviewPanel from "./components/terminal/ServerOverviewPanel";
 import { useServerStats, useSessionNetHistory, useSessionStats } from "./stores/serverStats";
 import QuickCommandBar from "./components/terminal/QuickCommandBar";
+import ComposeBar from "./components/terminal/ComposeBar";
 import {
   overviewBottomOffset,
+  useLiveComposeBarHeight,
   useLiveQuickBarHeight,
 } from "./components/terminal/quickBarHeight";
 import QuickCommandsPanel from "./components/terminal/QuickCommandsPanel";
 import {
   commandsInGroup,
   groupsOf,
-  isMultiline,
   parseQuickCommands,
-  payloadOf,
   serializeQuickCommands,
   type QuickCommand,
 } from "./state/quickCommands";
+import { sendCommandToTab } from "./state/sendCommand";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
 import SyncStatusBar from "./components/sync/SyncStatusBar";
 import UpdateBar from "./components/sync/UpdateBar";
@@ -244,16 +245,25 @@ interface ConfirmState {
  */
 function OverviewAnchor({
   quickBarOpen,
+  composeBarOpen,
   children,
 }: {
   quickBarOpen: boolean;
+  composeBarOpen: boolean;
   children: ReactNode;
 }) {
   const quickBarHeight = useLiveQuickBarHeight();
+  const composeBarHeight = useLiveComposeBarHeight();
   return (
     <div
       className="absolute right-0 top-0 z-20"
-      style={{ bottom: overviewBottomOffset(quickBarOpen, quickBarHeight) }}
+      style={{
+        bottom: overviewBottomOffset(
+          quickBarOpen,
+          quickBarHeight,
+          composeBarOpen ? composeBarHeight : 0,
+        ),
+      }}
     >
       {children}
     </div>
@@ -404,6 +414,9 @@ export default function App() {
   // 快捷命令栏：列表跟着同步，开关和当前分组只在本机
   const quickRaw = useSettings((state) => state.quick_commands);
   const quickBarOpen = useSettings((state) => state.quick_commands_bar);
+  // 撰写栏（UI-17）：显不显示只在本机；发送历史只放内存（所有终端标签共用，退出就没了）
+  const composeBarOpen = useSettings((state) => state.compose_bar);
+  const composeHistoryRef = useRef<string[]>([]);
   const quickGroup = useSettings((state) => state.quick_commands_group);
   const confirmMultilinePaste = useSettings((state) => state.terminal_confirm_multiline_paste);
   const updateSettingValue = useSettings((state) => state.update);
@@ -1743,34 +1756,53 @@ export default function App() {
     });
   }, []);
 
-  const runQuickCommand = useCallback(
-    (command: QuickCommand, allPanes: boolean) => {
+  /**
+   * 往当前终端标签发一条命令（快捷命令栏和撰写栏共用）：多行确认、没连上提示都在
+   * `sendCommandToTab` 里。`allPanes` 或这个标签开着输入广播时发到所有分屏。
+   * `afterSend` 在真正发过之后调（用户在多行确认框里取消时不调）。
+   */
+  const runCommandOnActiveTab = useCallback(
+    (
+      command: QuickCommand,
+      allPanes: boolean,
+      afterSend?: (sent: number, focusPaneId: string) => void,
+    ) => {
       const current = wsRef.current;
       const tab = current.tabs.find((item) => item.id === current.activeTabId);
       if (!tab || tab.sftp || tab.editor) return;
-      const all = allPanes || Boolean(tab.broadcast);
-      const send = () => {
-        const sent = sendToTab(tab.id, payloadOf(command), all);
-        if (sent === 0) {
-          toast.info(all ? "这个标签里还没有连上的窗格" : "当前窗格还没连上");
-        }
-        focusTerminalOf(tab.focus);
-      };
-      if (isMultiline(command) && confirmMultilinePaste) {
-        setConfirm({
-          title: `发送多行命令「${command.name}」？`,
-          message: `${command.command.trim().split(/\r?\n/).length} 行，每一行都会回车执行${
-            all ? "，发到这个标签的所有分屏" : ""
-          }。`,
-          confirmLabel: "发送",
-          destructive: false,
-          onConfirm: send,
-        });
-        return;
-      }
-      send();
+      sendCommandToTab(
+        {
+          send: (data, all) => sendToTab(tab.id, data, all),
+          confirmMultiline: confirmMultilinePaste,
+          askConfirm: setConfirm,
+          notify: (message) => toast.info(message),
+        },
+        command,
+        allPanes || Boolean(tab.broadcast),
+        (sent) => afterSend?.(sent, tab.focus),
+      );
     },
-    [sendToTab, focusTerminalOf, confirmMultilinePaste],
+    [sendToTab, confirmMultilinePaste],
+  );
+
+  const runQuickCommand = useCallback(
+    (command: QuickCommand, allPanes: boolean) => {
+      // 点完按钮把键盘还给终端
+      runCommandOnActiveTab(command, allPanes, (_sent, paneId) => focusTerminalOf(paneId));
+    },
+    [runCommandOnActiveTab, focusTerminalOf],
+  );
+
+  // 撰写栏：输入框里的内容当作一条回车执行的命令；发完焦点留在撰写栏里（由它自己处理）
+  const runComposeText = useCallback(
+    (text: string, allPanes: boolean, afterSend: (sent: number) => void) => {
+      runCommandOnActiveTab(
+        { id: "compose-bar", name: "撰写栏", command: text, enter: true },
+        allPanes,
+        (sent) => afterSend(sent),
+      );
+    },
+    [runCommandOnActiveTab],
   );
 
   const saveQuickCommands = useCallback(
@@ -2934,6 +2966,8 @@ export default function App() {
           }
           void updateSettingValue("quick_commands_bar", !quickBarOpen);
         }}
+        composeBarOpen={composeBarOpen}
+        onToggleComposeBar={() => void updateSettingValue("compose_bar", !composeBarOpen)}
       />
 
       <DockRow
@@ -3155,6 +3189,16 @@ export default function App() {
                       />
                       </div>
                     )}
+                    {isActive && composeBarOpen && (
+                      <div className={cn("shrink-0", !barsOnTerminal && "bg-background")}>
+                        <ComposeBar
+                          onSend={runComposeText}
+                          onEscape={() => focusTerminalOf(tab.focus)}
+                          paneCount={paneIds(tab.tree).length}
+                          history={composeHistoryRef}
+                        />
+                      </div>
+                    )}
                     {isActive && statsSettings && focusPaneOf?.origin.kind !== "empty" && (
                       <div className={cn("shrink-0", !barsOnTerminal && "bg-background")}>
                         <FocusStatsBar
@@ -3167,7 +3211,7 @@ export default function App() {
                     )}
                     {isActive && statsSettings && overviewOpen && (
                       // 盖在终端右边，不挤终端（终端不用重新算行列数）；底部让出快捷命令栏（高度可拖）和状态栏
-                      <OverviewAnchor quickBarOpen={quickBarOpen}>
+                      <OverviewAnchor quickBarOpen={quickBarOpen} composeBarOpen={composeBarOpen}>
                         <FocusOverviewPanel
                           sessionId={focusSessionId}
                           hostLabel={focusPaneOf?.origin.kind === "host" ? focusPaneOf.origin.label : null}

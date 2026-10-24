@@ -74,6 +74,8 @@ pub const SETTINGS_SYNC_CLASS: &[(&str, SyncMode)] = &[
     ("file_window_close", SyncMode::LocalOnly),
     ("quick_commands_bar", SyncMode::LocalOnly),
     ("quick_commands_group", SyncMode::LocalOnly),
+    // 终端底部的撰写栏显不显示（UI-17）：本机的使用习惯，不同步
+    ("compose_bar", SyncMode::LocalOnly),
     // 软件自身联网的代理：各台电脑的网络环境不一样
     ("app_network_proxy", SyncMode::LocalOnly),
     ("stats_show", SyncMode::LocalOnly),
@@ -1134,6 +1136,7 @@ mod tests {
             "layout.host_tree_width",
             "layout.ai_input_height",
             "layout.quick_bar_height",
+            "compose_bar",
             "ai_opencode_path",
             "ai_codex_path",
             "ai_claude_path",

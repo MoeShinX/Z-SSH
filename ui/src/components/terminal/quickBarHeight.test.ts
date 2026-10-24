@@ -4,7 +4,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   QUICK_BAR_DEFAULT_HEIGHT,
+  COMPOSE_INPUT_MIN_HEIGHT,
   clampQuickBarHeight,
+  composeInputMaxHeight,
   dragQuickBarHeight,
   overviewBottomOffset,
   quickBarMaxHeight,
@@ -58,5 +60,28 @@ describe("概览面板的底部偏移", () => {
     // 默认一行时和原来写死的 52 一致
     expect(overviewBottomOffset(true, QUICK_BAR_DEFAULT_HEIGHT)).toBe(52);
     expect(overviewBottomOffset(true, 100)).toBe(124);
+  });
+});
+
+describe("概览面板的底部偏移（撰写栏）", () => {
+  it("撰写栏开着再让出它的实际高度；不传就是 0", () => {
+    expect(overviewBottomOffset(false, 100, 0)).toBe(24);
+    expect(overviewBottomOffset(true, 28, 29)).toBe(81);
+    expect(overviewBottomOffset(false, 28, 60)).toBe(84);
+  });
+});
+
+describe("撰写栏输入框高度", () => {
+  it("一行 = 18 + 内边距和边框 6；最多 5 行 = 96", () => {
+    expect(COMPOSE_INPUT_MIN_HEIGHT).toBe(24);
+    expect(composeInputMaxHeight(2000)).toBe(96);
+    expect(composeInputMaxHeight(0)).toBe(96);
+    expect(composeInputMaxHeight(Number.NaN)).toBe(96);
+  });
+
+  it("窗口矮时不超过终端区域的 30%，至少一行", () => {
+    expect(composeInputMaxHeight(200)).toBe(60);
+    expect(composeInputMaxHeight(100)).toBe(30);
+    expect(composeInputMaxHeight(40)).toBe(COMPOSE_INPUT_MIN_HEIGHT);
   });
 });

@@ -190,11 +190,24 @@ vi.mock("./components/titlebar/TopTabs", () => ({
     onOpenSettings: () => void;
     onToggleQuickBar: () => void;
     quickBarOpen: boolean;
+    view: string;
+    onToggleComposeBar: () => void;
+    composeBarOpen: boolean;
   }) => (
     <>
       <button data-testid="gear" onClick={props.onOpenSettings}>
         设置
       </button>
+      {/* 真的标题栏在主机页不显示撰写栏按钮（TopTabs.test.tsx 验过） */}
+      {props.view !== "vault" && (
+        <button
+          data-testid="compose"
+          data-on={String(props.composeBarOpen)}
+          onClick={props.onToggleComposeBar}
+        >
+          撰写栏
+        </button>
+      )}
       <button
         data-testid="quick"
         data-on={String(props.quickBarOpen)}
@@ -871,5 +884,124 @@ describe("主机详情什么时候出来", () => {
       await Promise.resolve();
     });
     expect(document.querySelector('[data-testid="host-panel"]')).toBeNull();
+  });
+});
+
+describe("终端底部的撰写栏（UI-17）", () => {
+  const composeBar = () => document.querySelector('[data-section="compose-bar"]');
+  const composeInput = () => screen.getByLabelText("撰写栏") as HTMLTextAreaElement;
+
+  /** 打开一台主机，可选地等会话连上；撰写栏的开关由调用方决定。 */
+  async function openTerminal({ connected }: { connected: boolean }) {
+    mocks.stateHandlers.length = 0;
+    mocks.onSessionState.mockImplementation((async (handler: (event: unknown) => void) => {
+      mocks.stateHandlers.push(handler);
+      return () => {};
+    }) as unknown as () => Promise<() => void>);
+    const ready = await openHost();
+    await act(async () => ready(100, 30));
+    await waitFor(() => expect(mocks.sessionOpen).toHaveBeenCalledTimes(1));
+    if (connected) {
+      await act(async () => {
+        for (const handler of mocks.stateHandlers) handler({ session_id: "sess-1", state: "connected" });
+        await Promise.resolve();
+      });
+      await waitFor(() =>
+        expect(document.querySelector("[data-pane-id]")?.getAttribute("data-phase")).toBe(
+          "connected",
+        ),
+      );
+    }
+    const { useSettings } = await import("./stores/settings");
+    await act(async () => useSettings.setState({ compose_bar: true } as never));
+    mocks.termWrite.mockClear();
+  }
+
+  afterEach(() => {
+    mocks.onSessionState.mockImplementation(async () => () => {});
+  });
+
+  it("默认不显示；顶栏按钮切换 compose_bar，开着时撰写栏出现在终端区里", async () => {
+    const view = await mountApp();
+    const { useSettings } = await import("./stores/settings");
+    expect(useSettings.getState().compose_bar).toBe(false);
+    await act(async () => view.getByTestId("open-host").click());
+    await waitFor(() => expect(mocks.ready.size).toBe(1));
+    expect(composeBar()).toBeNull();
+
+    await act(async () => view.getByTestId("compose").click());
+    await waitFor(() => expect(useSettings.getState().compose_bar).toBe(true));
+    expect(composeBar()).not.toBeNull();
+    expect(view.getByTestId("compose").dataset.on).toBe("true");
+    // 在终端区里面，不是别处
+    expect(composeBar()?.closest('[data-section="terminal-area"]')).not.toBeNull();
+
+    await act(async () => view.getByTestId("compose").click());
+    await waitFor(() => expect(useSettings.getState().compose_bar).toBe(false));
+    expect(composeBar()).toBeNull();
+  });
+
+  it("主机页上没有撰写栏，也没有这个按钮（开关打开了也一样）", async () => {
+    const view = await mountApp();
+    const { useSettings } = await import("./stores/settings");
+    await act(async () => useSettings.setState({ compose_bar: true } as never));
+    expect(composeBar()).toBeNull();
+    expect(view.queryByTestId("compose")).toBeNull();
+  });
+
+  it("撰写栏在快捷命令栏下面", async () => {
+    await openTerminal({ connected: true });
+    const { useSettings } = await import("./stores/settings");
+    await act(async () => useSettings.setState({ quick_commands_bar: true } as never));
+    const area = composeBar()?.closest('[data-section="terminal-area"]');
+    const order = Array.from(area?.querySelectorAll("[data-section]") ?? []).map((element) =>
+      element.getAttribute("data-section"),
+    );
+    expect(order.indexOf("quick-command-bar")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("compose-bar")).toBeGreaterThan(order.indexOf("quick-command-bar"));
+  });
+
+  it("Enter 发到当前窗格（补回车）并清空；Ctrl+Enter 发到所有分屏", async () => {
+    await openTerminal({ connected: true });
+    fireEvent.change(composeInput(), { target: { value: "ls -la" } });
+    fireEvent.keyDown(composeInput(), { key: "Enter" });
+    expect(mocks.termWrite).toHaveBeenCalledTimes(1);
+    expect(mocks.termWrite).toHaveBeenLastCalledWith("sess-1", "ls -la\r");
+    expect(composeInput().value).toBe("");
+
+    fireEvent.change(composeInput(), { target: { value: "uptime" } });
+    fireEvent.keyDown(composeInput(), { key: "Enter", ctrlKey: true });
+    expect(mocks.termWrite).toHaveBeenLastCalledWith("sess-1", "uptime\r");
+    expect(composeInput().value).toBe("");
+  });
+
+  it("窗格没连上：什么都不发，内容留着", async () => {
+    await openTerminal({ connected: false });
+    fireEvent.change(composeInput(), { target: { value: "ls" } });
+    fireEvent.keyDown(composeInput(), { key: "Enter" });
+    expect(mocks.termWrite).not.toHaveBeenCalled();
+    expect(composeInput().value).toBe("ls");
+  });
+
+  it("多行内容先弹确认：点发送才发（每行回车）并清空，取消则保留", async () => {
+    await openTerminal({ connected: true });
+    fireEvent.change(composeInput(), { target: { value: "cd /tmp\nls" } });
+    fireEvent.keyDown(composeInput(), { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("发送多行命令「撰写栏」？")).toBeTruthy());
+    expect(mocks.termWrite).not.toHaveBeenCalled();
+
+    await act(async () => screen.getByText("取消").click());
+    expect(mocks.termWrite).not.toHaveBeenCalled();
+    expect(composeInput().value).toBe("cd /tmp\nls");
+
+    fireEvent.keyDown(composeInput(), { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("发送多行命令「撰写栏」？")).toBeTruthy());
+    const dialog = screen.getByRole("dialog");
+    const confirmButton = Array.from(dialog.querySelectorAll("button")).find(
+      (button) => button.textContent === "发送",
+    ) as HTMLElement;
+    await act(async () => confirmButton.click());
+    expect(mocks.termWrite).toHaveBeenLastCalledWith("sess-1", "cd /tmp\rls\r");
+    expect(composeInput().value).toBe("");
   });
 });
