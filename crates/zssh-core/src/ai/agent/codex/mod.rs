@@ -40,6 +40,7 @@ use super::discovery::{self, AgentInstall};
 use super::process::{
     drain_tail_lines, idle_tick, kill_process_tree, tail_buf, tail_text, TailBuf, TAIL_LINES,
 };
+use super::retry::{retry_limit_message, retry_limit_reached, RETRY_STOP_GRACE};
 use super::{AgentConversation, AgentError, AgentEvent, AgentModel, AgentModelCatalog};
 use approval::Decision;
 use protocol::{method, ErrorResponse, Incoming, Request, Response, RpcError};
@@ -183,6 +184,12 @@ struct ThreadEntry {
 struct ThreadInner {
     state: TranslateState,
     turn: TurnStats,
+    /// 回合序号（每次发消息加一）：重试超限后的延时收尾任务靠它确认还是同一个回合，
+    /// 别误伤用户马上发的下一条消息。
+    turn_seq: u64,
+    /// 重试超限、兜底收尾时放弃的回合 id：codex 之后再发的、属于这个回合的通知
+    /// （包括晚到的 `turn/completed`）一律丢掉，免得误伤之后的新回合。
+    abandoned_turn: Option<String>,
 }
 
 impl ThreadEntry {
@@ -632,6 +639,8 @@ impl CodexRuntime {
             inner: Mutex::new(ThreadInner {
                 state: TranslateState::default(),
                 turn: TurnStats::default(),
+                turn_seq: 0,
+                abandoned_turn: None,
             }),
             busy: AtomicBool::new(false),
             turn_id: Mutex::new(None),
@@ -804,6 +813,7 @@ impl CodexConversation {
         shared.touch();
         if let Ok(mut inner) = self.entry.inner.lock() {
             inner.turn = TurnStats::default();
+            inner.turn_seq += 1;
         }
         *self.entry.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
@@ -839,36 +849,128 @@ impl CodexConversation {
     }
 
     async fn stop_inner(&self) -> Result<(), AgentError> {
-        if !self.entry.busy.load(Ordering::SeqCst) {
-            return Ok(());
+        stop_turn(&self.runtime.shared, &self.thread_id, &self.entry).await
+    }
+}
+
+/// 停止当前回合：标记「已中断」，再发 `turn/interrupt`。用户点停止和重试超限自动停止
+/// 走的是同一条路径（就是这个函数）。没有回合在跑时是空操作。
+async fn stop_turn(
+    shared: &Shared,
+    thread_id: &str,
+    entry: &ThreadEntry,
+) -> Result<(), AgentError> {
+    if !entry.busy.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if let Ok(mut inner) = entry.inner.lock() {
+        inner.turn.aborted = true;
+    }
+    let turn_id = entry
+        .turn_id
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    match turn_id {
+        Some(turn_id) => shared
+            .request(
+                method::TURN_INTERRUPT,
+                protocol::turn_interrupt_params(thread_id, &turn_id),
+                INTERRUPT_TIMEOUT,
+            )
+            .await
+            .map(|_| ()),
+        None => {
+            // 回合还在启动：标记一下，send 拿到 id 后立即打断。
+            entry.stop_requested.store(true, Ordering::SeqCst);
+            Ok(())
         }
-        if let Ok(mut inner) = self.entry.inner.lock() {
-            inner.turn.aborted = true;
+    }
+}
+
+/// 重试超限：走和用户点「停止」同一条路径（[`stop_turn`]，`turn/interrupt`），并保证这一
+/// 回合一定收尾。
+///
+/// 正常情况下 codex 收到打断后会发 `turn/completed`（interrupted），由
+/// [`translate::translate`] 先发错误再发 TurnEnd；万一它没发（打断失败、通知丢了），宽限期
+/// 过后由 [`retry_stop_fallback_now`] 收尾。打断请求单独发，不占宽限期。
+fn stop_after_retry_limit(
+    shared: &Arc<Shared>,
+    thread_id: &str,
+    thread: &Arc<ThreadEntry>,
+    seq: u64,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        // 没有 tokio 运行时（只会在单测里出现）：打断发不出去，直接兜底收尾。
+        retry_stop_fallback_now(thread, seq);
+        return;
+    };
+    {
+        let shared = Arc::clone(shared);
+        let thread = Arc::clone(thread);
+        let thread_id = thread_id.to_string();
+        handle.spawn(async move {
+            // 这个回合已经收尾、用户开了新回合：别把打断打到新回合上。
+            let same_turn = thread
+                .inner
+                .lock()
+                .map(|i| i.turn_seq == seq)
+                .unwrap_or(false);
+            if !same_turn {
+                return;
+            }
+            if let Err(err) = stop_turn(&shared, &thread_id, &thread).await {
+                tracing::warn!(error = %err, "重试超限后打断回合失败");
+            }
+        });
+    }
+    {
+        let shared = Arc::clone(shared);
+        let thread = Arc::clone(thread);
+        let thread_id = thread_id.to_string();
+        handle.spawn(async move {
+            tokio::time::sleep(RETRY_STOP_GRACE).await;
+            if let Some(abandoned) = retry_stop_fallback_now(&thread, seq) {
+                // codex 没听打断：再试一次，免得旧回合在那边继续占着 thread（尽力而为）。
+                let _ = shared
+                    .request(
+                        method::TURN_INTERRUPT,
+                        protocol::turn_interrupt_params(&thread_id, &abandoned),
+                        INTERRUPT_TIMEOUT,
+                    )
+                    .await;
+            }
+        });
+    }
+}
+
+/// 兜底收尾：还是同一个回合、而且 `turn/completed` 还没来，就由我们发 `Error` + `TurnEnd`，
+/// 并把这个回合记成「已放弃」（它晚到的通知不再认）。返回被放弃的回合 id（如果知道）。
+fn retry_stop_fallback_now(thread: &ThreadEntry, seq: u64) -> Option<String> {
+    let (message, abandoned) = {
+        let mut inner = thread
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.turn_seq != seq || !thread.busy.load(Ordering::SeqCst) {
+            return None;
         }
-        let turn_id = self
-            .entry
+        // `turn/completed` 已经处理过会把它取走；还在就是没收尾。
+        let message = inner.turn.retry_stop.take()?;
+        let abandoned = thread
             .turn_id
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        match turn_id {
-            Some(turn_id) => self
-                .runtime
-                .shared
-                .request(
-                    method::TURN_INTERRUPT,
-                    protocol::turn_interrupt_params(&self.thread_id, &turn_id),
-                    INTERRUPT_TIMEOUT,
-                )
-                .await
-                .map(|_| ()),
-            None => {
-                // 回合还在启动：标记一下，send 拿到 id 后立即打断。
-                self.entry.stop_requested.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }
+        inner.abandoned_turn = abandoned.clone();
+        (message, abandoned)
+    };
+    thread.stop_requested.store(false, Ordering::SeqCst);
+    if thread.busy.swap(false, Ordering::SeqCst) {
+        *thread.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        thread.emit(vec![AgentEvent::Error { message }, AgentEvent::TurnEnd]);
     }
+    abandoned
 }
 
 impl AgentConversation for CodexConversation {
@@ -1050,7 +1152,7 @@ async fn read_loop(shared: Arc<Shared>, stdout: tokio::process::ChildStdout) {
 }
 
 /// 通知分发：按 threadId 找到对话，翻译成统一事件；顺带维护回合状态。
-async fn handle_notification(shared: &Shared, method_name: &str, params: &Value) {
+async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &Value) {
     // MCP 服务的启动状态是进程级信息（核对 / 诊断），不依赖 thread 登记。
     if method_name == "mcpServer/startupStatus/updated" {
         if let Some(name) = params["name"].as_str() {
@@ -1092,19 +1194,63 @@ async fn handle_notification(shared: &Shared, method_name: &str, params: &Value)
         return;
     };
     shared.touch();
-    let events = {
+    let (events, retry_stop_seq) = {
         let mut inner = thread
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ThreadInner { state, turn } = &mut *inner;
-        translate::translate(method_name, params, state, turn)
+        // 重试超限时被我们放弃的回合：它之后发的通知（含晚到的 turn/completed）不认，
+        // 免得误伤之后开的新回合。
+        if let Some(abandoned) = inner.abandoned_turn.as_deref() {
+            if turn_id_of(params) == Some(abandoned) {
+                if method_name == method::TURN_COMPLETED {
+                    inner.abandoned_turn = None;
+                }
+                return;
+            }
+        }
+        let seq = inner.turn_seq;
+        let busy = thread.busy.load(Ordering::SeqCst);
+        let ThreadInner { state, turn, .. } = &mut *inner;
+        let mut events = Vec::new();
+        let mut stop = false;
+        for event in translate::translate(method_name, params, state, turn) {
+            if let AgentEvent::Retrying {
+                attempt, reason, ..
+            } = &event
+            {
+                // 回合不在跑 / 已被停止（用户点停止，或已经因超限停掉）时晚到的重试
+                // 状态：忽略。
+                if !busy || turn.aborted {
+                    continue;
+                }
+                if retry_limit_reached(*attempt) {
+                    // 第 3 次重试也失败了：这条不给界面看，直接停掉这一轮。
+                    turn.aborted = true;
+                    turn.retry_stop = Some(retry_limit_message(reason));
+                    stop = true;
+                    continue;
+                }
+            }
+            events.push(event);
+        }
+        (events, stop.then_some(seq))
     };
     thread.emit(events);
     if method_name == method::TURN_COMPLETED {
         thread.busy.store(false, Ordering::SeqCst);
         *thread.turn_id.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
+    if let Some(seq) = retry_stop_seq {
+        stop_after_retry_limit(shared, thread_id, &thread, seq);
+    }
+}
+
+/// 通知里的回合 id（`turnId`，或 `turn/completed` 的 `turn.id`）。
+fn turn_id_of(params: &Value) -> Option<&str> {
+    params["turnId"]
+        .as_str()
+        .or_else(|| params["turn"]["id"].as_str())
 }
 
 async fn idle_watch(
@@ -1288,5 +1434,297 @@ mod tests {
         assert!(prompt.contains("`zssh` tools"));
         assert!(prompt.contains("abc123"));
         assert!(prompt.contains("list_targets"));
+    }
+
+    // ---- AI-11：重试提示与 3 次上限 ----
+
+    fn test_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            stdin: tokio::sync::Mutex::new(None),
+            child: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            threads: Mutex::new(HashMap::new()),
+            mcp_started: Mutex::new(Vec::new()),
+            mcp_gate: watch::channel(McpGate::Ready).0,
+            mcp_name: "zssh".to_string(),
+            mcp_disabled: Vec::new(),
+            mcp_status_checked: AtomicBool::new(true),
+            workspace: PathBuf::new(),
+            last_activity: Mutex::new(Instant::now()),
+            closed: AtomicBool::new(false),
+            stderr_tail: tail_buf(),
+        })
+    }
+
+    /// 登记一个正在跑回合（turn-1）的 thread。
+    fn running_thread(
+        shared: &Arc<Shared>,
+    ) -> (Arc<ThreadEntry>, mpsc::UnboundedReceiver<AgentEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let entry = Arc::new(ThreadEntry {
+            events: tx,
+            inner: Mutex::new(ThreadInner {
+                state: TranslateState::default(),
+                turn: TurnStats::default(),
+                turn_seq: 1,
+                abandoned_turn: None,
+            }),
+            busy: AtomicBool::new(true),
+            turn_id: Mutex::new(Some("turn-1".to_string())),
+            stop_requested: AtomicBool::new(false),
+        });
+        shared
+            .threads
+            .lock()
+            .unwrap()
+            .insert("t1".to_string(), Arc::clone(&entry));
+        (entry, rx)
+    }
+
+    fn retry_notice(n: u32) -> Value {
+        json!({
+            "threadId": "t1", "turnId": "turn-1", "willRetry": true,
+            "error": {
+                "message": format!("Reconnecting... {n}/5"),
+                "additionalDetails": "last status: 429 Too Many Requests"
+            }
+        })
+    }
+
+    fn completed(turn_id: &str, status: &str) -> Value {
+        json!({ "threadId": "t1", "turn": { "id": turn_id, "status": status } })
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut got = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            got.push(event);
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn first_three_retries_reach_the_ui_and_do_not_stop_the_turn() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        for n in 1..=3 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3);
+        for (i, event) in got.iter().enumerate() {
+            match event {
+                AgentEvent::Retrying {
+                    attempt,
+                    reason,
+                    next_in_secs,
+                } => {
+                    assert_eq!(*attempt as usize, i + 1);
+                    assert_eq!(reason, "请求太频繁，被服务商限流了");
+                    assert_eq!(*next_in_secs, None);
+                }
+                other => panic!("该是 Retrying，得到 {other:?}"),
+            }
+        }
+        assert!(thread.busy.load(Ordering::SeqCst));
+        assert!(!thread.inner.lock().unwrap().turn.aborted);
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(300)).await;
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// 第 4 次：不给界面、走停止路径；codex 回了 interrupted：先 Error 后 TurnEnd，各一次；
+    /// 停止期间 codex 自己再吐的错误不报；兜底不重复。
+    #[tokio::test]
+    async fn fourth_retry_stops_then_turn_completed_ends_turn_with_one_error() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        for n in 1..=4 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3, "只有前 3 次给界面：{got:?}");
+        assert!(got.iter().all(|e| matches!(e, AgentEvent::Retrying { .. })));
+        {
+            let inner = thread.inner.lock().unwrap();
+            assert!(inner.turn.aborted);
+            assert!(inner.turn.retry_stop.is_some());
+        }
+        // 停止期间：更多重试通知、放弃重试的错误：都不报。
+        handle_notification(&shared, "error", &retry_notice(5)).await;
+        let fatal = json!({
+            "threadId": "t1", "turnId": "turn-1", "willRetry": false,
+            "error": { "message": "stream closed" }
+        });
+        handle_notification(&shared, "error", &fatal).await;
+        assert!(drain(&mut rx).is_empty());
+
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-1", "interrupted"),
+        )
+        .await;
+        match drain(&mut rx).as_slice() {
+            [AgentEvent::Error { message }, AgentEvent::TurnEnd] => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+                assert!(message.contains("请求太频繁"));
+                assert!(message.ends_with("已停止这一轮，可以稍后再试或换一个模型。"));
+            }
+            other => panic!("要先 Error 后 TurnEnd：{other:?}"),
+        }
+        assert!(!thread.busy.load(Ordering::SeqCst));
+        assert!(thread.turn_id.lock().unwrap().is_none());
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty(), "不能重复报错或重复收尾");
+    }
+
+    /// 打断没有回应、turn/completed 一直不来：宽限期后由我们收尾；旧回合晚到的通知不认，
+    /// 也不会把之后的新回合收掉。
+    #[tokio::test]
+    async fn fourth_retry_falls_back_and_ignores_the_abandoned_turn() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        for n in 1..=4 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        drain(&mut rx);
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(1500)).await;
+        match drain(&mut rx).as_slice() {
+            [AgentEvent::Error { message }, AgentEvent::TurnEnd] => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+            }
+            other => panic!("要兜底 Error + TurnEnd：{other:?}"),
+        }
+        assert!(!thread.busy.load(Ordering::SeqCst));
+        assert_eq!(
+            thread.inner.lock().unwrap().abandoned_turn.as_deref(),
+            Some("turn-1")
+        );
+
+        // 用户发了新回合（turn-2）。
+        {
+            let mut inner = thread.inner.lock().unwrap();
+            inner.turn = TurnStats::default();
+            inner.turn_seq += 1;
+        }
+        thread.busy.store(true, Ordering::SeqCst);
+        *thread.turn_id.lock().unwrap() = Some("turn-2".to_string());
+
+        // 旧回合晚到的 turn/completed 和错误：丢掉，不动新回合。
+        handle_notification(&shared, "error", &retry_notice(5)).await;
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-1", "interrupted"),
+        )
+        .await;
+        assert!(drain(&mut rx).is_empty());
+        assert!(thread.busy.load(Ordering::SeqCst), "新回合还得接着跑");
+        assert_eq!(
+            thread.turn_id.lock().unwrap().as_deref(),
+            Some("turn-2"),
+            "新回合的 id 不能被清掉"
+        );
+        assert!(thread.inner.lock().unwrap().abandoned_turn.is_none());
+
+        // 新回合自己的重试从头放行，自己的 turn/completed 正常收尾。
+        let mut notice = retry_notice(1);
+        notice["turnId"] = json!("turn-2");
+        handle_notification(&shared, "error", &notice).await;
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [AgentEvent::Retrying { attempt: 1, .. }]
+        ));
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-2", "completed"),
+        )
+        .await;
+        assert_eq!(drain(&mut rx), vec![AgentEvent::TurnEnd]);
+    }
+
+    /// 兜底不误伤新回合：宽限期内用户已经开了下一个回合，兜底什么都不做。
+    #[tokio::test]
+    async fn fallback_does_not_touch_a_newer_turn() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        for n in 1..=4 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        drain(&mut rx);
+        // codex 及时收尾，用户马上发了下一条（回合序号 +1、状态重置）。
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-1", "interrupted"),
+        )
+        .await;
+        assert_eq!(drain(&mut rx).len(), 2);
+        {
+            let mut inner = thread.inner.lock().unwrap();
+            inner.turn = TurnStats::default();
+            inner.turn_seq += 1;
+        }
+        thread.busy.store(true, Ordering::SeqCst);
+        *thread.turn_id.lock().unwrap() = Some("turn-2".to_string());
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty(), "新回合不能被旧的兜底收尾");
+        assert!(thread.busy.load(Ordering::SeqCst));
+        assert!(
+            !thread.inner.lock().unwrap().turn.aborted,
+            "打断也不能打到新回合上"
+        );
+    }
+
+    /// 回合不在跑 / 用户已经点了停止：晚到的重试通知忽略，不报错、不收尾。
+    #[tokio::test]
+    async fn late_retry_after_user_stop_or_turn_end_is_ignored() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.inner.lock().unwrap().turn.aborted = true; // 用户点了停止
+        for n in 1..=5 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(thread.inner.lock().unwrap().turn.retry_stop.is_none());
+
+        thread.inner.lock().unwrap().turn = TurnStats::default();
+        thread.busy.store(false, Ordering::SeqCst); // 回合已结束
+        for n in 1..=5 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        assert!(drain(&mut rx).is_empty());
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(300)).await;
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// 没有 tokio 运行时可用时（只会出现在单测里）兜底函数能直接收尾，且只收一次。
+    #[test]
+    fn fallback_now_ends_the_turn_once() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        thread.inner.lock().unwrap().turn.retry_stop = Some("E".to_string());
+        assert_eq!(
+            retry_stop_fallback_now(&thread, 1).as_deref(),
+            Some("turn-1")
+        );
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                AgentEvent::Error {
+                    message: "E".to_string()
+                },
+                AgentEvent::TurnEnd
+            ]
+        );
+        assert_eq!(retry_stop_fallback_now(&thread, 1), None);
+        assert!(drain(&mut rx).is_empty());
+        // 回合序号对不上：不动。
+        thread.busy.store(true, Ordering::SeqCst);
+        thread.inner.lock().unwrap().turn.retry_stop = Some("E".to_string());
+        assert_eq!(retry_stop_fallback_now(&thread, 99), None);
+        assert!(thread.busy.load(Ordering::SeqCst));
     }
 }

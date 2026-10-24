@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
   agentHandler: null as ((event: Record<string, unknown>) => void) | null,
   toastError: vi.fn(),
   aiAgentDiscover: vi.fn(async (agent: string) =>
-    agent === "opencode"
+    ["opencode", "claude", "codex"].includes(agent)
       ? {
           path: "C:\tools\opencode\opencode.exe",
           version: "1.19.4",
@@ -155,6 +155,33 @@ describe("AI 面板：自动重试提示", () => {
     await emit(retrying(1, "请求太频繁，被服务商限流了", 2));
     expect(noticeText()).not.toBeNull();
     await emit({ kind: "turn_end" });
+    expect(noticeText()).toBeNull();
+    expect(document.querySelector('[data-section="ai-thinking"]')).toBeNull();
+  });
+});
+
+describe("AI 面板：Claude Code / Codex 走同一条重试提示", () => {
+  it.each(["claude", "codex"] as const)("%s：显示提示，出字后消失", async (agent) => {
+    useSettings.setState({ ai_default_agent: agent });
+    await startTurn();
+    await emit(retrying(1, "服务商那边暂时忙不过来", 2));
+    expect(noticeText()).toContain("第 1 次，最多 3 次");
+    expect(noticeText()).toContain("服务商那边暂时忙不过来");
+    expect(noticeText()).toContain("约 2 秒后重试");
+    await emit({ kind: "text_delta", text: "好了" });
+    await waitFor(() => expect(noticeText()).toBeNull());
+  });
+
+  it.each(["claude", "codex"] as const)("%s：超限错误 + 收尾后提示和「思考中」消失", async (agent) => {
+    useSettings.setState({ ai_default_agent: agent });
+    await startTurn();
+    await emit(retrying(3, "请求太频繁，被服务商限流了"));
+    expect(noticeText()).toContain("第 3 次");
+    const message =
+      "重试了 3 次仍然失败：请求太频繁，被服务商限流了。已停止这一轮，可以稍后再试或换一个模型。";
+    await emit({ kind: "error", message });
+    await emit({ kind: "turn_end" });
+    expect(mocks.toastError).toHaveBeenCalledWith(message);
     expect(noticeText()).toBeNull();
     expect(document.querySelector('[data-section="ai-thinking"]')).toBeNull();
   });

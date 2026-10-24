@@ -38,7 +38,7 @@ export interface RetryNotice {
   nextInSecs: number | null;
 }
 
-/** 后端同一回合最多放行的重试次数（超过就停掉这一轮，见 opencode 驱动的 MAX_RETRIES）。 */
+/** 后端同一回合最多放行的重试次数（超过就停掉这一轮，见后端 ai/agent/retry.rs 的 MAX_RETRIES，三个智能体共用）。 */
 export const MAX_RETRIES = 3;
 
 /** 「约 X 秒后重试」；不知道或已经到点就不说。 */

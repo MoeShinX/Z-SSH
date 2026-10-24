@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod download;
 pub mod opencode;
 pub mod process;
+pub mod retry;
 pub mod text;
 pub mod translate;
 
@@ -48,7 +49,9 @@ pub enum AgentEvent {
     /// 出错。错误文本直接面向用户展示。
     Error { message: String },
     /// 智能体遇到额度用完 / 限流 / 服务过载之类的错误，正在带退避地自动重试（opencode 的
-    /// `session.status` 重试状态）。界面据此在「思考中」旁给提示，免得像卡死了。
+    /// `session.status` 重试状态、Claude Code 的 `system/api_retry`、Codex 的 `willRetry`
+    /// 错误通知）。界面据此在「思考中」旁给提示，免得像卡死了。同一回合最多放行
+    /// [`retry::MAX_RETRIES`] 次，超限由各驱动停掉这一轮。
     Retrying {
         /// 第几次重试（从 1 开始）。
         attempt: u32,

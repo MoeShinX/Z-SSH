@@ -8,7 +8,11 @@
 //!   正文和思考；
 //! - `assistant`：完整消息，工具调用以 `tool_use` 块为准（正文块不再发，流式里发过）；
 //! - `user`：`tool_result` 块是工具结果（带 `is_error`）；
-//! - `result`：回合结束（`subtype` / `is_error` / `result` 文本）。
+//! - `result`：回合结束（`subtype` / `is_error` / `result` 文本）；
+//! - `system/api_retry`：API 请求遇到可重试的错误（限流 / 过载 / 连接问题），等一会儿
+//!   再重试（AI-11）。字段 `attempt`（第几次重试，从 1 开始：第 N 次失败之后、第 N 次
+//!   重试之前发出，依据见 [`api_retry_events`]）、`max_retries`、`retry_delay_ms`、
+//!   `error_status`（HTTP 状态码，连接错误为 null）、`error`（类别字符串）。
 //!
 //! 工具名 `mcp__zssh__run_command` 归一成 `zssh_run_command`，和 opencode / codex
 //! 两侧的写法一致，面板的友好名 / 主机名 / 退出码解析原样复用。
@@ -17,6 +21,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use super::super::retry::friendly_agent_retry_reason;
 use super::super::AgentEvent;
 
 /// 翻译状态（一个对话一份）。
@@ -33,8 +38,11 @@ pub struct TranslateState {
 pub struct TurnStats {
     /// 出现过正文或工具调用（空回复判断用）。
     pub content: bool,
-    /// 中断过（用户点停止；由驱动在发中断时置位）。
+    /// 中断过（用户点停止，或重试超限被我们停掉；由驱动在发中断时置位）。
     pub aborted: bool,
+    /// 重试超限被我们停掉：要给用户看的错误文字。随后到来的 `result`（不管成功还是
+    /// 中断错误）据此先发这一条 `Error` 再发 `TurnEnd`，并且只发这一次。
+    pub retry_stop: Option<String>,
 }
 
 /// `system/init` / `result` 里的会话 id。
@@ -70,10 +78,76 @@ pub fn translate(
         "assistant" => assistant_events(message, state, turn),
         "user" => user_events(message, state),
         "result" => result_events(message, turn),
+        "system" if message["subtype"].as_str() == Some("api_retry") => api_retry_events(message),
         // system/init、system/status、system/thinking_tokens、rate_limit_event 之类
         // 不产生统一事件（驱动自己读 session_id / mcp_servers）。
         _ => Vec::new(),
     }
+}
+
+/// `system/api_retry` → [`AgentEvent::Retrying`]。
+///
+/// `attempt` 的含义（读本机 Claude Code 2.1.x 程序文本得出，没有抓到真实事件）：重试循环
+/// 里 `attempt` 从 1 起，请求失败后先判断 `attempt <= max_retries`，再把当前 `attempt`
+/// 连同退避时间发出来，然后等待、重试。所以它是「第几次重试」（和 opencode 一致）：
+/// 第 1 次失败后发 `attempt=1`，`attempt == max_retries` 是它自己的最后一次重试。程序的
+/// 日志里也写作 `API error (attempt N/max+1)`。缺失或为 0 时按 1 处理。
+///
+/// 原因：`error_status` 拼成 `HTTP 429` 这样的文字，`error` 是类别（`rate_limit` /
+/// `overloaded` / `server_error` / `authentication_failed` / `unknown` 等，下划线换成空格），
+/// 交给共用的友好化；认不出就保留原文；没有状态码又没有类别是连接错误 / 超时。
+fn api_retry_events(message: &Value) -> Vec<AgentEvent> {
+    let attempt = message["attempt"]
+        .as_u64()
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        .unwrap_or(1)
+        .max(1);
+    let shown = api_retry_text(message);
+    vec![AgentEvent::Retrying {
+        attempt,
+        reason: friendly_agent_retry_reason("Claude Code", &classify_text(message, &shown), &shown),
+        next_in_secs: delay_secs(&message["retry_delay_ms"]),
+    }]
+}
+
+/// 给用户看的原文：类别 + 状态码（都没有就是连接问题）。
+fn api_retry_text(message: &Value) -> String {
+    let category = message["error"]
+        .as_str()
+        .map(|s| s.trim().replace('_', " "))
+        .filter(|s| !s.is_empty() && s != "unknown")
+        .unwrap_or_default();
+    let status = message["error_status"].as_u64();
+    let mut parts = Vec::new();
+    if !category.is_empty() {
+        parts.push(category);
+    }
+    if let Some(status) = status {
+        parts.push(format!("HTTP {status}"));
+    }
+    if parts.is_empty() {
+        "网络连接出错或超时".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// 用来分类的文字：529 是 Anthropic 的「过载」状态码，补上这个词好让友好化认出来。
+fn classify_text(message: &Value, shown: &str) -> String {
+    if message["error_status"].as_u64() == Some(529) {
+        format!("{shown} overloaded")
+    } else {
+        shown.to_string()
+    }
+}
+
+/// 毫秒 → 向上取整的秒；缺失 / 不是数字 / 负数 / 非有限数是 None。
+fn delay_secs(value: &Value) -> Option<u64> {
+    let ms = value.as_f64()?;
+    if !ms.is_finite() || ms < 0.0 {
+        return None;
+    }
+    Some((ms / 1000.0).ceil() as u64)
 }
 
 fn stream_event(event: &Value, turn: &mut TurnStats) -> Vec<AgentEvent> {
@@ -191,6 +265,11 @@ fn joined_text_blocks(parts: &[Value]) -> Option<String> {
 }
 
 fn result_events(message: &Value, turn: &mut TurnStats) -> Vec<AgentEvent> {
+    // 重试超限被我们停掉：不管这条 result 是成功、中断还是错误，都只报我们自己的这一条
+    // （取走，之后不会再报第二次）。
+    if let Some(text) = turn.retry_stop.take() {
+        return vec![AgentEvent::Error { message: text }, AgentEvent::TurnEnd];
+    }
     let is_error = message["is_error"].as_bool() == Some(true);
     if !is_error {
         return vec![AgentEvent::TurnEnd];
@@ -459,6 +538,178 @@ ok
         assert_eq!(
             translate(&result, &mut state, &mut turn),
             vec![AgentEvent::TurnEnd]
+        );
+    }
+
+    fn retry_msg(attempt: u64, status: Value, error: &str, delay_ms: Value) -> Value {
+        json!({
+            "type": "system", "subtype": "api_retry",
+            "attempt": attempt, "max_retries": 10,
+            "retry_delay_ms": delay_ms, "error_status": status, "error": error,
+            "uuid": "u", "session_id": "s"
+        })
+    }
+
+    fn one_retry(message: &Value) -> (u32, String, Option<u64>) {
+        let mut state = TranslateState::default();
+        let mut turn = TurnStats::default();
+        let events = translate(message, &mut state, &mut turn);
+        match events.as_slice() {
+            [AgentEvent::Retrying {
+                attempt,
+                reason,
+                next_in_secs,
+            }] => (*attempt, reason.clone(), *next_in_secs),
+            other => panic!("该是一个 Retrying，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_retry_becomes_retrying_with_friendly_reason_and_rounded_delay() {
+        // 限流：状态码 429 / 类别 rate_limit；延迟 2500ms 向上取整成 3 秒。
+        let (attempt, reason, next) =
+            one_retry(&retry_msg(2, json!(429), "rate_limit", json!(2500)));
+        assert_eq!(attempt, 2);
+        assert_eq!(reason, "请求太频繁，被服务商限流了");
+        assert_eq!(next, Some(3));
+
+        // 过载：529 + overloaded；整秒不多进一位。
+        let (_, reason, next) = one_retry(&retry_msg(1, json!(529), "overloaded", json!(2000)));
+        assert_eq!(reason, "服务商那边暂时忙不过来");
+        assert_eq!(next, Some(2));
+
+        // 只有状态码 529、类别认不出：也能认成过载。
+        let (_, reason, _) = one_retry(&retry_msg(1, json!(529), "unknown", json!(500)));
+        assert_eq!(reason, "服务商那边暂时忙不过来");
+
+        // 服务端错误 500。
+        let (_, reason, next) = one_retry(&retry_msg(3, json!(500), "server_error", json!(0)));
+        assert_eq!(reason, "服务商那边暂时忙不过来");
+        assert_eq!(next, Some(0));
+    }
+
+    #[test]
+    fn api_retry_unrecognised_reasons_keep_the_original_text() {
+        // 认不出的类别 + 状态码：保留原文（下划线换成空格）。
+        let (_, reason, _) = one_retry(&retry_msg(
+            1,
+            json!(401),
+            "authentication_failed",
+            json!(1000),
+        ));
+        assert_eq!(reason, "authentication failed HTTP 401");
+        // 连接错误：状态码为 null、类别 unknown。
+        let (_, reason, _) = one_retry(&retry_msg(1, Value::Null, "unknown", json!(1000)));
+        assert_eq!(reason, "网络连接出错或超时");
+    }
+
+    #[test]
+    fn api_retry_quota_text_reaches_the_quota_sentence() {
+        // 如果 error 里带了额度类文字，走额度那一句（用通用说法，不提 opencode）。
+        let (_, reason, _) = one_retry(&retry_msg(
+            1,
+            json!(429),
+            "usage limit reached",
+            json!(1000),
+        ));
+        assert!(reason.starts_with("额度用完了（Claude Code 提示：usage limit reached HTTP 429）"));
+        assert!(!reason.contains("opencode"));
+    }
+
+    #[test]
+    fn api_retry_with_missing_or_odd_fields_never_panics() {
+        // 全缺：attempt 当 1，原因是连接问题，延迟 None。
+        let bare = json!({ "type": "system", "subtype": "api_retry" });
+        let (attempt, reason, next) = one_retry(&bare);
+        assert_eq!((attempt, next), (1, None));
+        assert_eq!(reason, "网络连接出错或超时");
+        // attempt 为 0 / 负数 / 字符串 / 超大：都落在 >= 1。
+        for odd in [json!(0), json!(-3), json!("2"), json!(null), json!(1.5)] {
+            let mut msg = retry_msg(1, json!(429), "rate_limit", json!(1000));
+            msg["attempt"] = odd;
+            assert!(one_retry(&msg).0 >= 1);
+        }
+        let mut huge = retry_msg(1, json!(429), "rate_limit", json!(1000));
+        huge["attempt"] = json!(u64::MAX);
+        assert_eq!(one_retry(&huge).0, u32::MAX);
+        // 延迟：负数 / 字符串 / null 都是 None。
+        for odd in [json!(-5), json!("x"), json!(null)] {
+            assert_eq!(
+                one_retry(&retry_msg(1, json!(429), "rate_limit", odd)).2,
+                None
+            );
+        }
+        // 状态码不是整数、类别不是字符串：不 panic。
+        let weird = json!({
+            "type": "system", "subtype": "api_retry", "attempt": 1,
+            "error_status": "429", "error": 7, "retry_delay_ms": 100
+        });
+        let _ = one_retry(&weird);
+    }
+
+    #[test]
+    fn other_system_messages_still_produce_no_events() {
+        let mut state = TranslateState::default();
+        let mut turn = TurnStats::default();
+        for message in [
+            json!({ "type": "system", "subtype": "init", "session_id": "s" }),
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+            json!({ "type": "system", "subtype": "api_error" }),
+            json!({ "type": "system" }),
+            json!({ "type": "rate_limit_event" }),
+        ] {
+            assert!(
+                translate(&message, &mut state, &mut turn).is_empty(),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_after_a_retry_stop_reports_our_error_exactly_once() {
+        let mut state = TranslateState::default();
+        // 中断带来的错误 result。
+        let interrupted = json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "result": "Request was aborted"
+        });
+        let mut turn = TurnStats {
+            aborted: true,
+            retry_stop: Some("重试了 3 次仍然失败：x。".to_string()),
+            ..Default::default()
+        };
+        let events = translate(&interrupted, &mut state, &mut turn);
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Error {
+                    message: "重试了 3 次仍然失败：x。".to_string()
+                },
+                AgentEvent::TurnEnd
+            ]
+        );
+        assert_eq!(turn.retry_stop, None);
+        // 再来一条 result（不该有，但要保证不会再报第二条错误）。
+        assert_eq!(
+            translate(&interrupted, &mut state, &mut turn),
+            vec![AgentEvent::TurnEnd]
+        );
+
+        // 即使 result 是成功的，也先报我们的错误。
+        let mut turn = TurnStats {
+            aborted: true,
+            retry_stop: Some("E".to_string()),
+            ..Default::default()
+        };
+        let ok = json!({ "type": "result", "subtype": "success", "is_error": false });
+        assert_eq!(
+            translate(&ok, &mut state, &mut turn),
+            vec![
+                AgentEvent::Error {
+                    message: "E".to_string()
+                },
+                AgentEvent::TurnEnd
+            ]
         );
     }
 }

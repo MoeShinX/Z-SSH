@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use super::retry::friendly_retry_reason;
 use super::AgentEvent;
 
 /// part 的类型（只关心这几种）。
@@ -124,36 +125,6 @@ fn next_in_secs(next: &Value, now_ms: u64) -> Option<u64> {
         return Some(0);
     }
     Some((diff_ms / 1000.0).ceil() as u64)
-}
-
-/// 把 opencode 重试状态里的原文换成人话（不区分大小写匹配，匹配不上就原样返回）。
-pub fn friendly_retry_reason(raw: &str) -> String {
-    let raw = raw.trim();
-    let lower = raw.to_lowercase();
-    let has = |keys: &[&str]| keys.iter().any(|k| lower.contains(k));
-    if has(&[
-        "free usage exceeded",
-        "usage limit",
-        "quota",
-        "credit",
-        "insufficient",
-    ]) {
-        format!("免费额度用完了（opencode 提示：{raw}）。可以换一个模型，或到 opencode.ai 查看额度 / 订阅")
-    } else if has(&["rate limit", "too many requests", "429"]) {
-        "请求太频繁，被服务商限流了".to_string()
-    } else if has(&[
-        "overloaded",
-        "unavailable",
-        "500",
-        "502",
-        "503",
-        "504",
-        "524",
-    ]) {
-        "服务商那边暂时忙不过来".to_string()
-    } else {
-        raw.to_string()
-    }
 }
 
 fn part_updated(props: &Value, state: &mut TranslateState) -> Vec<AgentEvent> {
@@ -701,41 +672,5 @@ mod tests {
         assert_eq!(next_in_secs(&Value::from(0), now), None);
         assert_eq!(next_in_secs(&Value::from(5000), now), None);
         assert_eq!(next_in_secs(&Value::from("x"), now), None);
-    }
-
-    #[test]
-    fn friendly_reason_branches() {
-        let quota = friendly_retry_reason("Free usage exceeded, subscribe to Go");
-        assert!(quota.starts_with("免费额度用完了（opencode 提示：Free usage exceeded"));
-        assert!(quota.contains("opencode.ai"));
-        assert!(friendly_retry_reason("You exceeded your current QUOTA").contains("免费额度"));
-        assert!(friendly_retry_reason("Insufficient credits").contains("免费额度"));
-        assert!(friendly_retry_reason("Usage Limit reached").contains("免费额度"));
-        assert_eq!(
-            friendly_retry_reason("Rate limit reached for requests"),
-            "请求太频繁，被服务商限流了"
-        );
-        assert_eq!(
-            friendly_retry_reason("Too Many Requests"),
-            "请求太频繁，被服务商限流了"
-        );
-        assert_eq!(
-            friendly_retry_reason("HTTP 429"),
-            "请求太频繁，被服务商限流了"
-        );
-        assert_eq!(
-            friendly_retry_reason("Overloaded"),
-            "服务商那边暂时忙不过来"
-        );
-        assert_eq!(
-            friendly_retry_reason("service Unavailable"),
-            "服务商那边暂时忙不过来"
-        );
-        assert_eq!(
-            friendly_retry_reason("status 503"),
-            "服务商那边暂时忙不过来"
-        );
-        assert_eq!(friendly_retry_reason("  something odd  "), "something odd");
-        assert_eq!(friendly_retry_reason(""), "");
     }
 }

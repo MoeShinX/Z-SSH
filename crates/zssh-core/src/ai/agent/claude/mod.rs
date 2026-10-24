@@ -35,6 +35,7 @@ use super::discovery;
 use super::process::{
     drain_tail_lines, idle_tick, kill_process_tree, push_tail, tail_buf, tail_text, TailBuf,
 };
+use super::retry::{retry_limit_message, retry_limit_reached, RETRY_STOP_GRACE};
 use super::{AgentConversation, AgentError, AgentEvent, AgentModel, AgentModelCatalog};
 use config::{ClaudeFlags, ModelChoice, StartArgs};
 use translate::{TranslateState, TurnStats};
@@ -95,6 +96,9 @@ struct Inner {
     retry_text: Option<String>,
     /// 已经在退回新会话重发了（发消息那边写失败时不要再报错）。
     fallback_inflight: bool,
+    /// 回合序号（每次发消息加一）：重试超限后的延时收尾任务靠它确认还是同一个回合，
+    /// 别误伤用户马上发的下一条消息。
+    turn_seq: u64,
 }
 
 /// 一个对话（一个进程）。
@@ -345,6 +349,7 @@ impl ClaudeConversation {
                     .is_some_and(|id| !id.trim().is_empty()),
                 retry_text: None,
                 fallback_inflight: false,
+                turn_seq: 0,
             }),
             process_lock: AsyncMutex::new(()),
             send_lock: AsyncMutex::new(()),
@@ -588,13 +593,41 @@ impl ClaudeConversation {
             return;
         }
 
-        let events = {
+        let (events, retry_stop_seq) = {
             let mut inner = self.lock();
+            // 重试超限的兜底收尾可能刚把这一代进程作废了：它后面吐的行不再认。
+            if inner.gen != gen {
+                return;
+            }
             inner.last_activity = Instant::now();
+            let seq = inner.turn_seq;
+            let busy = self.busy.load(Ordering::SeqCst);
             let Inner {
                 translate, turn, ..
             } = &mut *inner;
-            translate::translate(&message, translate, turn)
+            let mut events = Vec::new();
+            let mut stop = false;
+            for event in translate::translate(&message, translate, turn) {
+                if let AgentEvent::Retrying {
+                    attempt, reason, ..
+                } = &event
+                {
+                    // 回合不在跑 / 已被停止（用户点停止，或已经因超限停掉）时晚到的重试
+                    // 状态：忽略。
+                    if !busy || turn.aborted {
+                        continue;
+                    }
+                    if retry_limit_reached(*attempt) {
+                        // 第 3 次重试也失败了：这条不给界面看，直接停掉这一轮。
+                        turn.aborted = true;
+                        turn.retry_stop = Some(retry_limit_message(reason));
+                        stop = true;
+                        continue;
+                    }
+                }
+                events.push(event);
+            }
+            (events, stop.then_some(seq))
         };
         for event in events {
             let _ = self.events.send(event);
@@ -602,6 +635,63 @@ impl ClaudeConversation {
         if message["type"] == "result" {
             self.busy.store(false, Ordering::SeqCst);
             self.touch();
+        }
+        if let Some(seq) = retry_stop_seq {
+            self.stop_after_retry_limit(seq);
+        }
+    }
+
+    /// 重试超限：走和用户点「停止」同一条路径（[`Self::stop_inner`]，写 interrupt 控制消息），
+    /// 并保证这一回合一定收尾。
+    ///
+    /// 正常情况下 Claude Code 收到中断后会回一条 `result`，由 [`translate::translate`]
+    /// 先发错误再发 TurnEnd；万一它没回（中断被吞、进程卡住），宽限期过后由
+    /// [`Self::retry_stop_fallback`] 收尾。中断请求单独发，不占宽限期。
+    fn stop_after_retry_limit(&self, seq: u64) {
+        let weak = self.this.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let for_stop = weak.clone();
+        tokio::spawn(async move {
+            if let Some(conversation) = for_stop.upgrade() {
+                // 这个回合已经收尾、用户开了新回合：别把中断打到新回合上。
+                if conversation.lock().turn_seq != seq {
+                    return;
+                }
+                if let Err(err) = conversation.stop_inner().await {
+                    tracing::warn!(error = %err, "重试超限后中断回合失败");
+                }
+            }
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(RETRY_STOP_GRACE).await;
+            if let Some(conversation) = weak.upgrade() {
+                conversation.retry_stop_fallback(seq).await;
+            }
+        });
+    }
+
+    /// 重试超限后的兜底收尾：宽限期过了还是同一个回合、而且 `result` 还没来，就由我们
+    /// 发 `Error` + `TurnEnd`。
+    ///
+    /// 这时进程没有听中断，为了不让它晚到的 `result` 误伤用户之后发的新回合，先把这一代
+    /// 进程作废并杀掉（会话 id 留着，下次发消息 `--resume` 接上）。
+    async fn retry_stop_fallback(&self, seq: u64) {
+        let message = {
+            let mut inner = self.lock();
+            if inner.turn_seq != seq || !self.busy.load(Ordering::SeqCst) {
+                return;
+            }
+            // `result` 已经处理过会把它取走；还在就是没收尾。
+            let Some(message) = inner.turn.retry_stop.take() else {
+                return;
+            };
+            // 代数 +1：这个进程之后吐的行（包括晚到的 result）和 EOF 都不认。
+            inner.gen += 1;
+            message
+        };
+        self.kill_process().await;
+        if self.busy.swap(false, Ordering::SeqCst) && !self.closed.load(Ordering::SeqCst) {
+            let _ = self.events.send(AgentEvent::Error { message });
+            let _ = self.events.send(AgentEvent::TurnEnd);
         }
     }
 
@@ -612,7 +702,7 @@ impl ClaudeConversation {
         if self.begin_resume_fallback(gen) {
             return;
         }
-        let (was_busy, tail) = {
+        let (was_busy, tail, retry_stop) = {
             let mut inner = self.lock();
             if inner.gen != gen {
                 return;
@@ -620,13 +710,15 @@ impl ClaudeConversation {
             inner.child = None;
             inner.stdin = None;
             let tail = tail_text(&inner.stdout_tail, &inner.stderr_tail);
-            (self.busy.swap(false, Ordering::SeqCst), tail)
+            // 重试超限停掉之后进程退了：报我们那一条，不再冒出第二条「进程退出了」。
+            let retry_stop = inner.turn.retry_stop.take();
+            (self.busy.swap(false, Ordering::SeqCst), tail, retry_stop)
         };
         if was_busy && !self.closed.load(Ordering::SeqCst) {
             tracing::warn!(gen, detail = %tail, "claude 进程退出了");
-            let _ = self.events.send(AgentEvent::Error {
-                message: format!("claude 进程退出了，继续发消息会自动恢复上下文{tail}"),
-            });
+            let message = retry_stop
+                .unwrap_or_else(|| format!("claude 进程退出了，继续发消息会自动恢复上下文{tail}"));
+            let _ = self.events.send(AgentEvent::Error { message });
             let _ = self.events.send(AgentEvent::TurnEnd);
         }
     }
@@ -645,6 +737,7 @@ impl ClaudeConversation {
             let mut inner = self.lock();
             inner.turn = TurnStats::default();
             inner.translate = TranslateState::default();
+            inner.turn_seq += 1;
         }
 
         let choice = config::parse_model_choice(model);
@@ -1122,6 +1215,214 @@ mod tests {
             Ok(AgentEvent::Error { message }) => assert!(message.contains("进程退出")),
             other => panic!("要按普通退出报错：{other:?}"),
         }
+    }
+
+    // ---- AI-11：重试提示与 3 次上限 ----
+
+    fn api_retry_line(attempt: u64) -> String {
+        json!({
+            "type": "system", "subtype": "api_retry", "attempt": attempt, "max_retries": 10,
+            "retry_delay_ms": 2000, "error_status": 529, "error": "overloaded"
+        })
+        .to_string()
+    }
+
+    fn interrupted_result_line() -> String {
+        json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "result": "Request was aborted"
+        })
+        .to_string()
+    }
+
+    /// 取走已经到的全部事件。
+    fn drain(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut got = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            got.push(event);
+        }
+        got
+    }
+
+    async fn running_conversation() -> (
+        Arc<ClaudeConversation>,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        crate::test_util::TestDir,
+    ) {
+        let (conversation, rx, ws) = fake_conversation(None).await;
+        {
+            let mut inner = conversation.lock();
+            inner.gen = 5;
+            inner.turn_seq = 1;
+        }
+        conversation.busy.store(true, Ordering::SeqCst);
+        (conversation, rx, ws)
+    }
+
+    #[tokio::test]
+    async fn first_three_retries_reach_the_ui_and_do_not_stop_the_turn() {
+        let (conversation, mut rx, _ws) = running_conversation().await;
+        for attempt in 1..=3 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3);
+        for (i, event) in got.iter().enumerate() {
+            match event {
+                AgentEvent::Retrying {
+                    attempt,
+                    reason,
+                    next_in_secs,
+                } => {
+                    assert_eq!(*attempt as usize, i + 1);
+                    assert_eq!(reason, "服务商那边暂时忙不过来");
+                    assert_eq!(*next_in_secs, Some(2));
+                }
+                other => panic!("该是 Retrying，得到 {other:?}"),
+            }
+        }
+        assert!(
+            conversation.busy.load(Ordering::SeqCst),
+            "没超限，回合接着跑"
+        );
+        assert!(!conversation.lock().turn.aborted);
+        // 等一个宽限期：不该有任何收尾。
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(300)).await;
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// 第 4 次：不给界面、走停止路径；Claude Code 回了中断 result：先 Error 后 TurnEnd，
+    /// 各一次；兜底不重复。
+    #[tokio::test]
+    async fn fourth_retry_stops_then_result_ends_turn_with_one_error() {
+        let (conversation, mut rx, _ws) = running_conversation().await;
+        for attempt in 1..=4 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3, "只有前 3 次给界面：{got:?}");
+        assert!(got.iter().all(|e| matches!(e, AgentEvent::Retrying { .. })));
+        {
+            let inner = conversation.lock();
+            assert!(inner.turn.aborted, "走的是停止路径的标记");
+            assert!(inner.turn.retry_stop.is_some());
+        }
+        // 超限之后还有更多重试状态：忽略。
+        conversation.handle_line(5, &api_retry_line(5)).await;
+        assert!(drain(&mut rx).is_empty());
+
+        // 中断后的 result 到了。
+        conversation
+            .handle_line(5, &interrupted_result_line())
+            .await;
+        let got = drain(&mut rx);
+        match got.as_slice() {
+            [AgentEvent::Error { message }, AgentEvent::TurnEnd] => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+                assert!(message.contains("服务商那边暂时忙不过来"));
+                assert!(message.ends_with("已停止这一轮，可以稍后再试或换一个模型。"));
+            }
+            other => panic!("要先 Error 后 TurnEnd：{other:?}"),
+        }
+        assert!(!conversation.busy.load(Ordering::SeqCst));
+        // 兜底到点：已经收尾了，什么都不再发。
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty(), "不能重复报错或重复收尾");
+    }
+
+    /// 中断被吞、result 一直不来：宽限期后由我们发 Error + TurnEnd，并作废旧进程。
+    #[tokio::test]
+    async fn fourth_retry_falls_back_to_our_own_error_and_turn_end() {
+        let (conversation, mut rx, _ws) = running_conversation().await;
+        for attempt in 1..=4 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        drain(&mut rx);
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(1500)).await;
+        let got = drain(&mut rx);
+        match got.as_slice() {
+            [AgentEvent::Error { message }, AgentEvent::TurnEnd] => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+            }
+            other => panic!("要兜底 Error + TurnEnd：{other:?}"),
+        }
+        assert!(!conversation.busy.load(Ordering::SeqCst));
+        // 旧进程晚到的 result / EOF 不再起作用（代数已作废）：不会重复收尾。
+        conversation
+            .handle_line(5, &interrupted_result_line())
+            .await;
+        conversation.on_process_gone(5);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// 兜底不误伤新回合：宽限期内用户已经开了下一个回合，兜底什么都不做。
+    #[tokio::test]
+    async fn fallback_does_not_touch_a_newer_turn() {
+        let (conversation, mut rx, _ws) = running_conversation().await;
+        for attempt in 1..=4 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        drain(&mut rx);
+        // result 来了、回合收尾，用户马上发了下一条（回合序号 +1、状态重置）。
+        conversation
+            .handle_line(5, &interrupted_result_line())
+            .await;
+        assert_eq!(drain(&mut rx).len(), 2);
+        {
+            let mut inner = conversation.lock();
+            inner.turn = TurnStats::default();
+            inner.turn_seq += 1;
+        }
+        conversation.busy.store(true, Ordering::SeqCst);
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty(), "新回合不能被旧的兜底收尾");
+        assert!(conversation.busy.load(Ordering::SeqCst));
+        // 新回合自己的重试也从头放行。
+        conversation.handle_line(5, &api_retry_line(1)).await;
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [AgentEvent::Retrying { attempt: 1, .. }]
+        ));
+    }
+
+    /// 回合不在跑 / 用户已经点了停止：晚到的重试状态忽略，不报错、不收尾。
+    #[tokio::test]
+    async fn late_retry_after_user_stop_or_turn_end_is_ignored() {
+        let (conversation, mut rx, _ws) = running_conversation().await;
+        conversation.lock().turn.aborted = true; // 用户点了停止
+        for attempt in 1..=5 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(conversation.lock().turn.retry_stop.is_none());
+
+        conversation.lock().turn = TurnStats::default();
+        conversation.busy.store(false, Ordering::SeqCst); // 回合已结束
+        for attempt in 1..=5 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        assert!(drain(&mut rx).is_empty());
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(300)).await;
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// 重试超限停掉之后进程直接退出：报我们那一条，不再冒出「进程退出了」。
+    #[tokio::test]
+    async fn process_exit_after_retry_stop_reports_only_our_error() {
+        let (conversation, mut rx, _ws) = running_conversation().await;
+        for attempt in 1..=4 {
+            conversation.handle_line(5, &api_retry_line(attempt)).await;
+        }
+        drain(&mut rx);
+        conversation.on_process_gone(5);
+        match drain(&mut rx).as_slice() {
+            [AgentEvent::Error { message }, AgentEvent::TurnEnd] => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(600)).await;
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]

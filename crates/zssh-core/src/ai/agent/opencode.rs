@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::discovery::{self, AgentInstall};
+use super::retry::{retry_limit_message, retry_limit_reached, RETRY_STOP_GRACE};
 use super::translate::{translate_event, TranslateState};
 use super::{AgentConversation, AgentError, AgentEvent, AgentModel, AgentModelCatalog};
 
@@ -49,23 +50,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 空回复时给用户的提示。
 const EMPTY_RESPONSE_HINT: &str =
     "opencode 没有返回任何内容。请在终端运行 opencode 完成登录和模型配置，然后再试。";
-
-/// 同一回合里最多放行几次 opencode 的自动重试；第 4 次重试状态（attempt >= 4，说明第 3 次
-/// 重试也失败了）一到就停掉这一轮。
-const MAX_RETRIES: u32 = 3;
-
-/// 因重试超限而停止时，等 opencode 自己收尾（发 idle）的宽限；到点还没收到就由我们收尾。
-const RETRY_STOP_GRACE: Duration = Duration::from_millis(1500);
-
-/// 这条重试状态是否已经超过放行次数。
-fn retry_limit_reached(attempt: u32) -> bool {
-    attempt > MAX_RETRIES
-}
-
-/// 重试超限时给用户的错误文字（`reason` 是已经友好化的原因）。
-fn retry_limit_message(reason: &str) -> String {
-    format!("重试了 {MAX_RETRIES} 次仍然失败：{reason}。已停止这一轮，可以稍后再试或换一个模型。")
-}
 
 /// 启动参数（进程级：所有对话共用）。
 pub struct StartOptions {
