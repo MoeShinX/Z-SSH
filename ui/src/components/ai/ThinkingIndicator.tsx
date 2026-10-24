@@ -83,7 +83,7 @@ export default function ThinkingIndicator({
         <span>思考中</span>
       </div>
       {retry && (
-        <p data-section="ai-retrying" className="text-[11px] text-amber-600">
+        <p data-section="ai-retrying" className="text-[11px] text-amber-600 dark:text-amber-400">
           {retryText(retry)}
         </p>
       )}

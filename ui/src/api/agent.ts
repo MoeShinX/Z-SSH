@@ -76,7 +76,7 @@ export type AgentEvent =
   | { kind: "tool_end"; call_id: string; tool: string; output: string; error: boolean }
   | { kind: "turn_end" }
   | { kind: "error"; message: string }
-  /** 智能体遇到额度用完 / 限流 / 过载，正在自动重试（opencode）；`reason` 已经是人话。 */
+  /** 智能体遇到额度用完 / 限流 / 过载，正在自动重试（opencode / Claude Code / Codex 都会发）；`reason` 已经是人话。 */
   | { kind: "retrying"; attempt: number; reason: string; next_in_secs: number | null }
   /** 续接历史会话失败，已作为新会话继续。 */
   | { kind: "resume_failed" };

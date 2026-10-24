@@ -190,6 +190,10 @@ struct ThreadInner {
     /// 重试超限、兜底收尾时放弃的回合 id：codex 之后再发的、属于这个回合的通知
     /// （包括晚到的 `turn/completed`）一律丢掉，免得误伤之后的新回合。
     abandoned_turn: Option<String>,
+    /// 被放弃回合的回合序号：兜底时可能还不知道回合 id（`abandoned_turn` 为空），这时靠
+    /// 「序号没变 = 还是同一个回合」认出晚到的 `turn/completed`。新回合一开始序号就变了，
+    /// 不会误伤；0 表示没有放弃中的回合。
+    abandoned_seq: u64,
 }
 
 impl ThreadEntry {
@@ -641,6 +645,7 @@ impl CodexRuntime {
                 turn: TurnStats::default(),
                 turn_seq: 0,
                 abandoned_turn: None,
+                abandoned_seq: 0,
             }),
             busy: AtomicBool::new(false),
             turn_id: Mutex::new(None),
@@ -963,6 +968,7 @@ fn retry_stop_fallback_now(thread: &ThreadEntry, seq: u64) -> Option<String> {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         inner.abandoned_turn = abandoned.clone();
+        inner.abandoned_seq = seq;
         (message, abandoned)
     };
     thread.stop_requested.store(false, Ordering::SeqCst);
@@ -1200,11 +1206,21 @@ async fn handle_notification(shared: &Arc<Shared>, method_name: &str, params: &V
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // 重试超限时被我们放弃的回合：它之后发的通知（含晚到的 turn/completed）不认，
-        // 免得误伤之后开的新回合。
+        // 免得误伤之后开的新回合。知道回合 id 按 id 认；兜底时还不知道 id 的按回合序号认
+        // （序号没变就是同一个回合）——不然晚到的 turn/completed 会再发一次 TurnEnd。
+        if method_name == method::TURN_COMPLETED
+            && inner.abandoned_seq != 0
+            && inner.abandoned_seq == inner.turn_seq
+        {
+            inner.abandoned_seq = 0;
+            inner.abandoned_turn = None;
+            return;
+        }
         if let Some(abandoned) = inner.abandoned_turn.as_deref() {
             if turn_id_of(params) == Some(abandoned) {
                 if method_name == method::TURN_COMPLETED {
                     inner.abandoned_turn = None;
+                    inner.abandoned_seq = 0;
                 }
                 return;
             }
@@ -1469,6 +1485,7 @@ mod tests {
                 turn: TurnStats::default(),
                 turn_seq: 1,
                 abandoned_turn: None,
+                abandoned_seq: 0,
             }),
             busy: AtomicBool::new(true),
             turn_id: Mutex::new(Some("turn-1".to_string())),
@@ -1636,6 +1653,58 @@ mod tests {
             drain(&mut rx).as_slice(),
             [AgentEvent::Retrying { attempt: 1, .. }]
         ));
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-2", "completed"),
+        )
+        .await;
+        assert_eq!(drain(&mut rx), vec![AgentEvent::TurnEnd]);
+    }
+
+    /// 兜底时还不知道回合 id（turn_id 是 None）：晚到的 turn/completed 按回合序号认出来
+    /// 丢掉，不能再发一次 TurnEnd。
+    #[tokio::test]
+    async fn fallback_without_turn_id_ignores_late_completion_by_seq() {
+        let shared = test_shared();
+        let (thread, mut rx) = running_thread(&shared);
+        *thread.turn_id.lock().unwrap() = None;
+        for n in 1..=4 {
+            handle_notification(&shared, "error", &retry_notice(n)).await;
+        }
+        drain(&mut rx);
+        tokio::time::sleep(RETRY_STOP_GRACE + Duration::from_millis(1500)).await;
+        match drain(&mut rx).as_slice() {
+            [AgentEvent::Error { message }, AgentEvent::TurnEnd] => {
+                assert!(message.starts_with("重试了 3 次仍然失败："), "{message}");
+            }
+            other => panic!("要兜底 Error + TurnEnd：{other:?}"),
+        }
+        // 没有回合 id 可记，只记了序号。
+        assert!(thread.inner.lock().unwrap().abandoned_turn.is_none());
+        assert_ne!(thread.inner.lock().unwrap().abandoned_seq, 0);
+
+        // 晚到的 turn/completed（还是同一个回合，序号没变）：不能再发 TurnEnd。
+        handle_notification(
+            &shared,
+            method::TURN_COMPLETED,
+            &completed("turn-9", "interrupted"),
+        )
+        .await;
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(
+            thread.inner.lock().unwrap().abandoned_seq,
+            0,
+            "吞掉后清掉记录"
+        );
+
+        // 序号变了的下一个回合不受影响，照常收尾。
+        {
+            let mut inner = thread.inner.lock().unwrap();
+            inner.turn = TurnStats::default();
+            inner.turn_seq += 1;
+        }
+        thread.busy.store(true, Ordering::SeqCst);
         handle_notification(
             &shared,
             method::TURN_COMPLETED,

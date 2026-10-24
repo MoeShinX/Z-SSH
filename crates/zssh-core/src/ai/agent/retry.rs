@@ -20,8 +20,14 @@ pub fn retry_limit_reached(attempt: u32) -> bool {
     attempt > MAX_RETRIES
 }
 
-/// 重试超限时给用户的错误文字（`reason` 是已经友好化的原因）。
+/// 重试超限时给用户的错误文字（`reason` 是已经友好化的原因；为空就别说空的冒号）。
 pub fn retry_limit_message(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return format!(
+            "重试了 {MAX_RETRIES} 次仍然失败。已停止这一轮，可以稍后再试或换一个模型。"
+        );
+    }
     format!("重试了 {MAX_RETRIES} 次仍然失败：{reason}。已停止这一轮，可以稍后再试或换一个模型。")
 }
 
@@ -50,21 +56,38 @@ fn classify(raw: &str) -> ReasonKind {
         "insufficient",
     ]) {
         ReasonKind::Quota
-    } else if has(&["rate limit", "too many requests", "429"]) {
+    } else if has(&["rate limit", "too many requests"]) || has_code(&lower, "429") {
         ReasonKind::RateLimited
-    } else if has(&[
-        "overloaded",
-        "unavailable",
-        "500",
-        "502",
-        "503",
-        "504",
-        "524",
-    ]) {
+    } else if has(&["overloaded", "unavailable"])
+        || ["500", "502", "503", "504", "524"]
+            .iter()
+            .any(|code| has_code(&lower, code))
+    {
         ReasonKind::Overloaded
     } else {
         ReasonKind::Other
     }
+}
+
+/// 数字状态码按词边界匹配：`HTTP 500`、`500 Internal Server Error`、`status: 503` 认，
+/// `x-500`、`5000 tokens`、`gpt-429b` 这种子串不算（不然随便一个数字都像状态码）。
+fn has_code(lower: &str, code: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut start = 0;
+    while let Some(at) = lower[start..].find(code) {
+        let at = start + at;
+        // 两侧都不能是字母数字或连字符：`HTTP 500`、`(524)`、`status: 503` 认；
+        // `x-500`、`5000 tokens`、`gpt-429b`、`15003` 里的 `500` 不算。
+        let boundary = |b: u8| !b.is_ascii_alphanumeric() && b != b'-';
+        let before_ok = at == 0 || boundary(bytes[at - 1]);
+        let end = at + code.len();
+        let after_ok = end == bytes.len() || boundary(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
 }
 
 const RATE_LIMITED_TEXT: &str = "请求太频繁，被服务商限流了";
@@ -152,6 +175,28 @@ mod tests {
         );
         assert_eq!(friendly_retry_reason("  something odd  "), "something odd");
         assert_eq!(friendly_retry_reason(""), "");
+    }
+
+    #[test]
+    fn status_codes_match_on_word_boundaries_only() {
+        // 认得出的：HTTP 500、行首 503、status: 504、句尾 524。
+        for raw in [
+            "HTTP 500 Internal Server Error",
+            "503 Service Unavailable",
+            "status: 504",
+            "gateway timeout (524)",
+        ] {
+            assert_eq!(friendly_retry_reason(raw), OVERLOADED_TEXT, "{raw}");
+        }
+        // 认不出的：是别的数字的一部分，不是状态码。
+        for raw in [
+            "model x-500",
+            "5000 tokens remaining",
+            "gpt-429b",
+            "error 15003",
+        ] {
+            assert_eq!(friendly_retry_reason(raw), raw, "{raw}");
+        }
     }
 
     #[test]

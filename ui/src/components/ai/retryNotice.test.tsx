@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   aiAgentDiscover: vi.fn(async (agent: string) =>
     ["opencode", "claude", "codex"].includes(agent)
       ? {
-          path: "C:\tools\opencode\opencode.exe",
+          path: "C:\\tools\\opencode\\opencode.exe",
           version: "1.19.4",
           source: "tools_dir" as const,
           needs_shell: false,
