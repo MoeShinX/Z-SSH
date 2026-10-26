@@ -79,6 +79,25 @@ pub async fn identity_save(
     state.store.identity_save(&draft).map_err(to_message)
 }
 
+/// 主机编辑面板里点「小眼睛」：取出这条**密码凭据**的明文显示在密码框里。
+/// 只在用户点的时候调用（平时前端拿不到密码）；私钥、口令不从这里给出。
+#[tauri::command]
+pub async fn identity_reveal_password(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<String, String> {
+    state
+        .store
+        .identity_saved_password(id)
+        // 交给前端显示，前端那边已经是普通字符串了，这里不再保留 Zeroizing
+        .map(|password| password.as_str().to_owned())
+        .map_err(|err| match err {
+            // 规则类错误只给原因本身，不带「输入不合法：」前缀
+            zssh_core::ZsshError::InvalidInput(message) => message,
+            other => other.to_string(),
+        })
+}
+
 #[tauri::command]
 pub async fn identity_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     state.store.identity_delete(id).map_err(to_message)

@@ -876,17 +876,22 @@ fn append_capped(buffer: &mut Vec<u8>, truncated: &mut u64, data: &[u8], cap: us
 }
 
 impl ClientHandler {
-    /// 指纹变化时还是让界面弹一次红框（让用户看到新指纹），但决定权不在用户手里。
-    async fn tell_user_key_changed(&self, server_key: &ServerKey) {
+    /// 指纹变化 / 吊销时弹红框，给用户看旧指纹和新指纹，返回用户的回答。
+    async fn ask_about_changed_key(
+        &self,
+        server_key: &ServerKey,
+        status: HostKeyStatus,
+        stored_fingerprint: &str,
+    ) -> HostKeyDecision {
         let info = HostKeyInfo {
             host: self.host.clone(),
             port: self.port,
             key_type: server_key.key_type.clone(),
             fingerprint: server_key.fingerprint.clone(),
-            status: HostKeyStatus::Changed,
+            status,
+            stored_fingerprint: Some(stored_fingerprint.to_owned()),
         };
-        let decision = self.interactor.confirm_host_key(info).await;
-        warn!(host = %self.host, ?decision, "主机指纹变化，阻断连接");
+        self.interactor.confirm_host_key(info).await
     }
 }
 
@@ -1130,6 +1135,7 @@ impl client::Handler for ClientHandler {
                     key_type: server_key.key_type.clone(),
                     fingerprint: server_key.fingerprint.clone(),
                     status,
+                    stored_fingerprint: None,
                 };
 
                 match self.interactor.confirm_host_key(info).await {
@@ -1150,12 +1156,28 @@ impl client::Handler for ClientHandler {
                 }
             }
 
-            // 指纹变化：弹窗只让用户关掉，就算回答"信任"也一律拒绝（设计文档 4.4）
+            // 指纹变化：红框里给用户看旧 / 新指纹。只有明确选「更新指纹」才把旧记录换成新的并继续
+            // （服务器重装、DD 之后最常见，这样不用先去设置里清指纹再连一次，保存的密码照常用）；
+            // 「仅本次」不算数——无人值守的实现回答的就是它，不能借此悄悄接受换过的密钥。
             HostKeyLookup::Changed {
                 stored_fingerprint,
                 stored_in,
             } => {
-                self.tell_user_key_changed(&server_key).await;
+                let decision = self
+                    .ask_about_changed_key(&server_key, HostKeyStatus::Changed, &stored_fingerprint)
+                    .await;
+                if decision == HostKeyDecision::TrustAndSave {
+                    let removed = self.known_hosts.replace(&self.host, self.port, &public)?;
+                    warn!(
+                        host = %self.host,
+                        removed,
+                        old = %stored_fingerprint,
+                        new = %server_key.fingerprint,
+                        "用户确认主机指纹变化，已更新保存的指纹"
+                    );
+                    return Ok(true);
+                }
+                warn!(host = %self.host, ?decision, "主机指纹变化，阻断连接");
                 let (stored_in, advice) = describe_source(&stored_in, &self.host, self.port);
                 Err(ZsshError::HostKeyChanged(Box::new(HostKeyMismatch {
                     host: self.host.clone(),
@@ -1168,12 +1190,15 @@ impl client::Handler for ClientHandler {
                 })))
             }
 
-            // @revoked：命中就当指纹变化处理
+            // @revoked：红框只能关闭，任何回答都拒绝
             HostKeyLookup::Revoked {
                 stored_fingerprint,
                 stored_in,
             } => {
-                self.tell_user_key_changed(&server_key).await;
+                let decision = self
+                    .ask_about_changed_key(&server_key, HostKeyStatus::Revoked, &stored_fingerprint)
+                    .await;
+                warn!(host = %self.host, ?decision, "主机密钥已被吊销，阻断连接");
                 let (stored_in, advice) = describe_source(&stored_in, &self.host, self.port);
                 Err(ZsshError::HostKeyRevoked(Box::new(
                     crate::error::HostKeyRevokedInfo {

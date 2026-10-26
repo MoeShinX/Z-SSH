@@ -11,6 +11,7 @@ function hostKey(reqId: number): PendingPrompt {
     key_type: "ssh-ed25519",
     fingerprint: "SHA256:abc",
     status: "unknown",
+    stored_fingerprint: null,
   };
   return { kind: "hostkey", prompt };
 }

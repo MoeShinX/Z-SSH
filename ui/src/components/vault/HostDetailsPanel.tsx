@@ -3,11 +3,11 @@
 //!
 //! 字段和 M1-03～M1-05 一致；数据走我们自己的 stores/vault。
 
-import { useEffect, useState } from "react";
-import { Network } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Eye, EyeOff, Network } from "lucide-react";
 
 import { hostkeyForget, hostkeySaved } from "../../api/auth";
-import type { AuthMethod, Host, HostDraft, ProxyMode } from "../../api/vault";
+import { revealIdentityPassword, type AuthMethod, type Host, type HostDraft, type ProxyMode } from "../../api/vault";
 import { cn } from "../../lib/utils";
 import { identityFitsAuth } from "./authIdentity";
 import HostMemorySection from "./HostMemorySection";
@@ -82,6 +82,12 @@ export default function HostDetailsPanel({
   const [jumpHostId, setJumpHostId] = useState(host?.jump_host_id == null ? "none" : String(host.jump_host_id));
   // 留空表示不改已存的密码
   const [password, setPassword] = useState("");
+  // 密码框默认不显示明文；点小眼睛才显示。框里还空着时点它，先从保险库取出已存的密码
+  const [showPassword, setShowPassword] = useState(false);
+  const [revealing, setRevealing] = useState(false);
+  // 取出来的是哪条凭据的已存密码：保存时和它一样就不算改密码（不重写保险库）；
+  // 换了凭据或认证方式就作废，免得把 A 凭据的密码存进 B 凭据
+  const [revealed, setRevealed] = useState<{ identityId: string; value: string } | null>(null);
   const [remember, setRemember] = useState(true);
   const [busy, setBusy] = useState(false);
   const [legacyAlgorithms, setLegacyAlgorithms] = useState(host?.legacy_algorithms ?? false);
@@ -107,6 +113,45 @@ export default function HostDetailsPanel({
   }, [host]);
 
   const selectedIdentity = identities.find((item) => String(item.id) === identityId);
+  const canReveal =
+    authMethod === "password" &&
+    selectedIdentity?.kind === "password" &&
+    selectedIdentity.has_secret;
+  const identityIdRef = useRef(identityId);
+  identityIdRef.current = identityId;
+  const revealedRef = useRef(revealed);
+  revealedRef.current = revealed;
+  useEffect(() => {
+    const current = revealedRef.current;
+    if (!current || (current.identityId === identityId && authMethod === "password")) return;
+    setRevealed(null);
+    setShowPassword(false);
+    setPassword((typed) => (typed === current.value ? "" : typed));
+  }, [identityId, authMethod]);
+
+  const togglePassword = async () => {
+    if (showPassword) {
+      setShowPassword(false);
+      return;
+    }
+    if (password === "" && canReveal && selectedIdentity) {
+      const requested = identityId;
+      setRevealing(true);
+      try {
+        const value = await revealIdentityPassword(selectedIdentity.id);
+        // 等待期间换了凭据：取回来的已经不是现在这条的密码，丢掉
+        if (identityIdRef.current !== requested) return;
+        setRevealed({ identityId: requested, value });
+        setPassword(value);
+      } catch (error: unknown) {
+        onError(String(error));
+        return;
+      } finally {
+        setRevealing(false);
+      }
+    }
+    setShowPassword(true);
+  };
   // 只列和认证方式配套的凭据（R-10 H2）：密码认证选了私钥凭据，私钥会被当成密码发给服务器。
   const fittingIdentities = identities.filter((item) => identityFitsAuth(item.kind, authMethod));
   // 原来存的组合就不配套（旧数据或同步来的）：取消选择，并告诉用户为什么。
@@ -133,8 +178,11 @@ export default function HostDetailsPanel({
     try {
       let resolvedIdentity: number | null = identityId === "none" ? null : Number(identityId);
 
-      // 填了密码才动保险库：选了凭据就覆盖它的密码，没选就新建一条
-      if (password !== "" && authMethod === "password") {
+      // 填了密码才动保险库：选了凭据就覆盖它的密码，没选就新建一条。
+      // 只是点小眼睛看了一下已存的密码、没改：不算改密码
+      const passwordChanged =
+        password !== "" && !(revealed?.identityId === identityId && revealed.value === password);
+      if (passwordChanged && authMethod === "password") {
         if (resolvedIdentity !== null) {
           const selected = identities.find((item) => item.id === resolvedIdentity);
           await saveIdentity({
@@ -277,13 +325,32 @@ export default function HostDetailsPanel({
                 {passwordHint}
               </span>
             </Label>
-            <Input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              className="h-9"
-              autoComplete="off"
-            />
+            <div className="relative">
+              <Input
+                type={showPassword ? "text" : "password"}
+                data-field="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                // 已存了密码但还没取出来：用圆点示意"这里有密码"，点小眼睛才取明文
+                placeholder={canReveal && password === "" ? "••••••••" : undefined}
+                className={cn("h-9", (canReveal || password !== "") && "pr-9")}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {(canReveal || password !== "") && (
+                <button
+                  type="button"
+                  data-action="toggle-password"
+                  aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                  title={showPassword ? "隐藏密码" : "显示密码"}
+                  disabled={revealing}
+                  onClick={() => void togglePassword()}
+                  className="absolute right-1 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
+                >
+                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              )}
+            </div>
           </div>
           <label className="flex items-center justify-between gap-2 text-[13px]">
             <span>没有选凭据时，把密码存成一条新凭据</span>

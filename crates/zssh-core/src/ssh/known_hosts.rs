@@ -147,18 +147,41 @@ impl KnownHosts {
     ///
     /// 追加而不是重写，配合进程内的锁，多个连接同时确认同一台主机也不会写坏。
     pub fn append(&self, host: &str, port: u16, key: &PublicKey) -> Result<(), ZsshError> {
+        let line = Self::entry_line(host, port, key)?;
+        let _guard = write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.append_locked(&line)
+    }
+
+    /// 指纹变化后用户确认「更新指纹」：删掉自己文件里这台主机的全部旧记录，再写上这把新密钥。
+    /// 两步在同一把锁里做，别的连接不会在中间读到"旧的删了、新的还没写"。
+    ///
+    /// 旧记录在只读的系统文件里时也够用：查找时自己的文件优先，写进来的新记录会盖过它
+    /// （系统文件本身照旧不碰）。返回删掉的旧记录条数。
+    pub fn replace(&self, host: &str, port: u16, key: &PublicKey) -> Result<usize, ZsshError> {
+        let line = Self::entry_line(host, port, key)?;
+        let _guard = write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = self.forget_locked(host, port, true)?;
+        self.append_locked(&line)?;
+        Ok(removed)
+    }
+
+    /// 一条要写进文件的记录（含换行）。
+    fn entry_line(host: &str, port: u16, key: &PublicKey) -> Result<String, ZsshError> {
         check_host_address(host).map_err(ZsshError::HostKeyStore)?;
-        let line = format!(
+        Ok(format!(
             "{} {}\n",
             host_pattern(host, port),
             key.to_openssh()
                 .map_err(|err| ZsshError::HostKeyStore(format!("公钥序列化失败：{err}")))?
-        );
+        ))
+    }
 
-        let _guard = write_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
+    /// 调用方必须已经拿着 `write_lock`。
+    fn append_locked(&self, line: &str) -> Result<(), ZsshError> {
         if let Some(parent) = self.our_file.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| ZsshError::HostKeyStore(format!("建目录失败：{err}")))?;
@@ -182,7 +205,12 @@ impl KnownHosts {
         let _guard = write_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.forget_locked(host, port, false)
+    }
 
+    /// 调用方必须已经拿着 `write_lock`。`keep_revoked`：`@revoked` 行留着不删——更新指纹时
+    /// 只换掉旧的普通记录，吊销过的密钥以后出现照样拦。
+    fn forget_locked(&self, host: &str, port: u16, keep_revoked: bool) -> Result<usize, ZsshError> {
         let content = match read_known_hosts(&self.our_file) {
             Ok(Some(content)) => content,
             Ok(None) => return Ok(0),
@@ -199,10 +227,10 @@ impl KnownHosts {
         let mut kept = String::with_capacity(content.len());
         for line in content.lines() {
             let entry = parse_line(line);
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.matches_host(&wanted))
-            {
+            if entry.as_ref().is_some_and(|entry| {
+                entry.matches_host(&wanted)
+                    && !(keep_revoked && entry.marker == Some(Marker::Revoked))
+            }) {
                 removed += 1;
                 continue;
             }
@@ -317,7 +345,8 @@ impl HostKeyLookup {
         match self {
             Self::Unknown => Some(HostKeyStatus::Unknown),
             Self::OtherKeyTypes => Some(HostKeyStatus::OtherKeyTypesSaved),
-            Self::Changed { .. } | Self::Revoked { .. } => Some(HostKeyStatus::Changed),
+            Self::Changed { .. } => Some(HostKeyStatus::Changed),
+            Self::Revoked { .. } => Some(HostKeyStatus::Revoked),
             Self::Match | Self::Unreadable { .. } => None,
         }
     }
@@ -847,6 +876,100 @@ mod tests {
 
         // 再删一次就没有了
         assert_eq!(known.forget("a.example.com", 22).expect("删除"), 0);
+    }
+
+    #[test]
+    fn replace_swaps_the_old_key_for_the_new_one_and_leaves_other_hosts_alone() {
+        let file = TempFile::new();
+        let known = KnownHosts::new(&file.path);
+        known
+            .append("example.com", 22, &key(ED25519_A))
+            .expect("写入");
+        known
+            .append("other.example.com", 22, &key(ED25519_A))
+            .expect("写入");
+        assert!(matches!(
+            known.lookup("example.com", 22, &key(ED25519_B)),
+            HostKeyLookup::Changed { .. }
+        ));
+
+        assert_eq!(
+            known
+                .replace("example.com", 22, &key(ED25519_B))
+                .expect("更新"),
+            1
+        );
+        assert_eq!(
+            known.lookup("example.com", 22, &key(ED25519_B)),
+            HostKeyLookup::Match
+        );
+        assert!(
+            matches!(
+                known.lookup("example.com", 22, &key(ED25519_A)),
+                HostKeyLookup::Changed { .. }
+            ),
+            "旧密钥不能再算数"
+        );
+        assert_eq!(
+            known.lookup("other.example.com", 22, &key(ED25519_A)),
+            HostKeyLookup::Match,
+            "别的主机的记录不动"
+        );
+    }
+
+    #[test]
+    fn replace_keeps_revocations() {
+        let file = TempFile::new();
+        file.write(&format!(
+            "example.com {ED25519_A}\n@revoked example.com {ED25519_C}\n"
+        ));
+        let known = KnownHosts::new(&file.path);
+        known
+            .replace("example.com", 22, &key(ED25519_B))
+            .expect("更新");
+        assert_eq!(
+            known.lookup("example.com", 22, &key(ED25519_B)),
+            HostKeyLookup::Match
+        );
+        assert!(
+            matches!(
+                known.lookup("example.com", 22, &key(ED25519_C)),
+                HostKeyLookup::Revoked { .. }
+            ),
+            "吊销记录要留着"
+        );
+    }
+
+    #[test]
+    fn replace_overrides_an_old_entry_in_the_read_only_system_file() {
+        let ours = TempFile::new();
+        let system = TempFile::new();
+        system.write(&format!("example.com {ED25519_A}\n"));
+        let known = KnownHosts::new(&ours.path).with_read_only(&system.path);
+        assert!(matches!(
+            known.lookup("example.com", 22, &key(ED25519_B)),
+            HostKeyLookup::Changed {
+                stored_in: StoredIn::System(_),
+                ..
+            }
+        ));
+
+        assert_eq!(
+            known
+                .replace("example.com", 22, &key(ED25519_B))
+                .expect("更新"),
+            0
+        );
+        assert_eq!(
+            known.lookup("example.com", 22, &key(ED25519_B)),
+            HostKeyLookup::Match,
+            "自己的文件优先，新记录盖过系统文件里的旧记录"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&system.path).expect("读系统文件"),
+            format!("example.com {ED25519_A}\n"),
+            "系统文件不碰"
+        );
     }
 
     #[test]

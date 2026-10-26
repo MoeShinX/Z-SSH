@@ -471,6 +471,7 @@ fn main() {
             commands::forward::forward_statuses,
             commands::vault::identity_generate,
             commands::vault::identity_public_key,
+            commands::vault::identity_reveal_password,
             commands::vault::host_install_public_key,
             commands::vault::proxy_list,
             commands::vault::proxy_save,

@@ -26,8 +26,11 @@ pub enum HostKeyDecision {
 pub enum HostKeyStatus {
     /// 没见过这台主机
     Unknown,
-    /// 有记录但指纹不一样：必须阻断，界面上不提供继续
+    /// 有记录但指纹不一样：红色警告；只有用户明确选「更新指纹」（`TrustAndSave`）才继续，
+    /// 旧记录被换成新的（服务器重装 / DD 后最常见）
     Changed,
+    /// 命中了 `@revoked`：只能关闭，任何回答都不继续
+    Revoked,
     /// 只记过这台主机的其它类型密钥
     OtherKeyTypesSaved,
 }
@@ -42,6 +45,8 @@ pub struct HostKeyInfo {
     /// OpenSSH 格式的 SHA256 指纹
     pub fingerprint: String,
     pub status: HostKeyStatus,
+    /// 指纹变化 / 吊销时，已保存的那条旧指纹（让用户对比）；其它情况没有
+    pub stored_fingerprint: Option<String>,
 }
 
 /// 提问的种类，界面据此决定用什么控件。
@@ -125,8 +130,9 @@ pub struct HopProgress {
 pub trait Interactor: Send + Sync {
     /// 未知主机、指纹变化时问用户。
     ///
-    /// 返回 `Reject` 表示终止连接；指纹变化的情况即使返回 `TrustAndSave` /
-    /// `TrustOnce` 也会被 core 拒绝（兜底）。
+    /// 返回 `Reject` 表示终止连接。指纹变化时只有 `TrustAndSave`（用户明确选了「更新指纹」）
+    /// 才继续，`TrustOnce` 一律拒绝——无人值守的实现（[`NonInteractive`]）回答的就是它，
+    /// 不能因此悄悄接受换过的密钥；吊销的情况任何回答都拒绝（兜底）。
     fn confirm_host_key(&self, info: HostKeyInfo) -> BoxFuture<'_, HostKeyDecision>;
 
     /// 要密码、口令，或者回答 keyboard-interactive 的提问。

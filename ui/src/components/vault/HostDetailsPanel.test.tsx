@@ -141,7 +141,8 @@ describe("密码字段的位置", () => {
       screen.getAllByText(text).find((el) => el.tagName === "LABEL") as HTMLElement;
     const username = labelOf("用户名");
     const password = document.querySelector('input[type="password"]') as HTMLElement;
-    expect(password.previousElementSibling?.textContent).toContain("密码");
+    // 密码框和小眼睛按钮包在一层 div 里：标签紧挨着这一层
+    expect(password.parentElement?.previousElementSibling?.textContent).toContain("密码");
     const remember = screen.getByText("没有选凭据时，把密码存成一条新凭据");
     const authHeading = screen.getByText("认证", { selector: "h4" });
     const authMethod = labelOf("认证方式");

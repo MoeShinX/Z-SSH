@@ -1,7 +1,7 @@
 {
   "name": "zssh-ui",
   "private": true,
-  "version": "0.2.13",
+  "version": "0.2.14",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {

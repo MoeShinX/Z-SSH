@@ -182,6 +182,22 @@ impl Database {
         })
     }
 
+    /// 主机编辑面板的「小眼睛」：用户点了才取，只给**密码类**凭据的明文——私钥、口令一律
+    /// 不给（它们不是在密码框里显示的东西，界面拿到了也没用）。没存密码按 `InvalidInput` 报。
+    pub fn identity_saved_password(&self, id: i64) -> Result<Zeroizing<String>, ZsshError> {
+        self.with_conn(|conn| {
+            let identity = crate::store::identities::identity_get(conn, id)?;
+            crate::store::hosts::check_identity_matches(AuthMethod::Password, &identity)?;
+            if !identity.has_secret {
+                return Err(ZsshError::InvalidInput(NO_SAVED_PASSWORD.to_owned()));
+            }
+            match crate::store::identities::identity_secret(conn, id)? {
+                Some(password) if !password.is_empty() => Ok(Zeroizing::new(password)),
+                _ => Err(ZsshError::InvalidInput(NO_SAVED_PASSWORD.to_owned())),
+            }
+        })
+    }
+
     /// 「复制连接信息」：收集这台主机的连接信息；能取到密码就带上。
     pub fn host_connection_info(&self, id: i64) -> Result<ConnectionInfo, ZsshError> {
         self.with_conn(|conn| {
@@ -557,6 +573,34 @@ mod db_tests {
             db.host_saved_password(host.id).unwrap().as_str(),
             "vault-pw"
         );
+    }
+
+    #[test]
+    fn revealing_a_credential_only_gives_out_passwords() {
+        let db = Database::open_in_memory().expect("内存库");
+        let password = identity(&db, IdentityKind::Password, Some("vault-pw"));
+        assert_eq!(
+            db.identity_saved_password(password).unwrap().as_str(),
+            "vault-pw"
+        );
+
+        let empty = identity(&db, IdentityKind::Password, None);
+        assert!(db
+            .identity_saved_password(empty)
+            .expect_err("没存密码")
+            .to_string()
+            .contains("没有保存密码"));
+
+        // 私钥凭据的内容不是密码，不能从这里拿出去
+        let key = identity(
+            &db,
+            IdentityKind::KeyInline,
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n-----END OPENSSH PRIVATE KEY-----\n"),
+        );
+        let err = db.identity_saved_password(key).expect_err("私钥不给");
+        assert!(err.to_string().contains("不是密码凭据"), "{err}");
+
+        assert!(db.identity_saved_password(9999).is_err(), "不存在的凭据");
     }
 
     #[test]

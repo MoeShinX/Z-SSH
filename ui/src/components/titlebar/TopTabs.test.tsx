@@ -157,6 +157,39 @@ describe("标签右键菜单", () => {
     fireEvent.click(screen.getByText("复制标签页"));
     expect(handlers.onDuplicateTab).toHaveBeenCalledWith("b");
   });
+
+  it("复制地址：连了主机的标签可以点，还没连主机的空白标签是灰的", async () => {
+    const onCopyTabAddress = vi.fn();
+    render(
+      <TopTabs
+        tabs={[tab("a", "web-1"), tab("b", "新标签")]}
+        activeTabId="a"
+        panes={{
+          "p-a": { phase: "connected", origin: { kind: "host", hostId: 1, label: "web-1" } } as never,
+          "p-b": { phase: "idle", origin: { kind: "empty" } } as never,
+        }}
+        view="terminal"
+        onShowVault={() => {}}
+        onOpenSettings={() => {}}
+        onSelectTab={() => {}}
+        onCloseTab={() => {}}
+        onNewTab={() => {}}
+        aiOpen={false}
+        onToggleAI={() => {}}
+        sftpOpen={false}
+        onToggleSftp={() => {}}
+        onCopyTabAddress={onCopyTabAddress}
+      />,
+    );
+    fireEvent.contextMenu(screen.getByText("新标签"));
+    const blank = (await screen.findByText("复制地址")).closest('[role="menuitem"]');
+    expect(blank?.getAttribute("data-disabled")).not.toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    fireEvent.contextMenu(screen.getByText("web-1"));
+    fireEvent.click(await screen.findByText("复制地址"));
+    expect(onCopyTabAddress).toHaveBeenCalledWith("a");
+  });
 });
 
 describe("双击标签复制标签页", () => {
@@ -222,6 +255,40 @@ describe("双击标签复制标签页", () => {
   it("没有提供复制能力时双击无效、不报错", () => {
     renderTabs({ onDuplicateTab: undefined });
     expect(() => fireEvent.doubleClick(screen.getByText("web-1"))).not.toThrow();
+  });
+  it("分隔线（两个终端 + 一个 SFTP，和真实使用一致）", () => {
+    render(
+      <TopTabs
+        tabs={[
+          { ...base, id: "t1", title: "web-1" },
+          { ...base, id: "t2", title: "db-1" },
+          { ...base, id: "s", title: "文件 web-1", sftp: { hostId: "h" } } as never,
+        ]}
+        activeTabId="s"
+        panes={{ p: { phase: "connected" } as never }}
+        view="vault"
+        onShowVault={() => {}}
+        onOpenSettings={() => {}}
+        onNewTab={() => {}}
+        aiOpen={false}
+        onToggleAI={() => {}}
+        sftpOpen={false}
+        onToggleSftp={() => {}}
+        onSelectTab={() => {}}
+        onCloseTab={() => {}}
+      />,
+    );
+    expect(document.querySelectorAll(".no-scrollbar > div[aria-hidden]")).toHaveLength(2);
+  });
+
+  it("会话标签之间的分隔线：主机页上每两个标签一条；当前标签两侧不画", () => {
+    renderTabs({ view: "vault", activeTabId: "s" });
+    // 三个标签（终端、SFTP、编辑器）之间两条
+    expect(document.querySelectorAll(".no-scrollbar > div[aria-hidden]")).toHaveLength(2);
+    cleanup();
+    // 终端页、中间那个是当前标签：两侧由它自己的边框画
+    renderTabs({ view: "terminal", activeTabId: "s" });
+    expect(document.querySelectorAll(".no-scrollbar > div[aria-hidden]")).toHaveLength(0);
   });
 });
 

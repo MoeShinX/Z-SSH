@@ -64,8 +64,10 @@ pub struct HostKeyPrompt {
     pub port: u16,
     pub key_type: String,
     pub fingerprint: String,
-    /// unknown / changed / other_key_types_saved
+    /// unknown / changed / revoked / other_key_types_saved
     pub status: &'static str,
+    /// 指纹变化 / 吊销时已保存的旧指纹（弹窗里和新指纹对比）
+    pub stored_fingerprint: Option<String>,
 }
 
 /// keyboard-interactive 的一道题。
@@ -247,6 +249,7 @@ impl Interactor for UiInteractor {
                 key_type: info.key_type.clone(),
                 fingerprint: info.fingerprint.clone(),
                 status: status_str(info.status),
+                stored_fingerprint: info.stored_fingerprint.clone(),
             };
 
             if let Err(err) = app.emit(HOSTKEY_EVENT, payload) {
@@ -355,6 +358,7 @@ fn status_str(status: HostKeyStatus) -> &'static str {
     match status {
         HostKeyStatus::Unknown => "unknown",
         HostKeyStatus::Changed => "changed",
+        HostKeyStatus::Revoked => "revoked",
         HostKeyStatus::OtherKeyTypesSaved => "other_key_types_saved",
     }
 }

@@ -158,15 +158,15 @@ async fn unknown_host_is_asked_then_saved_and_not_asked_again() {
 }
 
 #[tokio::test]
-async fn changed_fingerprint_is_blocked_even_when_trusted() {
-    if !common::full_live("changed_fingerprint_is_blocked_even_when_trusted") {
+async fn changed_fingerprint_needs_an_explicit_update() {
+    if !common::full_live("changed_fingerprint_needs_an_explicit_update") {
         return;
     }
     let _serial = serial().await;
     let server = match TestServer::from_env() {
         Ok(server) => server,
         Err(reason) => {
-            println!("跳过 changed_fingerprint_is_blocked_even_when_trusted：{reason}");
+            println!("跳过 changed_fingerprint_needs_an_explicit_update：{reason}");
             return;
         }
     };
@@ -201,19 +201,18 @@ async fn changed_fingerprint_is_blocked_even_when_trusted() {
     let key_base64 = fields.next().expect("公钥 base64");
     known_hosts.write(&format!("{} {key_type} {key_base64}\n", server.host));
 
-    // 第二次：就算回答"信任"，也必须被拒绝（设计文档 4.4）
-    let attacker = Arc::new(MockInteractor::new(
-        HostKeyDecision::TrustAndSave,
+    // 第二次：只回答「仅本次」必须被拒绝——无人值守的实现回答的就是它
+    let once = Arc::new(MockInteractor::new(
+        HostKeyDecision::TrustOnce,
         vec![Some(&server.password)],
     ));
     let result = connect_with(
         &server,
         &known_hosts,
         AuthConfig::password(Some(server.password.clone())),
-        Arc::clone(&attacker),
+        Arc::clone(&once),
     )
     .await;
-
     match result {
         Err(ZsshError::HostKeyChanged(info)) => {
             assert_ne!(info.stored, info.presented);
@@ -226,9 +225,49 @@ async fn changed_fingerprint_is_blocked_even_when_trusted() {
             "应该是指纹变化被阻断，实际 {}",
             server.sanitize(&format!("{other:?}"))
         ),
-        Ok(_) => panic!("指纹变化时不该连上"),
+        Ok(_) => panic!("只回答「仅本次」时指纹变化不该连上"),
     }
-    assert_eq!(attacker.asks(), 1, "红框要弹一次给用户看新指纹");
+    assert_eq!(once.asks(), 1, "红框要弹一次给用户看新指纹");
+    let shown = once.host_key_infos();
+    assert_eq!(shown[0].status, HostKeyStatus::Changed);
+    assert!(shown[0].stored_fingerprint.is_some(), "红框里要有旧指纹");
+
+    // 第三次：用户明确选「更新指纹」，换掉旧记录、同一次连接用保存的密码直接连上
+    let update = Arc::new(MockInteractor::new(
+        HostKeyDecision::TrustAndSave,
+        Vec::new(),
+    ));
+    let connection = server.expect_ok(
+        connect_with(
+            &server,
+            &known_hosts,
+            AuthConfig::password(Some(server.password.clone())),
+            Arc::clone(&update),
+        )
+        .await,
+        "确认更新指纹之后应该能连上",
+    );
+    drop(connection);
+    assert_eq!(update.asks(), 1);
+    assert!(
+        update.asked_kinds().is_empty(),
+        "保存的密码照常用，不该再问密码"
+    );
+
+    // 第四次：新指纹已经存下了，不再弹窗
+    let again = Arc::new(MockInteractor::new(HostKeyDecision::Reject, Vec::new()));
+    let connection = server.expect_ok(
+        connect_with(
+            &server,
+            &known_hosts,
+            AuthConfig::password(Some(server.password.clone())),
+            Arc::clone(&again),
+        )
+        .await,
+        "更新过的指纹应该直接匹配",
+    );
+    drop(connection);
+    assert_eq!(again.asks(), 0, "更新后不该再问指纹");
 }
 
 #[tokio::test]

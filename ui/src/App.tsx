@@ -193,13 +193,13 @@ import {
   splitPane,
   type PaneId,
 } from "./state/splitTree";
-import { emptyPane, type PaneOrigin, type PaneSession, type Tab } from "./state/sessions";
+import { emptyPane, insertTabAfter, type PaneOrigin, type PaneSession, type Tab } from "./state/sessions";
 import { keepSubscription, leasesToRelease, type StatsLease } from "./state/statsLease";
 import { startHostOs } from "./stores/hostOs";
 import { useResolvedMode, useSettings, useTerminalITheme, useTerminalMode } from "./stores/settings";
 import { useImeDefaultEnglish } from "./terminal/useImeDefaultEnglish";
 import { recordRecent } from "./state/hostTree";
-import { hostCopyText } from "./state/hostAddress";
+import { hostCopyText, originAddress } from "./state/hostAddress";
 import { copyInfoToClipboard, copyPasswordToClipboard } from "./state/hostClipboard";
 import {
   closeSettings,
@@ -1591,7 +1591,8 @@ export default function App() {
     [reconnect],
   );
 
-  const openTabWithOrigin = useCallback((origin: PaneOrigin, title: string) => {
+  /** `afterTabId`：新标签紧挨在这个标签右边（复制标签页用）；不给就加在最后。 */
+  const openTabWithOrigin = useCallback((origin: PaneOrigin, title: string, afterTabId?: string) => {
     const paneId = makeId("pane");
     const tab: Tab = {
       id: makeId("tab"),
@@ -1600,7 +1601,7 @@ export default function App() {
       focus: paneId,
     };
     setWs((current) => ({
-      tabs: [...current.tabs, tab],
+      tabs: insertTabAfter(current.tabs, tab, afterTabId),
       activeTabId: tab.id,
       panes: { ...current.panes, [paneId]: emptyPane(origin) },
     }));
@@ -1658,10 +1659,25 @@ export default function App() {
         toast.info("这个标签还没连主机，没有可复制的");
         return;
       }
-      openTabWithOrigin(origin, tab.title);
+      openTabWithOrigin(origin, tab.title, tab.id);
     },
     [openTabWithOrigin],
   );
+
+  /** 标签右键「复制地址」：复制这个标签连的那台主机的地址（和主机树右键「复制地址」一样）。 */
+  const copyTabAddress = useCallback((tabId: string) => {
+    const tab = wsRef.current.tabs.find((item) => item.id === tabId);
+    const origin = tab ? wsRef.current.panes[tab.focus]?.origin : undefined;
+    const address = origin ? originAddress(origin, useVault.getState().hosts) : null;
+    if (address === null) {
+      toast.info("这个标签没有可复制的地址");
+      return;
+    }
+    void navigator.clipboard
+      .writeText(address)
+      .then(() => toast.info(`已复制：${address}`))
+      .catch(() => toast.error("复制失败"));
+  }, []);
 
   const splitAt = useCallback((tabId: string, paneId: PaneId, axis: "x" | "y") => {
     const current = wsRef.current;
@@ -2932,6 +2948,7 @@ export default function App() {
         onCloseTab={closeTab}
         onReconnectTab={reconnectTab}
         onDuplicateTab={duplicateTab}
+        onCopyTabAddress={copyTabAddress}
         onCloseTabs={closeTabs}
         onNewTab={newTab}
         aiBadges={aiBadges}

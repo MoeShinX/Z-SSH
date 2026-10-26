@@ -25,3 +25,40 @@ export function normalizeHostInput(raw: string): string {
 export function hostCopyText(host: { name: string; host: string }, kind: HostCopyKind): string {
   return kind === "name" ? host.name : normalizeHostInput(host.host);
 }
+
+/** 快速连接串 `user@host[:port]` / `user@[::1]:2222` 里的地址部分（规则同后端 `parse_quick_target`）。 */
+export function quickTargetAddress(target: string): string | null {
+  const at = target.trim().indexOf("@");
+  if (at <= 0) return null;
+  const rest = target.trim().slice(at + 1);
+  if (rest.startsWith("[")) {
+    const close = rest.indexOf("]");
+    const inner = close > 0 ? rest.slice(1, close).trim() : "";
+    return inner === "" ? null : inner;
+  }
+  const host = rest.split(":")[0];
+  return host === "" ? null : host;
+}
+
+/**
+ * 终端标签右键「复制地址」：标签里连的那台主机的地址，和主机树右键「复制地址」复制的一样
+ * （主机库里的主机走 [`hostCopyText`]）。没连主机、或者主机已经从库里删掉了，返回 null。
+ */
+export function originAddress(
+  origin:
+    | { kind: "empty" }
+    | { kind: "host"; hostId: number }
+    | { kind: "quick"; target: string },
+  hosts: ReadonlyArray<{ id: number; name: string; host: string }>,
+): string | null {
+  switch (origin.kind) {
+    case "empty":
+      return null;
+    case "host": {
+      const host = hosts.find((item) => item.id === origin.hostId);
+      return host ? hostCopyText(host, "address") : null;
+    }
+    case "quick":
+      return quickTargetAddress(origin.target);
+  }
+}

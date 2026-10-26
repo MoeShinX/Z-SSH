@@ -3,8 +3,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-/** 指纹弹窗的状态：未知 / 指纹变化 / 只记过别的密钥类型。 */
-export type HostKeyStatus = "unknown" | "changed" | "other_key_types_saved";
+/** 指纹弹窗的状态：未知 / 指纹变化 / 密钥已被吊销 / 只记过别的密钥类型。 */
+export type HostKeyStatus = "unknown" | "changed" | "revoked" | "other_key_types_saved";
 
 export interface HostKeyPrompt {
   req_id: number;
@@ -13,6 +13,8 @@ export interface HostKeyPrompt {
   key_type: string;
   fingerprint: string;
   status: HostKeyStatus;
+  /** 指纹变化 / 吊销时已保存的旧指纹 */
+  stored_fingerprint: string | null;
 }
 
 export type PromptKind = "password" | "passphrase" | "keyboard_interactive";

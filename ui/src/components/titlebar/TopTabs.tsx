@@ -12,6 +12,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Bot,
+  ClipboardCopy,
   Command,
   Copy,
   ExternalLink,
@@ -34,7 +35,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 
 import type { PaneSession, Tab } from "../../state/sessions";
 import { paneIds } from "../../state/splitTree";
@@ -70,6 +71,8 @@ interface TopTabsProps {
   onReconnectTab?: (tabId: string) => void;
   /** 标签右键：再开一个连同一台主机的标签。 */
   onDuplicateTab?: (tabId: string) => void;
+  /** 标签右键：复制这个标签连的那台主机的地址（和主机树右键「复制地址」一样）。 */
+  onCopyTabAddress?: (tabId: string) => void;
   /** 标签右键：关闭其他 / 右侧 / 所有标签。 */
   onCloseTabs?: (tabId: string, which: "others" | "right" | "all") => void;
   onNewTab: () => void;
@@ -118,6 +121,7 @@ export default function TopTabs({
   onCloseTab,
   onReconnectTab,
   onDuplicateTab,
+  onCopyTabAddress,
   onCloseTabs,
   onNewTab,
   aiBadges,
@@ -290,10 +294,22 @@ export default function TopTabs({
         {/* 终端标签 */}
         <div className="no-scrollbar flex h-9 min-w-0 flex-1 items-end gap-0.5 overflow-x-auto">
           {tabs.map((tab, tabIndex) => {
+            // 两个挨着的非当前标签之间加一条小竖线：主机页上看不出会话的分界时（全都不是
+            // 当前标签、又只有 hover 才有底色），靠它分辨每个会话。挨着当前标签的那条分界
+            // 由当前标签自己的边框画，不再多画一条。
+            const activeNow = (id: string) => view === "terminal" && id === activeTabId;
+            const divider =
+              tabIndex > 0 &&
+              !activeNow(tab.id) &&
+              !activeNow(tabs[tabIndex - 1].id) ? (
+                <div aria-hidden className="mb-1 h-4 w-px shrink-0 bg-border" />
+              ) : null;
             // SFTP 标签：区别于终端的图标（M3-2 第 2 节），不显示状态点。
             if (tab.sftp) {
               return (
-                <ContextMenu key={tab.id}>
+                <Fragment key={tab.id}>
+                {divider}
+                <ContextMenu>
                   <ContextMenuTrigger asChild>
                     <div className="contents">
                     <TabShape
@@ -329,11 +345,14 @@ export default function TopTabs({
                     />
                   </ContextMenuContent>
                 </ContextMenu>
+                </Fragment>
               );
             }
             if (tab.editor) {
               return (
-                <ContextMenu key={tab.id}>
+                <Fragment key={tab.id}>
+                {divider}
+                <ContextMenu>
                   <ContextMenuTrigger asChild>
                     <div className="contents">
                       <TabShape
@@ -358,6 +377,7 @@ export default function TopTabs({
                     />
                   </ContextMenuContent>
                 </ContextMenu>
+                </Fragment>
               );
             }
             const phases = paneIds(tab.tree).map((paneId) => panes[paneId]?.phase ?? "idle");
@@ -365,7 +385,9 @@ export default function TopTabs({
             // 双击标签和右键「复制标签页」是同一个函数
             const duplicate = onDuplicateTab ? () => onDuplicateTab(tab.id) : undefined;
             return (
-              <ContextMenu key={tab.id}>
+              <Fragment key={tab.id}>
+              {divider}
+              <ContextMenu>
                 <ContextMenuTrigger asChild>
                   <div className="contents">
                     <TabShape
@@ -398,7 +420,17 @@ export default function TopTabs({
                       <Copy className="mr-2 h-3.5 w-3.5" /> 复制标签页
                     </ContextMenuItem>
                   )}
-                  {(onReconnectTab || onDuplicateTab) && <ContextMenuSeparator />}
+                  {onCopyTabAddress && (
+                    <ContextMenuItem
+                      data-action="copy-address"
+                      // 还没连主机的空白标签没有地址可复制
+                      disabled={panes[tab.focus]?.origin.kind === "empty"}
+                      onSelect={() => onCopyTabAddress(tab.id)}
+                    >
+                      <ClipboardCopy className="mr-2 h-3.5 w-3.5" /> 复制地址
+                    </ContextMenuItem>
+                  )}
+                  {(onReconnectTab || onDuplicateTab || onCopyTabAddress) && <ContextMenuSeparator />}
                   <CloseItems
                     tabId={tab.id}
                     index={tabIndex}
@@ -408,6 +440,7 @@ export default function TopTabs({
                   />
                 </ContextMenuContent>
               </ContextMenu>
+              </Fragment>
             );
           })}
           <Tooltip>

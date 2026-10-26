@@ -201,6 +201,10 @@ export const hostMemoryGet = (hostId: number): Promise<HostMemory | null> =>
 export const hostMemorySet = (hostId: number, content: string): Promise<void> =>
   invoke("host_memory_set", { hostId, content });
 
+/** 主机编辑面板的「小眼睛」：用户点了才取这条密码凭据的明文（私钥、口令不给）。 */
+export const revealIdentityPassword = (id: number): Promise<string> =>
+  invoke<string>("identity_reveal_password", { id });
+
 /** 右键「复制密码」：后端按规则取密码直接写进剪贴板（30 秒后自动清除），密码不经过前端。 */
 export const copyHostPassword = (id: number): Promise<void> =>
   invoke("host_copy_password", { id });

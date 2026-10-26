@@ -50,6 +50,20 @@ export interface Tab {
   broadcast?: boolean;
 }
 
+/**
+ * 新标签放在哪：给了 `afterTabId` 且它还在，就紧挨在它右边（复制标签页时新标签挨着原来那个，
+ * 不跑到最右边）；否则加在最后。
+ */
+export function insertTabAfter<T extends { id: string }>(
+  tabs: readonly T[],
+  tab: T,
+  afterTabId?: string,
+): T[] {
+  const index = afterTabId === undefined ? -1 : tabs.findIndex((item) => item.id === afterTabId);
+  if (index < 0) return [...tabs, tab];
+  return [...tabs.slice(0, index + 1), tab, ...tabs.slice(index + 1)];
+}
+
 /** SFTP 标签挂的信息（M3-2 第 2 节）。 */
 export interface SftpTabInfo {
   /** 后端的 sftp_id */
