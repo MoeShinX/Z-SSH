@@ -492,11 +492,14 @@ export default function TerminalView({
             </div>
           }
           confirmLabel="粘贴"
+          // 弹窗关掉（粘贴 / 取消 / Esc）后把焦点还给终端，直接按回车就能执行。不能在 onConfirm
+          // 里 focus：那时弹窗的焦点陷阱还在，会被拉回去，关掉后焦点落到 body 上，得再点一下终端。
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            terminalRef.current?.focus();
+          }}
           onOpenChange={(open) => {
-            if (!open) {
-              setPending(null);
-              terminalRef.current?.focus();
-            }
+            if (!open) setPending(null);
           }}
           onConfirm={() => {
             // 再核对一次目标：确认按钮按下时它还得是请求粘贴时的那个会话
@@ -506,7 +509,6 @@ export default function TerminalView({
               toast.info("会话已变化，已取消粘贴");
             }
             setPending(null);
-            terminalRef.current?.focus();
           }}
         />
       )}

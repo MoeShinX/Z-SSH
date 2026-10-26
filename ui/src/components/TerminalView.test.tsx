@@ -44,6 +44,8 @@ const fake = vi.hoisted(() => ({
   selected: [] as number[][],
   /** 后端 open_external_url 收到的网址。 */
   opened: [] as string[],
+  /** 每次 terminal.focus() 被调用时页面上还有没有弹窗（弹窗还开着时 focus 会被焦点陷阱拉回去）。 */
+  focusWhileDialog: [] as boolean[],
 }));
 
 vi.mock("../api/settings", () => ({
@@ -87,7 +89,9 @@ vi.mock("../terminal/terminal", () => {
     select(column: number, row: number, length: number) {
       fake.selected.push([column, row, length]);
     },
-    focus() {},
+    focus() {
+      fake.focusWhileDialog.push(document.querySelector('[role="dialog"]') !== null);
+    },
     dispose() {
       fake.disposed += 1;
     },
@@ -136,6 +140,7 @@ beforeEach(() => {
   fake.links = null;
   fake.selected = [];
   fake.opened = [];
+  fake.focusWhileDialog = [];
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   // jsdom 没有 ResizeObserver
   globalThis.ResizeObserver = class {
@@ -355,6 +360,28 @@ describe("粘贴入口的多行确认（TERM-1 T04）", () => {
 
     expect(view.queryByRole("dialog")).toBeNull();
     expect(fake.pasted).toEqual([]);
+  });
+
+  it.each([
+    ["点「粘贴」", (view: ReturnType<typeof render>) => fireEvent.click(view.getByText("粘贴"))],
+    ["点「取消」", (view: ReturnType<typeof render>) => fireEvent.click(view.getByText("取消"))],
+    [
+      "按 Esc",
+      () => fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" }),
+    ],
+  ])("%s 关掉确认框后焦点回到终端（弹窗已经收起才 focus），直接按回车就能执行", (_how, close) => {
+    useSettings.setState({ terminal_confirm_multiline_paste: true });
+    const { ref, view } = renderWithHandle();
+    act(() => ref.current?.paste("a\nb"));
+    fake.focusWhileDialog = [];
+
+    close(view);
+    act(() => {
+      vi.runAllTimers();
+    });
+
+    expect(view.queryByRole("dialog")).toBeNull();
+    expect(fake.focusWhileDialog.at(-1)).toBe(false);
   });
 
   it("目标没变：确认之后照常送出", () => {
