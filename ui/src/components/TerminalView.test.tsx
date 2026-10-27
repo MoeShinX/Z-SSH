@@ -46,6 +46,8 @@ const fake = vi.hoisted(() => ({
   opened: [] as string[],
   /** 每次 terminal.focus() 被调用时页面上还有没有弹窗（弹窗还开着时 focus 会被焦点陷阱拉回去）。 */
   focusWhileDialog: [] as boolean[],
+  /** terminal.clear() 被调用了几次（右键「清屏」）。 */
+  clears: 0,
 }));
 
 vi.mock("../api/settings", () => ({
@@ -88,6 +90,9 @@ vi.mock("../terminal/terminal", () => {
     },
     select(column: number, row: number, length: number) {
       fake.selected.push([column, row, length]);
+    },
+    clear() {
+      fake.clears += 1;
     },
     focus() {
       fake.focusWhileDialog.push(document.querySelector('[role="dialog"]') !== null);
@@ -141,6 +146,7 @@ beforeEach(() => {
   fake.selected = [];
   fake.opened = [];
   fake.focusWhileDialog = [];
+  fake.clears = 0;
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   // jsdom 没有 ResizeObserver
   globalThis.ResizeObserver = class {
@@ -654,7 +660,7 @@ describe("终端里的链接", () => {
     expect(fake.pasted).toEqual(["pasted"]);
   });
 
-  it("不在链接上右键且没开右键粘贴：什么都不做，也不出链接菜单", () => {
+  it("不在链接上右键且没开右键粘贴：弹终端菜单（清屏），不出链接菜单、不粘贴", () => {
     useSettings.setState({ terminal_right_click_paste: false });
     const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
 
@@ -662,6 +668,36 @@ describe("终端里的链接", () => {
 
     expect(view.queryByText("打开链接")).toBeNull();
     expect(clipboard.readText).not.toHaveBeenCalled();
+    fireEvent.click(view.getByText("清屏"));
+    expect(fake.clears).toBe(1);
+    expect(fake.pasted).toEqual([]);
+  });
+
+  it("开着右键粘贴：普通右键照旧粘贴、不弹菜单；Shift+右键弹终端菜单，不粘贴", async () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(view.queryByText("清屏")).toBeNull();
+    expect(fake.pasted).toEqual(["pasted"]);
+
+    fireEvent.contextMenu(fake.openedEl as HTMLElement, { shiftKey: true });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(clipboard.readText).toHaveBeenCalledTimes(1);
+    fireEvent.click(view.getByText("清屏"));
+    expect(fake.clears).toBe(1);
+  });
+
+  it("链接上的右键菜单里没有清屏", () => {
+    const view = render(<TerminalView theme={{}} onData={() => {}} onResize={() => {}} />);
+    hover();
+    fireEvent.contextMenu(fake.openedEl as HTMLElement);
+    expect(view.getByText("打开链接")).not.toBeNull();
+    expect(view.queryByText("清屏")).toBeNull();
   });
 
   it("菜单开着时收到离开：菜单不收，点「复制链接」用的仍是打开菜单时的链接", () => {

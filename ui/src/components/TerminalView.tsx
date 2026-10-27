@@ -1,7 +1,7 @@
 import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 
 import type { FitAddon } from "@xterm/addon-fit";
-import { Copy, ExternalLink } from "lucide-react";
+import { Copy, Eraser, ExternalLink } from "lucide-react";
 
 import { openExternalUrl } from "../api/settings";
 import { isPanelDragging, onPanelDragChange } from "../state/panelWidths";
@@ -143,15 +143,15 @@ export default function TerminalView({
     setPending(null);
     toast.info("会话已变化，已取消待确认的粘贴");
   }, [pasteTarget, pending]);
-  // 鼠标当前悬停的链接（xterm 的 hover / leave 回调维护，菜单开着也照常更新）。右键只在悬停
-  // 链接时弹链接菜单，所以"有没有悬停"同时放一份 state 给菜单触发器用；链接本身放 ref，
-  // 避免每次悬停都重建终端。
+  // 鼠标当前悬停的链接（xterm 的 hover / leave 回调维护，菜单开着也照常更新）。右键时据此
+  // 决定弹链接菜单还是终端菜单；放 ref，避免每次悬停都重建终端。
   const hoveredLinkRef = useRef<HoveredLink | null>(null);
-  const [linkHovered, setLinkHovered] = useState(false);
   // 右键那一刻的链接目标网址：菜单项只认它，不受菜单开着时悬停变化的影响；菜单关了就清掉，
   // 之后以实时悬停为准。能不能「打开」另存一份 state，给菜单项置灰用（非 http / https 只能复制）。
   const menuLinkRef = useRef<string | null>(null);
   const [menuLinkOpenable, setMenuLinkOpenable] = useState(true);
+  // 这次右键弹的是哪种菜单：在链接上是链接菜单，别处是终端菜单（清屏）
+  const [menuKind, setMenuKind] = useState<"link" | "terminal">("terminal");
   const openLink = (uri: string) => {
     void openExternalUrl(uri).catch((error: unknown) => {
       toast.error(typeof error === "string" ? error : "没能打开链接");
@@ -175,7 +175,6 @@ export default function TerminalView({
       // 实时跟着 xterm 的进入 / 离开走（菜单开着也一样）；离开链接就清掉双击候选
       onHover: (link) => {
         hoveredLinkRef.current = link;
-        setLinkHovered(link !== null);
         if (!link) doubleClickGate.reset();
       },
       onActivate: (uri, event, range) => {
@@ -228,9 +227,16 @@ export default function TerminalView({
       if (hoveredLinkRef.current) {
         menuLinkRef.current = hoveredLinkRef.current.uri;
         setMenuLinkOpenable(isOpenableUrl(hoveredLinkRef.current.uri));
+        setMenuKind("link");
         return;
       }
-      if (!behaviorRef.current.rightClickPaste) return;
+      // 没开右键粘贴，或者按着 Shift：弹终端菜单（清屏）。开了右键粘贴时 Shift+右键是
+      // 唯一打开这个菜单的办法。
+      if (!behaviorRef.current.rightClickPaste || event.shiftKey) {
+        setMenuKind("terminal");
+        return;
+      }
+      // 右键粘贴：拦下事件，菜单也就不弹了（Radix 看到 defaultPrevented 不打开）
       event.preventDefault();
       void navigator.clipboard
         ?.readText()
@@ -445,7 +451,7 @@ export default function TerminalView({
           if (!open) menuLinkRef.current = null;
         }}
       >
-        <ContextMenuTrigger asChild disabled={!linkHovered}>
+        <ContextMenuTrigger asChild>
           <div ref={containerRef} className="h-full w-full overflow-hidden" />
         </ContextMenuTrigger>
         <ContextMenuContent
@@ -455,28 +461,42 @@ export default function TerminalView({
             terminalRef.current?.focus();
           }}
         >
-          <ContextMenuItem
-            disabled={!menuLinkOpenable}
-            onSelect={() => {
-              const uri = menuLinkRef.current;
-              if (uri && isOpenableUrl(uri)) openLinkRef.current(uri);
-            }}
-          >
-            <ExternalLink className="mr-2 h-3.5 w-3.5" />
-            打开链接
-          </ContextMenuItem>
-          <ContextMenuItem
-            onSelect={() => {
-              const uri = menuLinkRef.current;
-              if (!uri) return;
-              void navigator.clipboard?.writeText(uri).catch((error: unknown) => {
-                console.warn("复制失败（剪贴板不可用）", error);
-              });
-            }}
-          >
-            <Copy className="mr-2 h-3.5 w-3.5" />
-            复制链接
-          </ContextMenuItem>
+          {menuKind === "link" ? (
+            <>
+              <ContextMenuItem
+                disabled={!menuLinkOpenable}
+                onSelect={() => {
+                  const uri = menuLinkRef.current;
+                  if (uri && isOpenableUrl(uri)) openLinkRef.current(uri);
+                }}
+              >
+                <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                打开链接
+              </ContextMenuItem>
+              <ContextMenuItem
+                onSelect={() => {
+                  const uri = menuLinkRef.current;
+                  if (!uri) return;
+                  void navigator.clipboard?.writeText(uri).catch((error: unknown) => {
+                    console.warn("复制失败（剪贴板不可用）", error);
+                  });
+                }}
+              >
+                <Copy className="mr-2 h-3.5 w-3.5" />
+                复制链接
+              </ContextMenuItem>
+            </>
+          ) : (
+            <ContextMenuItem
+              data-action="clear-screen"
+              // 只清本地的屏幕和回滚记录（保留光标所在的提示符那一行），不往服务器发任何东西：
+              // 不会打断正在跑的程序，也不会把 clear 命令敲进 vim 之类的全屏程序里
+              onSelect={() => terminalRef.current?.clear()}
+            >
+              <Eraser className="mr-2 h-3.5 w-3.5" />
+              清屏
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
       {pendingPaste !== null && (

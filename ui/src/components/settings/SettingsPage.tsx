@@ -447,7 +447,7 @@ function TerminalSection() {
             onCheckedChange={(checked) => void update("terminal_copy_on_select", checked)}
           />
         </SettingRow>
-        <SettingRow title="右键粘贴" description="在终端里点右键直接粘贴剪贴板内容。">
+        <SettingRow title="右键粘贴" description="在终端里点右键直接粘贴剪贴板内容；要清屏时按住 Shift 点右键打开菜单。">
           <Switch
             checked={settings.terminal_right_click_paste}
             onCheckedChange={(checked) => void update("terminal_right_click_paste", checked)}
