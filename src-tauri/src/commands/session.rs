@@ -909,6 +909,14 @@ async fn run_session(
         tokio::task::spawn_blocking(move || drop(log));
     }
 
+    // 会话到这里已经结束了：先摘掉、告诉界面"已断开"，再做下面可能要等的清理。
+    // 以前清理排在前面——服务器在重启 / 关机时，给它发 EOF / CLOSE（以及快速连接的断开）
+    // 可能要等到超时（各最长 5 秒），界面就晚几秒才显示断开。
+    // 正常关闭时 session_close 已经摘掉了，这里兜住远端断开的情况。
+    app.state::<AppState>().remove(&session_id).await;
+    info!(%session_id, %reason, "会话结束");
+    emit_state(&app, &session_id, "disconnected", Some(reason));
+
     let _ = tokio::time::timeout(CLEANUP_TIMEOUT, writer.close()).await;
     // 池里的连接不在这里断：最后一个会话释放引用之后，池子按空闲时长收。
     // 快速连接的连接没有池子管：只有自己用的时候（没有别的 duplicate 会话）
@@ -920,10 +928,6 @@ async fn run_session(
     }
     // 丢掉事件流：它会关掉流控门并结束读写任务。
     drop(events);
-    // 正常关闭时 session_close 已经摘掉了，这里兜住远端断开的情况。
-    app.state::<AppState>().remove(&session_id).await;
-    info!(%session_id, %reason, "会话结束");
-    emit_state(&app, &session_id, "disconnected", Some(reason));
     // 引用计数最后再减：池里的连接从"所有会话都结束了"这一刻开始算空闲。
     drop(connection);
 }
